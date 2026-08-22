@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -19,7 +20,15 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const DIST = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRY = join(DIST, "index.js");
 
-const FORBIDDEN = "@duckdb/node-api";
+/**
+ * Matched as a pattern, not as one exact string.
+ *
+ * `@duckdb/node-api` is the wrapper; the ~100 MB native addon and libduckdb
+ * live in `@duckdb/node-bindings-<platform>`. A deep subpath, the bindings
+ * package directly, or a future rename all carry the same cost and none of
+ * them equals the wrapper's name.
+ */
+const FORBIDDEN = /(^|\/)@?duckdb/i;
 
 function importedSpecifiers(source: string): string[] {
   const specifiers: string[] = [];
@@ -28,6 +37,9 @@ function importedSpecifiers(source: string): string[] {
     /(?:^|\n)\s*import\s*["']([^"']+)["']/g,
     /(?:^|\n)\s*export\s+[^"';]*?from\s*["']([^"']+)["']/g,
     /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+    // createRequire is the documented way to reach CommonJS from ESM, and it
+    // is how a lazily-loaded engine would most naturally arrive.
+    /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,
   ];
   for (const pattern of patterns) {
     for (const match of source.matchAll(pattern)) specifiers.push(match[1]);
@@ -62,28 +74,51 @@ describe("the plugin's import graph", () => {
     assert.ok(existsSync(ENTRY), "build first: dist/index.js is missing");
     const { bare, files } = walk(ENTRY);
     assert.ok(files.length > 1, "expected the entry point to import something");
-    assert.ok(
-      !bare.has(FORBIDDEN),
-      `dist/index.js reaches ${FORBIDDEN}. The Signal K process must not map ` +
-        `the engine: spawn a process for the work instead.`,
+    const offenders = [...bare].filter((specifier) =>
+      FORBIDDEN.test(specifier),
+    );
+    assert.deepEqual(
+      offenders,
+      [],
+      `dist/index.js reaches ${offenders.join(", ")}. The Signal K process ` +
+        `must not map the engine: spawn a process for the work instead.`,
     );
   });
 
-  it("loads no DuckDB native library when a real process imports it", () => {
+  it("loads no DuckDB native library when a real process starts it", () => {
     // The static walk covers this package's own files. This covers everything
     // else — a dependency that pulls the addon in transitively would map it
     // just the same.
+    // Importing the module is not enough: the factory it exports is what the
+    // server calls, and a lazily-loaded engine inside start() would map
+    // nothing until then. So this runs the plugin, against a throwaway data
+    // directory, exactly as the server would.
+    const work = mkdtempSync(join(tmpdir(), "sk-parquet-probe-"));
     const probe = [
-      `await import(${JSON.stringify(pathToFileURL(ENTRY).href)});`,
+      `import { mkdtempSync } from "node:fs";`,
+      `const factory = (await import(${JSON.stringify(pathToFileURL(ENTRY).href)})).default;`,
+      `const app = {`,
+      `  debug() {}, error() {},`,
+      `  setPluginStatus() {}, setPluginError() {},`,
+      `  getDataDirPath: () => ${JSON.stringify(work)},`,
+      `  selfContext: "vessels.self",`,
+      `};`,
+      `const plugin = factory(app);`,
+      `plugin.start({});`,
+      `await plugin.stop?.();`,
       `const loaded = process.report.getReport().sharedObjects`,
       `  .filter((p) => /duckdb/i.test(p));`,
       `console.log(JSON.stringify(loaded));`,
     ].join("\n");
-    const output = execFileSync(
-      process.execPath,
-      ["--input-type=module", "-e", probe],
-      { encoding: "utf8" },
-    );
-    assert.deepEqual(JSON.parse(output.trim()), []);
+    try {
+      const output = execFileSync(
+        process.execPath,
+        ["--input-type=module", "-e", probe],
+        { encoding: "utf8" },
+      );
+      assert.deepEqual(JSON.parse(output.trim()), []);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
   });
 });

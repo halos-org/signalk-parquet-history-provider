@@ -1,8 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -41,7 +40,13 @@ describe("tracked source files", () => {
 
     const offences: string[] = [];
     for (const file of files) {
-      const text = readFileSync(join(ROOT, file), "utf8");
+      // Read the committed blob, not the working tree: an editor autosave
+      // mid-run would otherwise report a file that is already correct again.
+      const text = execFileSync("git", ["show", `:${file}`], {
+        cwd: ROOT,
+        encoding: "utf8",
+        maxBuffer: 32 * 1024 * 1024,
+      });
       for (const { code, name } of FORBIDDEN) {
         const at = text.indexOf(String.fromCodePoint(code));
         if (at < 0) continue;

@@ -31,8 +31,19 @@ describe("the README configuration table", () => {
   }
 
   it("gives every schema field a title to be documented under", () => {
-    for (const title of titles()) {
-      assert.notEqual(title, undefined);
+    // Read without the `?? name` fallback: with it, every element is a string
+    // by construction and the assertion cannot fail. A property that loses its
+    // title otherwise degrades silently into being documented under its raw
+    // key, and surfaces as a confusing missing-row failure elsewhere.
+    for (const [name, property] of Object.entries(ConfigSchema.properties)) {
+      const schema = property as any;
+      const carried = schema.properties
+        ? Object.values(schema.properties).map((sub: any) => sub.title)
+        : [schema.title];
+      for (const title of carried) {
+        assert.equal(typeof title, "string", `${name} has no title`);
+        assert.notEqual(title, "", `${name} has an empty title`);
+      }
     }
   });
 
