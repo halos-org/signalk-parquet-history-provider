@@ -1,0 +1,21 @@
+name: Main Branch CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.repository }}-main-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    uses: halos-org/shared-workflows/.github/workflows/build-release.yml@main
+    with:
+      package-name: signalk-parquet-history-provider
+      package-description: "Parquet history provider for Signal K: a SQLite hot store rolled into a Parquet tree, queried with DuckDB"
+      build-deb: false

@@ -1,0 +1,74 @@
+# Proves the bundled sqlite_scanner loads on the platform HaLOS devices run,
+# with no network available.
+#
+# Nothing else covers this. The unit suites use a fixture instead of a real
+# 27 MB binary, and a check on an x86 developer machine with working DNS
+# proves neither the architecture nor the offline part -- DuckDB will happily
+# download an extension when it can reach the internet, which is exactly the
+# behaviour the plugin disables and this job verifies is disabled.
+
+name: DuckDB extension
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-load:
+    name: sqlite_scanner loads offline on ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            platform: linux_arm64
+          - runner: ubuntu-latest
+            platform: linux_amd64
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - name: Build and fetch the extension
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run build
+          node tools/fetch-extensions.mjs ${{ matrix.platform }}
+
+      - name: Load it with no network at all
+        # A container with --network none is the only honest way to assert
+        # this on a runner: the check would otherwise pass on a machine that
+        # could have downloaded what it needed.
+        run: |
+          docker run --rm --network none \
+            -v "$PWD":/w -w /w node:24 \
+            node dist/duckdb/check-extension.js
+
+      - name: Refuse a build whose extension does not match the engine
+        # The gate itself, exercised: a manifest naming a different DuckDB
+        # version must fail here rather than at LOAD on a boat.
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = "extensions/manifest.json";
+            const m = JSON.parse(fs.readFileSync(p, "utf8"));
+            m.duckdbVersion = "0.0.1";
+            fs.writeFileSync(p, JSON.stringify(m));
+          '
+          if node tools/check-bundled-extensions.mjs; then
+            echo "::error::the version gate accepted a mismatched manifest"
+            exit 1
+          fi
+          echo "the gate rejected it, as it should"

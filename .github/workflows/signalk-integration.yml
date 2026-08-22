@@ -1,0 +1,148 @@
+# Boots a real Signal K server and checks that it discovers and loads this
+# package as a plugin. Nothing else covers that: the unit suites run compiled
+# modules in isolation, and package-e2e asserts the tarball's shape -- not
+# that signalk-server finds the package, reads its schema and starts it.
+#
+# It does not yet assert history-provider registration, because this build
+# registers none. The v2 and v1 surfaces are halos-org/halos#171 and #172, and
+# the assertion belongs with them.
+
+name: Signal K Integration
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: signalk-server ${{ matrix.signalk-server-version }} / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+        signalk-server-version: ["latest"]
+
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - name: Build and pack the plugin
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run build
+          echo "PLUGIN_TGZ=$(npm pack --ignore-scripts --pack-destination /tmp)" >> "$GITHUB_ENV"
+
+      - name: Install signalk-server and the plugin
+        run: |
+          mkdir -p /tmp/sk-test && cd /tmp/sk-test
+          npm init -y > /dev/null
+          npm install signalk-server@${{ matrix.signalk-server-version }}
+          # basename defensively: some npm versions emit a path-prefixed name.
+          npm install "/tmp/$(basename "$PLUGIN_TGZ")"
+
+      - name: Enable the plugin
+        run: |
+          cd /tmp/sk-test
+          mkdir -p plugin-config-data
+          # The plugin id is declared in the plugin's own code, not derived from
+          # the package name, so it is read back rather than assumed.
+          PLUGIN_ID=$(node -p "require('/tmp/sk-test/node_modules/signalk-parquet-history-provider/dist/plugin-id.js').PLUGIN_ID")
+          echo "PLUGIN_ID=$PLUGIN_ID" >> "$GITHUB_ENV"
+          cat > "plugin-config-data/${PLUGIN_ID}.json" <<JSON
+          { "enabled": true, "configuration": {} }
+          JSON
+
+      - name: Start the server and verify the plugin
+        env:
+          # How the server finds plugin-config-data/. Without it the config
+          # written above is never read and the plugin stays disabled, which
+          # would fail this job for the wrong reason.
+          SIGNALK_NODE_CONFIG_DIR: /tmp/sk-test
+        run: |
+          cd /tmp/sk-test
+          npx signalk-server --sample-nmea0183-data -p 3000 > /tmp/sk.log 2>&1 &
+          echo $! > /tmp/sk.pid
+
+          for _ in $(seq 1 60); do
+            curl -sf http://localhost:3000/signalk/v1/api/ > /dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -sf http://localhost:3000/signalk/v1/api/ > /dev/null || {
+            echo "::error::signalk-server did not start"; cat /tmp/sk.log; exit 1; }
+
+          echo "--- loaded plugins ---"
+          PLUGINS=$(curl -sf http://localhost:3000/skServer/plugins)
+          echo "$PLUGINS" | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8")).forEach(p=>console.log(p.id))'
+          echo "$PLUGINS" | grep -q "$PLUGIN_ID" || {
+            echo "::error::the server did not load the plugin"; cat /tmp/sk.log; exit 1; }
+
+          # The configuration form the operator sees IS plugin.schema(). An
+          # empty schema loads without error and leaves every option unsettable.
+          echo "--- config schema ---"
+          echo "$PLUGINS" | node -e '
+            const plugins = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            const plugin = plugins.find((p) => p.id === process.env.PLUGIN_ID);
+            const properties = Object.keys(plugin.schema?.properties ?? {});
+            console.log(properties.join(", "));
+            const required = ["pathFilter", "defaultSamplingRate", "dataDir", "rollIntervalMinutes"];
+            const missing = required.filter((name) => !properties.includes(name));
+            if (missing.length > 0) {
+              console.error(`::error::the config form is missing ${missing.join(", ")}`);
+              process.exit(1);
+            }
+          '
+
+          # The premise of the design: the server pays for no storage engine.
+          # /tmp/sk.pid is npx's, not the server's, so the process is found by
+          # name -- and not finding it fails, because a check that cannot
+          # locate its target must not report success.
+          echo "--- native libraries in the server process ---"
+          SERVER_PIDS=$(pgrep -f "signalk-server" || true)
+          [ -n "$SERVER_PIDS" ] || {
+            echo "::error::could not find the signalk-server process to inspect"; exit 1; }
+          for pid in $SERVER_PIDS; do
+            if grep -qi duckdb "/proc/$pid/maps" 2>/dev/null; then
+              echo "::error::the Signal K process (pid $pid) mapped a DuckDB library"
+              exit 1
+            fi
+          done
+          echo "no DuckDB library mapped in: $(echo "$SERVER_PIDS" | tr '\n' ' ')"
+
+      - name: Stop the server
+        if: always()
+        run: kill "$(cat /tmp/sk.pid)" 2>/dev/null || true
+
+      - name: Server log
+        if: failure()
+        run: tail -200 /tmp/sk.log || true
+
+  # A stable name for branch protection to require. The matrix job names carry
+  # their matrix values ("signalk-server latest / Node 22"), so requiring those
+  # directly means every matrix edit silently blocks every PR on a context that
+  # will never report again.
+  integration-status:
+    name: Integration status
+    if: always()
+    needs: [integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the matrix result
+        run: |
+          echo "integration: ${{ needs.integration.result }}"
+          # skipped and cancelled are not success. Only success passes.
+          [ "${{ needs.integration.result }}" = "success" ] || {
+            echo "::error::the Signal K integration matrix did not succeed"; exit 1; }
