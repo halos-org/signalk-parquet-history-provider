@@ -14,6 +14,24 @@
 export const SQLITE_SCANNER = "sqlite_scanner";
 
 /**
+ * The platforms the npm tarball carries: the HaLOS device target, plus x86
+ * Linux for CI and development.
+ *
+ * Here, not in the scripts, because the fetcher's default and the publish
+ * gate's requirement are one rule. Two copies can disagree in the direction
+ * that is silent — a platform fetched but not required means removing it from
+ * the fetch list still passes `--strict`, and publishes a tarball with no
+ * binary for a device that used to have one.
+ */
+export const PUBLISHED_PLATFORMS = ["linux_arm64", "linux_amd64"] as const;
+
+/** Whether a dependency spec is an exact pin. A range would let an install
+ * move the engine away from the bundled extension binary. */
+export function isExactPin(spec: string): boolean {
+  return /^\d+\.\d+\.\d+(-r\.\d+)?$/.test(spec.trim());
+}
+
+/**
  * `@duckdb/node-api` publishes one npm version per DuckDB release plus a
  * revision suffix — `1.5.5-r.4` wraps DuckDB `1.5.5`. The extension
  * repository is keyed by the DuckDB version, so the suffix has to come off.

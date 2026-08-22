@@ -1,13 +1,16 @@
 import { createHash } from "node:crypto";
 import {
-  chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readdirSync,
   renameSync,
   statSync,
   unlinkSync,
-  writeFileSync,
+  writeSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,7 +30,8 @@ import {
  * internet and run it, at query time, in a process that holds the vessel's
  * history. Restricting file access and locking the configuration after
  * startup is the other half, and belongs with the query layer that knows
- * which directories are legitimate (halos-org/halos#166).
+ * which directories are legitimate:
+ * https://github.com/halos-org/halos/issues/166
  */
 export const BASE_DUCKDB_CONFIG: Readonly<Record<string, string>> =
   Object.freeze({
@@ -35,10 +39,18 @@ export const BASE_DUCKDB_CONFIG: Readonly<Record<string, string>> =
     autoload_known_extensions: "false",
   });
 
+export interface PlatformEntry {
+  /** Of the compressed file as shipped. */
+  sha256: string;
+  bytes: number;
+  /** Of the expanded binary, so a truncated cache entry is detectable without
+   * hashing 27 MB on every spawned process. */
+  expandedBytes: number;
+}
+
 export interface ExtensionManifest {
   duckdbVersion: string;
-  /** sha256 of the compressed file, per platform triple. */
-  platforms: Record<string, { sha256: string; bytes: number }>;
+  platforms: Record<string, PlatformEntry>;
 }
 
 /** The installed package's root, from this module's own location. */
@@ -47,10 +59,12 @@ export function packageRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 }
 
-/** The DuckDB version this package is pinned to, read from the dependency
- * that supplies the engine. `package.json` pins it exactly for this reason:
- * a range would let an install drift the engine away from the bundled
- * extension, which only shows up as a `LOAD` failure on the device. */
+/**
+ * The DuckDB version this package is pinned to, read from the dependency that
+ * supplies the engine. `package.json` pins it exactly for this reason: a range
+ * would let an install move the engine away from the bundled extension, which
+ * only shows up as a `LOAD` failure on the device.
+ */
 export function pinnedDuckdbVersion(root: string = packageRoot()): string {
   const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
     dependencies?: Record<string, string>;
@@ -71,7 +85,30 @@ export function readManifest(root: string = packageRoot()): ExtensionManifest {
         `have shipped them.`,
     );
   }
-  return JSON.parse(readFileSync(path, "utf8")) as ExtensionManifest;
+  // Three readers share this file and none of them owns its shape, so it is
+  // checked here rather than cast. An absent `platforms` otherwise surfaces as
+  // a TypeError raised while building the message for a different failure.
+  const manifest = JSON.parse(
+    readFileSync(path, "utf8"),
+  ) as Partial<ExtensionManifest>;
+  if (
+    typeof manifest.duckdbVersion !== "string" ||
+    typeof manifest.platforms !== "object" ||
+    manifest.platforms === null
+  ) {
+    throw new Error(`${path} is not a readable extension manifest`);
+  }
+  // The engine and the extension are shipped together and must agree; a
+  // mismatch here means an install moved one of them, and `LOAD` would report
+  // it much later with a message naming neither version.
+  const pinned = pinnedDuckdbVersion(root);
+  if (manifest.duckdbVersion !== pinned) {
+    throw new Error(
+      `The bundled extensions are for DuckDB ${manifest.duckdbVersion} but ` +
+        `this package pins ${pinned}.`,
+    );
+  }
+  return manifest as ExtensionManifest;
 }
 
 export interface ResolveOptions {
@@ -80,67 +117,88 @@ export interface ResolveOptions {
   cacheDir: string;
   root?: string;
   platform?: string;
-  extension?: string;
 }
 
 /**
- * The absolute path of a loadable `sqlite_scanner` for this platform.
+ * The absolute path of a loadable `sqlite_scanner` for this platform,
+ * expanding the bundled copy on first use.
  *
  * The package ships the binary gzipped, because that is 8 MB against 27 MB
  * and npm would compress it anyway. DuckDB's `LOAD '<path>'` needs the
  * decompressed file, so the first caller on a device expands it into the
  * cache and every later one finds it there. Version- and platform-keyed, so
  * a DuckDB upgrade expands a fresh copy rather than loading a stale one.
+ *
+ * Named for what it does. "resolve" reads as a path computation, and a caller
+ * who believes that will call it in a loop.
  */
-export function resolveExtension(options: ResolveOptions): string {
+export function ensureExtensionExtracted(options: ResolveOptions): string {
   const root = options.root ?? packageRoot();
   const platform = options.platform ?? currentDuckdbPlatform();
-  const extension = options.extension ?? SQLITE_SCANNER;
   const manifest = readManifest(root);
   const version = manifest.duckdbVersion;
+  const expected = manifest.platforms[platform];
 
-  const target = join(
-    options.cacheDir,
-    `v${version}`,
-    platform,
-    `${extension}.duckdb_extension`,
-  );
-  if (existsSync(target) && statSync(target).size > 0) return target;
-
-  const source = join(
-    root,
-    bundledExtensionRelPath(version, platform, extension),
-  );
-  if (!existsSync(source)) {
-    const shipped = Object.keys(manifest.platforms).join(", ") || "none";
+  // A binary the manifest does not describe is not something to load. The
+  // fetch script writes files inside its loop and the manifest only after it,
+  // so an interrupted fetch leaves exactly this state — and skipping the
+  // checksum for it would mean the integrity check quietly does nothing in
+  // the one case where something has already gone wrong.
+  if (!expected) {
+    const shipped = Object.keys(manifest.platforms).sort().join(", ") || "none";
     throw new Error(
-      `This build bundles ${extension} for ${shipped}, not for ${platform}. ` +
-        `Add it to the published platform set, or run ` +
+      `This build bundles ${SQLITE_SCANNER} for ${shipped}, not for ` +
+        `${platform}. Add it to the published platform set, or run ` +
         `\`./run fetch-extensions ${platform}\` in a clone.`,
     );
   }
 
-  const compressed = readFileSync(source);
-  const expected = manifest.platforms[platform];
-  if (expected) {
-    const actual = createHash("sha256").update(compressed).digest("hex");
-    if (actual !== expected.sha256) {
-      throw new Error(
-        `Bundled ${extension} for ${platform} does not match the manifest ` +
-          `checksum (${actual} vs ${expected.sha256}).`,
-      );
-    }
+  const targetDir = join(options.cacheDir, `v${version}`, platform);
+  const target = join(targetDir, `${SQLITE_SCANNER}.duckdb_extension`);
+  // Length, not a hash: hashing 27 MB in every spawned query process is a real
+  // cost, and a truncated file — what a power cut between the write and the
+  // rename leaves behind — is exactly what a length catches. A file of the
+  // right length and wrong content is not a failure a boat produces.
+  if (existsSync(target) && statSync(target).size === expected.expandedBytes) {
+    return target;
   }
 
-  mkdirSync(dirname(target), { recursive: true });
-  // Expand through a private temporary name and rename into place: several
-  // query processes can spawn at once, and a reader must never see a
-  // half-written 27 MB binary. rename() within one directory is atomic.
-  const temp = `${target}.${process.pid}.tmp`;
+  const source = join(root, bundledExtensionRelPath(version, platform));
+  if (!existsSync(source)) {
+    throw new Error(
+      `${source} is missing, though the manifest lists ${platform}. The ` +
+        `published tarball did not carry it.`,
+    );
+  }
+
+  const compressed = readFileSync(source);
+  const actual = createHash("sha256").update(compressed).digest("hex");
+  if (actual !== expected.sha256) {
+    throw new Error(
+      `Bundled ${SQLITE_SCANNER} for ${platform} does not match the manifest ` +
+        `checksum (${actual} vs ${expected.sha256}).`,
+    );
+  }
+
+  mkdirSync(targetDir, { recursive: true });
+  sweepStaleTemporaries(targetDir);
+
+  // Expand through a temporary name and rename into place: several query
+  // processes can spawn at once, and a reader must never see a half-written
+  // 27 MB binary. The fsync is what makes that survive a power cut — rename is
+  // atomic against a concurrent reader and says nothing about what reached
+  // the disk, and power loss is the normal way a vessel's Pi shuts down.
+  const temp = join(targetDir, `${SQLITE_SCANNER}.${process.pid}.tmp`);
   try {
-    writeFileSync(temp, gunzipSync(compressed));
-    chmodSync(temp, 0o644);
+    const fd = openSync(temp, "wx", 0o644);
+    try {
+      writeSync(fd, gunzipSync(compressed));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(temp, target);
+    syncDirectory(targetDir);
   } catch (err) {
     try {
       unlinkSync(temp);
@@ -150,6 +208,39 @@ export function resolveExtension(options: ResolveOptions): string {
     throw err;
   }
   return target;
+}
+
+/**
+ * Remove `*.tmp` left by a process that died between the write and the
+ * rename. The catch above covers a thrown error; it does not cover SIGKILL,
+ * an OOM kill or a power cut, and each orphan is 27 MB on the same card that
+ * holds the hot store and the Parquet tree.
+ */
+function sweepStaleTemporaries(directory: string): void {
+  for (const entry of readdirSync(directory)) {
+    if (!entry.startsWith(`${SQLITE_SCANNER}.`) || !entry.endsWith(".tmp")) {
+      continue;
+    }
+    try {
+      unlinkSync(join(directory, entry));
+    } catch {
+      /* another process may be writing it right now */
+    }
+  }
+}
+
+function syncDirectory(directory: string): void {
+  try {
+    const fd = openSync(directory, "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // Not every platform allows fsync on a directory handle. The device target
+    // is Linux, where it works and where it is what makes the rename durable.
+  }
 }
 
 /** Minimal shape of what `DuckDBConnection` offers us, so this module stays
@@ -163,7 +254,7 @@ export async function loadSqliteScanner(
   connection: Runnable,
   options: ResolveOptions,
 ): Promise<string> {
-  const path = resolveExtension(options);
+  const path = ensureExtensionExtracted(options);
   // A single-quoted literal: the path is ours (package root plus configured
   // cache directory), and DuckDB has no parameter binding for LOAD.
   await connection.run(`LOAD '${path.replaceAll("'", "''")}'`);
