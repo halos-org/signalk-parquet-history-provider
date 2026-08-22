@@ -31,11 +31,6 @@ import { gunzipSync } from "node:zlib";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-/** Platforms the npm tarball carries: the HaLOS device target, plus x86 Linux
- * for CI and development. Anything else is a `./run fetch-extensions <triple>`
- * away, and dev machines have network. */
-const PUBLISHED_PLATFORMS = ["linux_arm64", "linux_amd64"];
-
 const dist = join(ROOT, "dist", "duckdb", "duckdb-version.js");
 if (!existsSync(dist)) {
   console.error(
@@ -45,6 +40,7 @@ if (!existsSync(dist)) {
   process.exit(1);
 }
 const {
+  PUBLISHED_PLATFORMS,
   SQLITE_SCANNER,
   bundledExtensionRelPath,
   currentDuckdbPlatform,
@@ -64,9 +60,11 @@ const version = duckdbVersionFromPackageVersion(pinned);
 // verify here and expensive to be wrong about later: a mismatched extension
 // only fails at LOAD, on the device. duckdb-version.ts says this check exists.
 const { DuckDBInstance } = await import("@duckdb/node-api");
+const { BASE_DUCKDB_CONFIG } = await import(
+  join(ROOT, "dist", "duckdb", "extension.js")
+);
 const instance = await DuckDBInstance.create(":memory:", {
-  autoinstall_known_extensions: "false",
-  autoload_known_extensions: "false",
+  ...BASE_DUCKDB_CONFIG,
 });
 const connection = await instance.connect();
 const reported = String(
@@ -86,7 +84,7 @@ const platforms = args.includes("--current")
   ? [currentDuckdbPlatform()]
   : args.length > 0
     ? args
-    : PUBLISHED_PLATFORMS;
+    : [...PUBLISHED_PLATFORMS];
 
 const extensionsDir = join(ROOT, "extensions");
 const versionDir = join(extensionsDir, `v${version}`);
@@ -114,13 +112,7 @@ const manifest = { duckdbVersion: version, platforms: { ...previous } };
 for (const platform of platforms) {
   const url = extensionUrl(version, platform, SQLITE_SCANNER);
   process.stdout.write(`fetching ${platform} ... `);
-  const response = await fetch(url);
-  if (!response.ok) {
-    console.log("");
-    console.error(`${url} returned ${response.status} ${response.statusText}`);
-    process.exit(1);
-  }
-  const bytes = Buffer.from(await response.arrayBuffer());
+  const bytes = await fetchWithRetry(url);
 
   // A CDN error page is a 200 with HTML in it often enough to be worth ruling
   // out here rather than at LOAD time on a boat.
@@ -141,11 +133,38 @@ for (const platform of platforms) {
   manifest.platforms[platform] = {
     sha256: createHash("sha256").update(bytes).digest("hex"),
     bytes: bytes.length,
+    // What a complete expansion weighs. The runtime checks the cached file
+    // against this instead of hashing 27 MB in every spawned query process.
+    expandedBytes: expanded.length,
   };
   console.log(
     `${(bytes.length / 1e6).toFixed(1)} MB compressed, ` +
       `${(expanded.length / 1e6).toFixed(1)} MB expanded`,
   );
+}
+
+async function fetchWithRetry(url, attempts = 3) {
+  let lastError = "";
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      // Without a deadline a slow-drip CDN stalls on undici's multi-minute
+      // default, inside `npm publish`.
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(120_000),
+      });
+      if (response.ok) return Buffer.from(await response.arrayBuffer());
+      lastError = `${response.status} ${response.statusText}`;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+    if (attempt < attempts) {
+      process.stdout.write(`(${lastError}, retrying) `);
+      await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+    }
+  }
+  console.log("");
+  console.error(`${url} failed after ${attempts} attempts: ${lastError}`);
+  process.exit(1);
 }
 
 mkdirSync(versionDir, { recursive: true });

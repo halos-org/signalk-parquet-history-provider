@@ -19,7 +19,6 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const REQUIRED_PLATFORMS = ["linux_arm64", "linux_amd64"];
 const strict = process.argv.includes("--strict");
 
 const fail = (message) => {
@@ -27,13 +26,23 @@ const fail = (message) => {
   process.exit(1);
 };
 
-const { bundledExtensionRelPath, duckdbVersionFromPackageVersion } =
-  await import(join(ROOT, "dist", "duckdb", "duckdb-version.js"));
+const dist = join(ROOT, "dist", "duckdb", "duckdb-version.js");
+if (!existsSync(dist)) {
+  // Its sibling fetch-extensions.mjs says this rather than dumping an
+  // ERR_MODULE_NOT_FOUND stack naming an internal Node resolver.
+  fail("dist/ is missing. Run `npx tsc` first.");
+}
+const {
+  PUBLISHED_PLATFORMS,
+  bundledExtensionRelPath,
+  duckdbVersionFromPackageVersion,
+  isExactPin,
+} = await import(dist);
 
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
 const spec = pkg.dependencies?.["@duckdb/node-api"];
 if (!spec) fail("package.json does not depend on @duckdb/node-api");
-if (!/^\d+\.\d+\.\d+(-r\.\d+)?$/.test(spec)) {
+if (!isExactPin(spec)) {
   fail(
     `@duckdb/node-api is "${spec}", a range. It must be pinned exactly: a ` +
       `range lets an install move the engine away from the bundled extension.`,
@@ -83,10 +92,29 @@ for (const [platform, expected] of Object.entries(manifest.platforms)) {
   if (sha256 !== expected.sha256) {
     fail(`${platform} does not match its manifest checksum.`);
   }
+  if (typeof expected.expandedBytes !== "number") {
+    fail(
+      `${platform} has no expandedBytes; re-run \`./run fetch-extensions\`.`,
+    );
+  }
+}
+
+// The other direction. Walking only the manifest means a binary it does not
+// list is never examined -- and the runtime used to skip its checksum for the
+// same reason, so an interrupted fetch could ship an unverified file.
+const versionDir = join(extensionsDir, `v${version}`);
+if (existsSync(versionDir)) {
+  for (const platform of readdirSync(versionDir)) {
+    if (manifest.platforms[platform]) continue;
+    fail(
+      `extensions/v${version}/${platform} holds a binary the manifest does ` +
+        `not list. Re-run \`./run fetch-extensions\`.`,
+    );
+  }
 }
 
 if (strict) {
-  const missing = REQUIRED_PLATFORMS.filter((p) => !manifest.platforms[p]);
+  const missing = PUBLISHED_PLATFORMS.filter((p) => !manifest.platforms[p]);
   if (missing.length > 0) {
     fail(`the published set is missing ${missing.join(", ")}.`);
   }

@@ -56,9 +56,11 @@ function ci {
 function fetch-extensions {
   #@ Download the bundled DuckDB extensions (default: the published set)
   #@ Category: DuckDB
-  # Needs dist/: the version and path rules live in the compiled sources so
-  # that this, the build gate and the runtime resolver cannot disagree.
-  npm run build
+  # Compiles with tsc directly rather than `npm run build`, which also runs the
+  # bundled-extension gate. That gate fails on a stale or mismatched
+  # extensions/ directory -- exactly the state this command exists to repair --
+  # so going through it would refuse to run the fix and name itself as the fix.
+  npx tsc
   node tools/fetch-extensions.mjs "$@"
 }
 
