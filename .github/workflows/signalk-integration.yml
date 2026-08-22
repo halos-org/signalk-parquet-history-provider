@@ -4,8 +4,9 @@
 # that signalk-server finds the package, reads its schema and starts it.
 #
 # It does not yet assert history-provider registration, because this build
-# registers none. The v2 and v1 surfaces are halos-org/halos#171 and #172, and
-# the assertion belongs with them.
+# registers none. The v2 and v1 surfaces are issues 171 and 172 under
+# https://github.com/halos-org/halos/issues/152, and the assertion belongs
+# with them.
 
 name: Signal K Integration
 
@@ -105,6 +106,28 @@ jobs:
               process.exit(1);
             }
           '
+
+          # Discovery is not startup. signalk-server lists installed plugins
+          # whether or not they are enabled, and start() reports every failure
+          # through setPluginError and returns normally -- so a plugin that
+          # failed to start looks identical above. That matters most for the
+          # library check below: if no plugin code ran, nothing could have been
+          # mapped, and the job would pass for the wrong reason.
+          #
+          # The directories are the assertion rather than the status line:
+          # setPluginStatus does not populate statusMessage on this endpoint
+          # (verified against a real server -- it stays empty for a plugin that
+          # started correctly), and a created directory is positive evidence
+          # that start() ran to completion. It also pins the on-disk layout
+          # that the writer unit will assume.
+          echo "--- storage layout the plugin created ---"
+          DATA_DIR="/tmp/sk-test/plugin-config-data/$PLUGIN_ID"
+          for sub in hot parquet duckdb-extensions; do
+            [ -d "$DATA_DIR/$sub" ] || {
+              echo "::error::the plugin did not create $DATA_DIR/$sub, so start() did not complete"
+              cat /tmp/sk.log; exit 1; }
+            echo "  $DATA_DIR/$sub"
+          done
 
           # The premise of the design: the server pays for no storage engine.
           # /tmp/sk.pid is npx's, not the server's, so the process is found by

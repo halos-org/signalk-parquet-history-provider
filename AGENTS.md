@@ -37,9 +37,13 @@ DuckDB that exits.
 So `src/index.ts` and everything it imports must never reach
 `@duckdb/node-api`. One import undoes the plugin's entire reason to exist by
 mapping a ~100 MB native addon into the server, and nothing else would fail.
-`src/test/plugin-import-graph.test.ts` checks the compiled import graph and
-then checks what a real process loads; the Signal K integration workflow
-checks `/proc/<pid>/maps` on a running server. Do not weaken any of the three.
+`src/test/plugin-import-graph.test.ts` matches any `@duckdb/*` specifier — the
+native addon lives in `@duckdb/node-bindings-<platform>`, not in the wrapper —
+including `require()` and `createRequire` forms, and then starts the plugin in
+a real process and checks what it mapped. The Signal K integration workflow
+checks `/proc/<pid>/maps` on a running server. Do not weaken any of the three:
+a lazily-loaded engine inside a query handler is the shape that would slip past
+a check on module evaluation alone.
 
 ## Layout
 
@@ -81,14 +85,22 @@ checks `/proc/<pid>/maps` on a running server. Do not weaken any of the three.
 `sqlite_scanner` is not statically linked into DuckDB and is not committed
 here. `./run fetch-extensions` downloads it; `prepublishOnly` does the same
 before packing. `tools/check-bundled-extensions.mjs` fails the build when the
-bundle and the pinned engine disagree, and `--strict` additionally fails when
-the published platform set is incomplete. The scripts in `tools/` read the
-version and path rules from `dist/`, so they need a build first — that is on
-purpose, so those rules exist once and are unit-tested.
+bundle and the pinned engine disagree, when a binary is present that the
+manifest does not describe, and — with `--strict` — when the published platform
+set is incomplete. The scripts in `tools/` read the version, path and platform
+rules from `dist/`, so they need a build first — that is on purpose, so those
+rules exist once and are unit-tested.
+
+`./run fetch-extensions` compiles with `tsc` directly rather than through
+`npm run build`, which also runs that gate. The gate fails on a stale or
+mismatched `extensions/` directory — the state the command exists to repair —
+so routing through it would refuse to run the fix and then name the fix as the
+remedy.
 
 ## Measurement
 
 Numbers get reported with their spread, never as point estimates, and a
-transient peak is never added to a steady-state figure. `src/bench/` enforces
-the method; `./run bench selftest` shows the harness agreeing with a load
-generator's own accounting of itself.
+transient peak is never added to a steady-state figure. Rates divide by the
+interval the clock measured, not the one that was requested. `src/bench/`
+enforces the method; `./run bench selftest` compares the harness against a load
+generator's own accounting of itself and exits non-zero when they disagree.

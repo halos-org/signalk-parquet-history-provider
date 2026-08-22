@@ -56,9 +56,26 @@ jobs:
             -v "$PWD":/w -w /w node:24 \
             node dist/duckdb/check-extension.js
 
+      - name: Install the packed tarball and load from inside it
+        # The composition that actually ships: pack, install, resolve out of
+        # node_modules, LOAD. Each half is covered separately and the join was
+        # not -- so a published tarball missing the binary, or carrying one the
+        # manifest does not describe, would first be discovered on a boat.
+        run: |
+          TGZ=$(npm pack --pack-destination /tmp | tail -1)
+          mkdir -p /tmp/installed && cd /tmp/installed
+          npm init -y > /dev/null
+          npm install "/tmp/$(basename "$TGZ")"
+          cd /tmp/installed
+          docker run --rm --network none \
+            -v /tmp/installed:/w -w /w node:24 \
+            node node_modules/signalk-parquet-history-provider/dist/duckdb/check-extension.js
+
       - name: Refuse a build whose extension does not match the engine
-        # The gate itself, exercised: a manifest naming a different DuckDB
-        # version must fail here rather than at LOAD on a boat.
+        # The gate itself, exercised. Asserting on the message, not just on a
+        # non-zero exit: a syntax error, a missing dist/ or a renamed export
+        # all exit non-zero too, so exit code alone cannot tell a correct
+        # rejection from a crash, and this step would go green either way.
         run: |
           node -e '
             const fs = require("fs");
@@ -67,8 +84,29 @@ jobs:
             m.duckdbVersion = "0.0.1";
             fs.writeFileSync(p, JSON.stringify(m));
           '
-          if node tools/check-bundled-extensions.mjs; then
+          if out=$(node tools/check-bundled-extensions.mjs 2>&1); then
             echo "::error::the version gate accepted a mismatched manifest"
             exit 1
           fi
-          echo "the gate rejected it, as it should"
+          echo "$out"
+          echo "$out" | grep -q "holds DuckDB 0.0.1 binaries" || {
+            echo "::error::the gate failed, but not for the reason under test"
+            exit 1; }
+          echo "the gate rejected it, and said why"
+
+      - name: Refuse a binary the manifest does not describe
+        # The other direction: walking only the manifest means a stray file is
+        # never examined, and the runtime used to skip its checksum for the
+        # same reason. An interrupted fetch leaves exactly this state.
+        run: |
+          node tools/fetch-extensions.mjs ${{ matrix.platform }}
+          mkdir -p "extensions/v$(node -p "require('./extensions/manifest.json').duckdbVersion")/osx_arm64"
+          echo unlisted > "extensions/v$(node -p "require('./extensions/manifest.json').duckdbVersion")/osx_arm64/sqlite_scanner.duckdb_extension.gz"
+          if out=$(node tools/check-bundled-extensions.mjs 2>&1); then
+            echo "::error::the gate accepted an unlisted binary"
+            exit 1
+          fi
+          echo "$out" | grep -q "the manifest does" || {
+            echo "::error::the gate failed, but not for the reason under test"
+            exit 1; }
+          echo "the gate rejected it, and said why"

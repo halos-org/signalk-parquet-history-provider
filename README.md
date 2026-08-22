@@ -83,10 +83,16 @@ Every unit that reports a number reports it through `src/bench/`, so the
 figures are comparable across units and against the QuestDB baseline. The
 method: settle, then N windows, each differenced end to end for its rate and
 split in half to check that it measured a steady state rather than a
-transition. Memory is sampled through the window instead, and its peak is
-reported apart from its mean — a transient peak and a 24-hour cost are
-different quantities, and adding them produces a number that describes
-nothing.
+transition. Rates divide by the interval the clock actually measured, never by
+the requested window length — those differ under load, and by more in the
+condition being tested than in the control it is compared against.
+
+Memory is sampled through the window instead, and its peak is reported apart
+from its mean: a transient peak and a 24-hour cost are different quantities,
+and adding them produces a number that describes nothing. The peak comes from
+the kernel's own high-water mark (`VmHWM`, or cgroup `memory.peak`) rather than
+from the samples, because the roll process is short-lived by design and its
+peak is exactly what a sampling interval misses.
 
 ```
 ./run bench run --label sqhp --subject signalk:pid=1234 -o sqhp.json
@@ -94,10 +100,11 @@ nothing.
 ./run bench selftest
 ```
 
-`selftest` measures a load generator with a known duty cycle and prints the
-generator's own accounting beside the harness's numbers, so a machine can show
-the harness reports what it should before anyone trusts it about a real
-workload. It reads `/proc` and cgroup counters, so it only runs on Linux.
+`selftest` measures a load generator with a known duty cycle and compares the
+harness's numbers against the generator's own accounting — it counted the bytes
+it fsynced and asked the kernel for its own CPU time, so those are ground truth
+and a disagreement beyond 15% fails the command. It reads `/proc` and cgroup
+counters, so it only runs on Linux.
 
 ## Development
 
