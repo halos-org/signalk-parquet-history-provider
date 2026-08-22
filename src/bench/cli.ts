@@ -19,7 +19,16 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { LoadStats, STATS_FILE, loadStatsSummary } from "./load-stats.js";
 import { renderComparison } from "./report.js";
-import { DEFAULTS, RunResult, runBenchmark } from "./run.js";
+import {
+  DEFAULTS,
+  RESULT_FORMAT_VERSION,
+  RunResult,
+  runBenchmark,
+} from "./run.js";
+
+/** The selftest generator's write cadence, named once so the argument and the
+ * note that describes it cannot disagree. */
+const SELFTEST_WRITE_INTERVAL_MS = 250;
 import { createProcSampler, parseSubjectSpec } from "./subjects.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -87,9 +96,7 @@ async function doCompare(argv: string[]): Promise<void> {
   if (positionals.length === 0) {
     throw new Error("compare takes one or more result files");
   }
-  const runs = positionals.map(
-    (path) => JSON.parse(readFileSync(path, "utf8")) as RunResult,
-  );
+  const runs = positionals.map((path) => readRunResult(path));
   const table = renderComparison(runs);
   if (values.out) {
     writeFileSync(values.out, table);
@@ -124,6 +131,7 @@ async function doSelftest(argv: string[]): Promise<void> {
 
   try {
     const runs: RunResult[] = [];
+    const disagreements: string[] = [];
     for (const condition of conditions) {
       const dir = join(work, condition.label);
       const child = spawn(
@@ -135,29 +143,42 @@ async function doSelftest(argv: string[]): Promise<void> {
           "--write-kb",
           String(condition.writeKb),
           "--interval-ms",
-          "250",
+          String(SELFTEST_WRITE_INTERVAL_MS),
           "--dir",
           dir,
         ],
         { stdio: "ignore" },
       );
-      const exited = new Promise<void>((resolve) =>
-        child.once("exit", () => resolve()),
-      );
+      // Without an error listener a failed spawn (EMFILE, ENOMEM, a missing
+      // load.js) becomes an uncaught exception outside this promise chain, so
+      // the outer finally never runs and the temp directory is left behind.
+      const spawnFailure: { error?: Error } = {};
+      child.once("error", (err: Error) => {
+        spawnFailure.error = err;
+      });
+      const exited = new Promise<void>((resolve) => {
+        child.once("exit", () => resolve());
+        child.once("error", () => resolve());
+      });
+      if (child.pid === undefined) {
+        throw new Error(
+          `Could not start the load generator: ${spawnFailure.error?.message ?? "spawn returned no pid"}`,
+        );
+      }
       let result: RunResult;
       try {
         result = await runBenchmark({
           label: condition.label,
-          subjects: [{ name: "load", kind: "pid", pid: child.pid as number }],
+          subjects: [{ name: "load", kind: "pid", pid: child.pid }],
           sampler: createProcSampler(),
-          windows: Number(values.windows),
-          windowSeconds: Number(values["window-seconds"]),
-          settleSeconds: Number(values["settle-seconds"]),
+          windows: numberOr(values.windows, 3),
+          windowSeconds: numberOr(values["window-seconds"], 6),
+          settleSeconds: numberOr(values["settle-seconds"], 2),
           gaugeIntervalSeconds: 1,
           notes: [
             `load generator at ${(condition.duty * 100).toFixed(0)}% duty`,
             condition.writeKb > 0
-              ? `${condition.writeKb} KB fsynced every ~250 ms`
+              ? `${condition.writeKb} KB fsynced every ~${SELFTEST_WRITE_INTERVAL_MS} ms`
               : "no writes",
           ],
           log: (message) => console.error(`[${condition.label}] ${message}`),
@@ -166,14 +187,21 @@ async function doSelftest(argv: string[]): Promise<void> {
         child.kill("SIGTERM");
       }
 
+      // The generator exits at the end of its current slice — unless it is
+      // parked in fsync on a stalled card, which ignores every signal. Waiting
+      // unconditionally would hang a run whose measurement already completed,
+      // inside the try, so the temp directory would leak too.
+      await settleChild(child, exited);
+
       // The generator's own account of what it did. It is not a second
       // estimate — it counted the bytes it fsynced and asked the kernel for
       // its own CPU time — so the harness agreeing with it to within a few
       // percent is the thing that makes the harness trustworthy. Timer
       // scheduling means the requested duty and interval are targets, not
       // facts, which is why the note carries this rather than the request.
-      await exited;
-      result.notes.push(byItsOwnAccount(dir));
+      const own = ownAccount(dir);
+      result.notes.push(describeOwnAccount(own));
+      if (own) disagreements.push(...compare(condition.label, result, own));
       runs.push(result);
     }
 
@@ -194,25 +222,144 @@ async function doSelftest(argv: string[]): Promise<void> {
     } else {
       process.stdout.write(table);
     }
+
+    // Printing a table and exiting 0 regardless is not a self-test. The
+    // generator counted the bytes it fsynced and asked the kernel for its own
+    // CPU time, so a disagreement means the harness is wrong about a workload
+    // whose answer is known — which is the only reason to run this.
+    if (disagreements.length > 0) {
+      console.error(
+        `\nThe harness disagrees with the load generator's own accounting:`,
+      );
+      for (const line of disagreements) console.error(`- ${line}`);
+      process.exitCode = 1;
+    } else {
+      console.error(
+        "\nThe harness agrees with the generator's own accounting.",
+      );
+    }
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
 }
 
-function byItsOwnAccount(dir: string): string {
+/**
+ * How far the harness may sit from the generator's own accounting before the
+ * selftest fails.
+ *
+ * Wide, because the generator's figure spans its whole lifetime — settle
+ * included — while the harness's spans only the windows, and because a shared
+ * CI runner is noisy. Still far narrower than the errors it exists to catch: a
+ * rate divided by the nominal rather than the measured window was out by 20%
+ * in the case that prompted this.
+ */
+const SELFTEST_BAND = 0.15;
+
+function compare(
+  label: string,
+  result: RunResult,
+  own: { cpuPercentOfCore: number; writeKbPerSec: number },
+): string[] {
+  const load = result.subjects.find((s) => s.name === "load");
+  if (!load) return [`${label}: the run has no load subject`];
+  const out: string[] = [];
+  const check = (metric: string, truth: number, floor: number) => {
+    const measured = load.metrics[metric]?.dispersion.mean;
+    if (measured === undefined) {
+      out.push(`${label}: the run reports no ${metric}`);
+      return;
+    }
+    // Below the floor both numbers are noise and their ratio says nothing.
+    if (truth < floor && measured < floor) return;
+    const drift = Math.abs(measured - truth) / Math.max(truth, floor);
+    if (drift > SELFTEST_BAND) {
+      out.push(
+        `${label} ${metric}: harness ${measured.toFixed(2)} against the ` +
+          `generator's ${truth.toFixed(2)} (${(drift * 100).toFixed(0)}% apart)`,
+      );
+    }
+  };
+  check("cpuPercentOfCore", own.cpuPercentOfCore, 1);
+  check("writeKbPerSec", own.writeKbPerSec, 1);
+  return out;
+}
+
+/** How long to wait for a SIGTERMed generator before escalating, and again
+ * before giving up on it. */
+const CHILD_EXIT_GRACE_MS = 5000;
+
+async function settleChild(
+  child: { kill: (signal: NodeJS.Signals) => boolean },
+  exited: Promise<void>,
+): Promise<void> {
+  if (await finishesWithin(exited, CHILD_EXIT_GRACE_MS)) return;
+  child.kill("SIGKILL");
+  if (await finishesWithin(exited, CHILD_EXIT_GRACE_MS)) return;
+  console.error(
+    "the load generator did not exit; continuing without its own accounting",
+  );
+}
+
+function finishesWithin(promise: Promise<void>, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    timer.unref();
+    void promise.then(() => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+/**
+ * Read a result file, refusing one this build does not understand rather than
+ * rendering it. An older shape would otherwise surface as a TypeError from
+ * inside the renderer, naming neither the file nor the field.
+ */
+function readRunResult(path: string): RunResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    throw new Error(`${path} is not readable JSON`, { cause: err });
+  }
+  const run = parsed as Partial<RunResult>;
+  if (run.formatVersion !== RESULT_FORMAT_VERSION) {
+    throw new Error(
+      `${path} is result format ${run.formatVersion ?? "unversioned"}; ` +
+        `this build reads ${RESULT_FORMAT_VERSION}`,
+    );
+  }
+  if (!Array.isArray(run.subjects) || !Array.isArray(run.notes)) {
+    throw new Error(`${path} is missing its subjects or notes`);
+  }
+  return run as RunResult;
+}
+
+function ownAccount(
+  dir: string,
+): (LoadStats & { cpuPercentOfCore: number; writeKbPerSec: number }) | null {
   try {
     const stats = JSON.parse(
       readFileSync(join(dir, STATS_FILE), "utf8"),
     ) as LoadStats;
-    const own = loadStatsSummary(stats);
-    return (
-      `by its own accounting over ${(stats.elapsedMs / 1000).toFixed(0)}s ` +
-      `(settle included): ${own.cpuPercentOfCore.toFixed(2)}% of one core, ` +
-      `${own.writeKbPerSec.toFixed(2)} KB/s fsynced in ${stats.writes} writes`
-    );
+    return { ...stats, ...loadStatsSummary(stats) };
   } catch {
-    return "the load generator wrote no stats file";
+    return null;
   }
+}
+
+function describeOwnAccount(own: ReturnType<typeof ownAccount>): string {
+  if (!own) {
+    // Said plainly, because a condition with no ground truth is not one the
+    // reader should compare against a condition that has it.
+    return "the load generator wrote no stats file, so this condition has no ground truth";
+  }
+  return (
+    `by its own accounting over ${(own.elapsedMs / 1000).toFixed(0)}s ` +
+    `(settle included): ${own.cpuPercentOfCore.toFixed(2)}% of one core, ` +
+    `${own.writeKbPerSec.toFixed(2)} KB/s fsynced in ${own.writes} writes`
+  );
 }
 
 function requireLinux(): void {
