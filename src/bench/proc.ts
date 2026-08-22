@@ -40,10 +40,13 @@ export function parseCgroupMemoryStat(text: string): {
   fileBytes: number;
 } {
   const fields = parseKeyValue(text);
-  return {
-    anonBytes: fields.get("anon") ?? 0,
-    fileBytes: fields.get("file") ?? 0,
-  };
+  const anonBytes = fields.get("anon");
+  if (anonBytes === undefined) {
+    // Same rule as parseProcStatusRss: reporting 0 MB is a measurement, and
+    // it is the most flattering possible one for whatever is being tested.
+    throw new Error("memory.stat has no anon line");
+  }
+  return { anonBytes, fileBytes: fields.get("file") ?? 0 };
 }
 
 export interface ProcCpuTicks {
@@ -95,11 +98,35 @@ export function parseProcIo(text: string): ProcIo {
   };
 }
 
-/** `VmRSS` from `/proc/<pid>/status`, in bytes. */
-export function parseProcStatusRss(text: string): number {
-  const match = /^VmRSS:\s+(\d+)\s+kB$/m.exec(text);
-  if (!match) throw new Error("/proc/<pid>/status has no VmRSS line");
-  return Number(match[1]) * 1024;
+/**
+ * `VmRSS` and `VmHWM` from `/proc/<pid>/status`, in bytes.
+ *
+ * The high-water mark is the reason both are read from one file. Sampling RSS
+ * on an interval cannot see a peak that happens between two samples, and the
+ * roll process this harness exists to measure is short-lived by design — its
+ * transient peak is precisely the quantity a 5-second cadence misses. The
+ * kernel has already tracked it.
+ */
+export function parseProcStatusMemory(text: string): {
+  rssBytes: number;
+  peakBytes: number;
+} {
+  const rss = /^VmRSS:\s+(\d+)\s+kB$/m.exec(text);
+  if (!rss) throw new Error("/proc/<pid>/status has no VmRSS line");
+  const hwm = /^VmHWM:\s+(\d+)\s+kB$/m.exec(text);
+  return {
+    rssBytes: Number(rss[1]) * 1024,
+    // VmHWM has been in /proc since 2.6.32, but a kernel without it should
+    // degrade to the sampled maximum rather than fail the run.
+    peakBytes: hwm ? Number(hwm[1]) * 1024 : Number(rss[1]) * 1024,
+  };
+}
+
+/** cgroup v2 `memory.peak`, the subtree's high-water mark. Absent before
+ * kernel 5.19, in which case the sampled maximum is all there is. */
+export function parseCgroupMemoryPeak(text: string): number | null {
+  const value = Number(text.trim());
+  return Number.isFinite(value) ? value : null;
 }
 
 export interface DiskCounters {
@@ -139,7 +166,14 @@ export function parseDiskstats(text: string): Map<string, DiskCounters> {
  * their parent's I/O, and loop/ram devices are not storage the vessel has.
  */
 export function isWholeDisk(name: string): boolean {
-  if (/^(loop|ram|dm-|zram|sr)/.test(name)) return false;
+  if (/^(loop|ram|dm-|zram|sr|nbd|mtdblock)/.test(name)) return false;
+  // An md array and its members both appear, and both count the same writes;
+  // summing all of them reports a mirrored pair at three times its real
+  // traffic, into the row that carries this project's write-amplification
+  // claim.
+  if (/^md\d+/.test(name)) return false;
+  // Every eMMC board — which is the target hardware — carries these.
+  if (/^mmcblk\d+(boot\d+|rpmb)$/.test(name)) return false;
   // nvme0n1 is a device, nvme0n1p1 a partition; mmcblk0 vs mmcblk0p1 likewise.
   if (/^(nvme\d+n\d+|mmcblk\d+)p\d+$/.test(name)) return false;
   // sda1, vdb2 and friends.

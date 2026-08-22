@@ -7,7 +7,8 @@ import {
   parseDiskstats,
   parseProcIo,
   parseProcStat,
-  parseProcStatusRss,
+  parseCgroupMemoryPeak,
+  parseProcStatusMemory,
   sumDisks,
 } from "../bench/proc.js";
 
@@ -34,6 +35,11 @@ describe("parseCgroupCpuStat", () => {
 });
 
 describe("parseCgroupMemoryStat", () => {
+  it("throws when anon is absent rather than reporting no memory", () => {
+    // The most flattering possible number for whatever is being tested.
+    assert.throws(() => parseCgroupMemoryStat("file 402653184\n"), /anon/);
+  });
+
   it("reads anon separately from file", () => {
     const memory = parseCgroupMemoryStat(
       ["anon 91234304", "file 402653184", "kernel_stack 262144"].join("\n"),
@@ -90,18 +96,45 @@ describe("parseProcIo", () => {
   });
 });
 
-describe("parseProcStatusRss", () => {
+describe("parseProcStatusMemory", () => {
+  const status = [
+    "Name:\tnode",
+    "VmPeak:\t 2000000 kB",
+    "VmHWM:\t  218112 kB",
+    "VmRSS:\t   87040 kB",
+  ].join("\n");
+
   it("returns VmRSS in bytes", () => {
-    const rss = parseProcStatusRss(
-      ["Name:\tnode", "VmPeak:\t 2000000 kB", "VmRSS:\t   87040 kB"].join("\n"),
-    );
-    assert.equal(rss, 87040 * 1024);
+    assert.equal(parseProcStatusMemory(status).rssBytes, 87040 * 1024);
+  });
+
+  it("returns the kernel's own high-water mark", () => {
+    // Sampling on an interval cannot see a peak between two samples, and the
+    // roll process is short-lived by design — so the transient the harness is
+    // judged on is exactly the one an interval misses. VmHWM already has it.
+    assert.equal(parseProcStatusMemory(status).peakBytes, 218112 * 1024);
+  });
+
+  it("falls back to VmRSS on a kernel with no VmHWM", () => {
+    const old = ["Name:\tnode", "VmRSS:\t   87040 kB"].join("\n");
+    assert.equal(parseProcStatusMemory(old).peakBytes, 87040 * 1024);
   });
 
   it("throws when the process has no VmRSS", () => {
     // A kernel thread has none. Reporting 0 MB of memory for it would be a
     // measurement, which it is not.
-    assert.throws(() => parseProcStatusRss("Name:\tkthreadd\n"));
+    assert.throws(() => parseProcStatusMemory("Name:\tkthreadd\n"));
+  });
+});
+
+describe("parseCgroupMemoryPeak", () => {
+  it("reads the subtree high-water mark", () => {
+    assert.equal(parseCgroupMemoryPeak("228589568\n"), 228589568);
+  });
+
+  it("returns null rather than a number it cannot read", () => {
+    // memory.peak arrived in kernel 5.19; older kernels simply lack the file.
+    assert.equal(parseCgroupMemoryPeak("max\n"), null);
   });
 });
 
@@ -159,6 +192,16 @@ describe("isWholeDisk", () => {
       "ram0",
       "dm-0",
       "zram0",
+      // An md array and its members both appear and both count the same I/O,
+      // so a mirrored pair would report three times its real traffic.
+      "md0",
+      "md0p1",
+      // Present on every eMMC board, which is the target hardware.
+      "mmcblk0boot0",
+      "mmcblk0boot1",
+      "mmcblk0rpmb",
+      "nbd0",
+      "mtdblock0",
     ]) {
       assert.equal(isWholeDisk(name), false, name);
     }

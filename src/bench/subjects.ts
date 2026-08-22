@@ -5,11 +5,12 @@ import {
   DiskCounters,
   isWholeDisk,
   parseCgroupCpuStat,
+  parseCgroupMemoryPeak,
   parseCgroupMemoryStat,
   parseDiskstats,
   parseProcIo,
   parseProcStat,
-  parseProcStatusRss,
+  parseProcStatusMemory,
   sumDisks,
 } from "./proc.js";
 
@@ -60,6 +61,15 @@ export interface Counters {
 /** Sampled repeatedly through a window rather than differenced across it. */
 export interface Gauges {
   memoryBytes: number;
+  /**
+   * The kernel's own high-water mark for this subject, when it has one.
+   *
+   * Sampling cannot see a peak between two samples, and the roll process is
+   * short-lived by design — so the transient this harness reports is exactly
+   * the one an interval misses. `null` where the kernel is too old to track
+   * it, in which case the sampled maximum is all there is.
+   */
+  peakBytes: number | null;
 }
 
 export interface Sampler {
@@ -92,6 +102,18 @@ export function createProcSampler(
   ticksPerSecond = clockTicksPerSecond(),
 ): Sampler {
   const read = (path: string) => readFileSync(path, "utf8");
+  // cgroup v2 gained memory.peak in 5.19. Absence is a fact about the kernel,
+  // not a failure of the run.
+  const readOptional = <T>(
+    path: string,
+    parse: (text: string) => T | null,
+  ): T | null => {
+    try {
+      return parse(readFileSync(path, "utf8"));
+    } catch {
+      return null;
+    }
+  };
 
   return {
     counters(subject) {
@@ -118,13 +140,17 @@ export function createProcSampler(
         // anon, not memory.current: page cache grows to fill whatever is free
         // and is reclaimed under pressure, so counting it would report a
         // number that says more about the machine than about the workload.
-        return { memoryBytes: memory.anonBytes };
+        return {
+          memoryBytes: memory.anonBytes,
+          peakBytes: readOptional(join(subject.path, "memory.peak"), (text) =>
+            parseCgroupMemoryPeak(text),
+          ),
+        };
       }
-      return {
-        memoryBytes: parseProcStatusRss(
-          read(join(procRoot, String(subject.pid), "status")),
-        ),
-      };
+      const memory = parseProcStatusMemory(
+        read(join(procRoot, String(subject.pid), "status")),
+      );
+      return { memoryBytes: memory.rssBytes, peakBytes: memory.peakBytes };
     },
 
     disks(devices) {
