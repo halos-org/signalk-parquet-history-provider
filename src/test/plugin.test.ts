@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import createPlugin from "../index.js";
@@ -75,24 +75,26 @@ describe("the plugin", () => {
     // setPluginError writes to a field nobody sees unless they open the Admin
     // UI. The server log is what survives a reboot and ships in a support
     // bundle, and it is the only one that gets the stack.
+    //
+    // The failure is forced with a directory path that runs through a regular
+    // file, which is ENOTDIR on every platform. An earlier version used a path
+    // under /proc, which is Linux-specific and hung the whole test file there.
     const base = mkdtempSync(join(tmpdir(), "sk-parquet-plugin-"));
     try {
+      const file = join(base, "a-file");
+      writeFileSync(file, "not a directory");
       const { app, calls } = stubApp(base);
-      // A path under a regular file cannot be made a directory.
-      const blocked = join(base, "blocked");
-      createPlugin(app).start({ dataDir: blocked });
-      rmSync(join(blocked, DATA_LAYOUT.hotStore), { recursive: true });
-      const { app: second, calls: secondCalls } = stubApp(base);
-      createPlugin(second).start({ dataDir: "/proc/cannot-create-here" });
-      assert.equal(secondCalls.status.length, 0, "reported success on failure");
-      assert.equal(secondCalls.errors.length, 1);
-      assert.match(secondCalls.errors[0], /Startup failed/);
+      createPlugin(app).start({ dataDir: join(file, "below") });
+
+      assert.equal(calls.status.length, 0, "reported success on failure");
+      assert.equal(calls.errors.length, 1);
+      assert.match(calls.errors[0], /Startup failed/);
       assert.equal(
-        secondCalls.logged.length,
+        calls.logged.length,
         1,
         "the failure never reached the server log",
       );
-      void calls;
+      assert.ok(calls.logged[0] instanceof Error, "the log lost the stack");
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
