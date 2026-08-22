@@ -1,7 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { renderComparison } from "../bench/report.js";
-import { MetricResult, RunResult } from "../bench/run.js";
+import {
+  MetricResult,
+  RESULT_FORMAT_VERSION,
+  RunResult,
+} from "../bench/run.js";
 import { summarize } from "../bench/statistics.js";
 
 function metric(
@@ -25,11 +29,14 @@ function run(
   extra: Partial<RunResult> = {},
 ): RunResult {
   return {
+    formatVersion: RESULT_FORMAT_VERSION,
+    harnessVersion: "0.1.0",
     label,
     startedAt: "2026-08-23T00:00:00.000Z",
     host: "halpi",
     windows: 3,
     windowSeconds: 300,
+    measuredWindowSeconds: summarize([300, 300, 300]),
     settleSeconds: 180,
     tolerance: 0.1,
     devices: ["mmcblk0"],
@@ -41,7 +48,11 @@ function run(
         target: "pid 1",
         metrics: {
           cpuPercentOfCore: metric("% of one core", cpu),
-          memoryMb: metric("MB", [87, 88, 87], { peak: 218 }),
+          memoryMb: metric("MB", [87, 88, 87], {
+            peak: 218,
+            steady: null,
+            halfWindowDrift: null,
+          }),
         },
       },
     ],
@@ -68,10 +79,43 @@ describe("renderComparison", () => {
     assert.match(table, /covered a transition/);
   });
 
-  it("reports memory peaks apart from the means", () => {
+  it("leaves a metric with no half-window split unmarked, and says so once", () => {
+    // `steady: null` is "never checked", not "checked and agreed". It renders
+    // without the marker — but the legend must not imply the metric passed.
+    const table = renderComparison([run("parquet", [1, 1, 1])]);
+    const memoryRow = table
+      .split("\n")
+      .find((line) => line.includes("signalk memory"));
+    assert.ok(memoryRow, "expected a memory row");
+    assert.ok(!memoryRow.includes("†"), memoryRow);
+  });
+
+  it("reports gauge peaks apart from the means, in the gauge's own unit", () => {
     const table = renderComparison([run("parquet", [1, 1, 1])]);
     assert.match(table, /peak 218\.0 MB/);
     assert.match(table, /different quantities/);
+  });
+
+  it("carries a peak for any gauge, not only for memory", () => {
+    // `peak` is documented as "gauges only", so filtering the section by the
+    // metric name would silently drop a gauge a later unit adds.
+    const withFds = run("parquet", [1, 1, 1]);
+    withFds.subjects[0].metrics.openFiles = metric("count", [12, 13, 12], {
+      peak: 400,
+      steady: null,
+      halfWindowDrift: null,
+    });
+    assert.match(renderComparison([withFds]), /peak 400\.0 count/);
+  });
+
+  it("refuses to render one measurement reported in two units", () => {
+    // The row header takes whichever unit came first and every later cell is
+    // printed beneath it, so this would render a table that looks right and
+    // is out by a factor of 1000.
+    const kb = run("control", [1, 1, 1]);
+    const mb = run("parquet", [1, 1, 1]);
+    mb.subjects[0].metrics.cpuPercentOfCore.unit = "% of four cores";
+    assert.throws(() => renderComparison([kb, mb]), /cannot share a row/);
   });
 
   it("says so when the runs do not share a method", () => {
@@ -80,6 +124,16 @@ describe("renderComparison", () => {
     const table = renderComparison([
       run("control", [1, 1, 1]),
       run("parquet", [2, 2, 2], { windowSeconds: 30 }),
+    ]);
+    assert.match(table, /do not share a method and are not comparable/);
+  });
+
+  it("counts a differing tolerance as a differing method", () => {
+    // Tolerance decides what the † marker means, so two runs that disagree on
+    // it carry markers that are not the same claim.
+    const table = renderComparison([
+      run("control", [1, 1, 1]),
+      run("parquet", [2, 2, 2], { tolerance: 0.9 }),
     ]);
     assert.match(table, /do not share a method and are not comparable/);
   });
@@ -98,7 +152,24 @@ describe("renderComparison", () => {
     assert.match(renderComparison([annotated]), /1000 ms cap, self only/);
   });
 
+  it("names the disks the system rows were measured against", () => {
+    // A mistyped --device sums to zero, which renders as a legitimate 0.00.
+    // Naming the device set is what lets a reader tell those apart.
+    const table = renderComparison([run("control", [1, 1, 1])]);
+    assert.match(table, /mmcblk0/);
+  });
+
   it("refuses to compare nothing", () => {
     assert.throws(() => renderComparison([]));
+  });
+
+  it("survives the round trip through JSON that every real run takes", () => {
+    // `bench run -o file.json` then `bench compare file.json` is how these
+    // numbers reach a human; nothing else in the suite crosses that boundary.
+    const original = renderComparison([run("control", [23.1, 23.2, 23.3])]);
+    const roundTripped = renderComparison([
+      JSON.parse(JSON.stringify(run("control", [23.1, 23.2, 23.3]))),
+    ]);
+    assert.equal(roundTripped, original);
   });
 });

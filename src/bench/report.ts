@@ -33,18 +33,31 @@ export function renderComparison(runs: RunResult[]): string {
   if (runs.length === 0) throw new Error("Nothing to compare");
 
   const rows: { subject: string; metric: string; unit: string }[] = [];
-  const seen = new Set<string>();
+  // Keyed with a colon pair, which no subject name can contain: parseSubjectSpec
+  // splits its argument on the first colon, so a name carrying one never
+  // reaches here.
+  const unitByRow = new Map<string, string>();
   for (const run of runs) {
     for (const subject of run.subjects) {
       for (const name of orderMetrics(Object.keys(subject.metrics))) {
-        const key = `${subject.name}\u0000${name}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        rows.push({
-          subject: subject.name,
-          metric: name,
-          unit: subject.metrics[name].unit,
-        });
+        const key = `${subject.name}::${name}`;
+        const unit = subject.metrics[name].unit;
+        const already = unitByRow.get(key);
+        if (already !== undefined) {
+          // The row header carries whichever unit was seen first, and every
+          // later run's cell is printed beneath it. Two runs reporting one
+          // measurement in KB/s and in MB/s would render a table that looks
+          // right and is out by a factor of 1000, so this refuses instead.
+          if (already !== unit) {
+            throw new Error(
+              `${subject.name} ${name} is reported in both "${already}" and ` +
+                `"${unit}"; these runs cannot share a row`,
+            );
+          }
+          continue;
+        }
+        unitByRow.set(key, unit);
+        rows.push({ subject: subject.name, metric: name, unit });
       }
     }
   }
@@ -61,27 +74,30 @@ export function renderComparison(runs: RunResult[]): string {
     ...markdownTable(header, body),
     "",
     "Cells are the mean across windows with the min–max range. " +
-      "† marks a window whose two halves disagreed by more than the " +
-      "tolerance, i.e. the measurement covered a transition rather than a " +
-      "steady state.",
+      "† marks a measurement in which at least one window's two halves " +
+      "disagreed by more than the tolerance — that window covered a " +
+      "transition rather than a steady state, and `halfWindowDrift` in the " +
+      "result file says which. An unmarked cell is either steady or, for a " +
+      "gauge and for the system rows, never split to check.",
   ];
 
-  const peaks = rows
-    .filter((row) => row.metric === "memoryMb")
-    .flatMap((row) =>
-      runs
-        .map((run) => {
-          const found = find(run, row.subject, row.metric);
-          return found?.peak === undefined
-            ? null
-            : `${row.subject} in ${run.label}: mean ${found.dispersion.mean.toFixed(1)} MB, peak ${found.peak.toFixed(1)} MB`;
-        })
-        .filter((v): v is string => v !== null),
-    );
+  const peaks = rows.flatMap((row) =>
+    runs
+      .map((run) => {
+        const found = find(run, row.subject, row.metric);
+        const label = METRIC_LABELS[row.metric] ?? row.metric;
+        return found?.peak === undefined
+          ? null
+          : `${row.subject} ${label} in ${run.label}: mean ` +
+              `${found.dispersion.mean.toFixed(1)} ${row.unit}, peak ` +
+              `${found.peak.toFixed(1)} ${row.unit}`;
+      })
+      .filter((v): v is string => v !== null),
+  );
   if (peaks.length > 0) {
     lines.push(
       "",
-      "Memory peaks, reported apart from the means because a transient peak " +
+      "Gauge peaks, reported apart from the means because a transient peak " +
         "and a continuous cost are different quantities and adding them " +
         "produces a number that describes nothing:",
       ...peaks.map((p) => `- ${p}`),
@@ -101,15 +117,24 @@ export function renderComparison(runs: RunResult[]): string {
 
 function methodBlock(runs: RunResult[]): string[] {
   const first = runs[0];
+  // Tolerance belongs here with the three window parameters: it decides what
+  // the † marker means, so a run at 0.9 and a run at 0.1 carry markers that
+  // are not the same claim.
   const mismatched = runs.filter(
     (r) =>
       r.windowSeconds !== first.windowSeconds ||
       r.windows !== first.windows ||
-      r.settleSeconds !== first.settleSeconds,
+      r.settleSeconds !== first.settleSeconds ||
+      r.tolerance !== first.tolerance,
   );
+  // The device set belongs in the header: a mistyped --device sums to zero,
+  // which renders as a legitimate 0.00 in every system row, and nothing else
+  // in the table says which disks were counted.
+  const devices = [...new Set(runs.flatMap((r) => r.devices))].sort();
   const lines = [
     `${first.windows} × ${first.windowSeconds}s windows after a ` +
-      `${first.settleSeconds}s settle, on ${[...new Set(runs.map((r) => r.host))].join(", ")}.`,
+      `${first.settleSeconds}s settle, on ${[...new Set(runs.map((r) => r.host))].join(", ")}. ` +
+      `System rows count ${devices.join(", ") || "no disks"}.`,
   ];
   if (mismatched.length > 0) {
     lines.push(
@@ -137,7 +162,11 @@ function find(
 
 function cell(result: MetricResult | undefined): string {
   if (!result) return "—";
-  return `${formatDispersion(result.dispersion)}${result.steady ? "" : " †"}`;
+  // `steady === null` means the metric has no half-window split, which is not
+  // the same as passing the check. Rendering it unmarked, identically to a
+  // metric that was checked and agreed, is the claim the null exists to avoid.
+  const marker = result.steady === false ? " †" : "";
+  return `${formatDispersion(result.dispersion)}${marker}`;
 }
 
 function orderMetrics(names: string[]): string[] {
