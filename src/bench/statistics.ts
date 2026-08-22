@@ -62,8 +62,13 @@ export function counterRate(
  * halves at zero is agreement, not a division by zero.
  */
 export function driftFraction(firstHalf: number, secondHalf: number): number {
+  // Both at zero is agreement. Guarding on the MEAN being zero would also
+  // swallow (-100, 100) — the strongest disagreement two halves can have — as
+  // perfect agreement. Not reachable from today's non-negative rates, and
+  // exactly the shape a future signed metric would take.
+  if (firstHalf === 0 && secondHalf === 0) return 0;
   const mean = (firstHalf + secondHalf) / 2;
-  if (mean === 0) return 0;
+  if (mean === 0) return Number.POSITIVE_INFINITY;
   return Math.abs(secondHalf - firstHalf) / Math.abs(mean);
 }
 
