@@ -62,6 +62,32 @@ describe("ConfigSchema", () => {
     }
   });
 
+  it("agrees with CONFIG_DEFAULTS, which claims to be the only source", () => {
+    // The two are maintained by hand and the numbers appear twice. Change one
+    // and not the other, and the Admin UI form offers one default while a
+    // saved config normalises to another — with every existing test green.
+    const declared: Record<string, unknown> = {
+      pathFilterMode: (ConfigSchema.properties.pathFilter as any).properties
+        .mode.default,
+      pathFilterPaths: (ConfigSchema.properties.pathFilter as any).properties
+        .paths.default,
+      defaultSamplingRate: (ConfigSchema.properties.defaultSamplingRate as any)
+        .default,
+      samplingRates: (ConfigSchema.properties.samplingRates as any).default,
+      recordSelf: (ConfigSchema.properties.recordSelf as any).default,
+      recordOthers: (ConfigSchema.properties.recordOthers as any).default,
+      maxRecordedPaths: (ConfigSchema.properties.maxRecordedPaths as any)
+        .default,
+      maxRecordedContexts: (ConfigSchema.properties.maxRecordedContexts as any)
+        .default,
+      dataDir: (ConfigSchema.properties.dataDir as any).default,
+      retentionDays: (ConfigSchema.properties.retentionDays as any).default,
+      rollIntervalMinutes: (ConfigSchema.properties.rollIntervalMinutes as any)
+        .default,
+    };
+    assert.deepEqual(declared, { ...CONFIG_DEFAULTS });
+  });
+
   it("defaults other vessels off", () => {
     // Every AIS target is a context, and the roll holds a Parquet writer per
     // partition — so this default is what bounds the roll's memory peak on a
@@ -72,6 +98,30 @@ describe("ConfigSchema", () => {
 });
 
 describe("normalizeConfig", () => {
+  it("replaces a value of the wrong shape rather than passing it on", () => {
+    // A hand-edited `"paths": "navigation.*"` is a string, and PathMatcher
+    // iterates a string character by character — the `*` compiles to a glob
+    // matching every path, which in exclude mode records nothing at all.
+    const normalized = normalizeConfig({
+      pathFilter: { mode: "invert" as any, paths: "navigation.*" as any },
+      samplingRates: [1, 2] as any,
+      dataDir: 42 as any,
+    });
+    assert.deepEqual(normalized.pathFilter.paths, []);
+    assert.equal(normalized.pathFilter.mode, "exclude");
+    assert.deepEqual(normalized.samplingRates, {});
+    assert.equal(normalized.dataDir, "");
+  });
+
+  it("drops individual entries that are not usable", () => {
+    const normalized = normalizeConfig({
+      pathFilter: { mode: "include", paths: ["a.b", 7 as any, "c.d"] },
+      samplingRates: { "a.*": 200, "b.*": "fast" as any, "c.*": Number.NaN },
+    });
+    assert.deepEqual(normalized.pathFilter.paths, ["a.b", "c.d"]);
+    assert.deepEqual(normalized.samplingRates, { "a.*": 200 });
+  });
+
   it("leaves a complete configuration alone", () => {
     assert.deepEqual(normalizeConfig(complete), complete);
   });

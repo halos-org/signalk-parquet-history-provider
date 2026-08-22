@@ -81,11 +81,29 @@ export type Config = Static<typeof ConfigSchema>;
 /** Every default in one place, so normalization and the schema cannot drift. */
 export const CONFIG_DEFAULTS = {
   pathFilterMode: "exclude" as const,
+  pathFilterPaths: [] as string[],
   defaultSamplingRate: 2000,
+  samplingRates: {} as Record<string, number>,
+  recordSelf: true,
+  recordOthers: false,
   maxRecordedPaths: 2000,
   maxRecordedContexts: 100,
+  dataDir: "",
   retentionDays: 0,
   rollIntervalMinutes: 60,
+};
+
+/**
+ * What Signal K actually hands `start()`: whatever JSON is on disk, which may
+ * predate any given option or have been edited by hand. Typing it as `Config`
+ * would let a later unit accept a raw stored config and dereference a key that
+ * is not there — the failure that silently stopped recording in the sibling
+ * provider.
+ */
+export type StoredConfig = {
+  [K in keyof Config]?: K extends "pathFilter"
+    ? Partial<Config["pathFilter"]>
+    : Config[K];
 };
 
 /**
@@ -100,21 +118,29 @@ export const CONFIG_DEFAULTS = {
  * hand-edited zero or negative roll interval would otherwise mean "roll
  * continuously".
  */
-export function normalizeConfig(config: Config): Config {
+export function normalizeConfig(config: StoredConfig): Config {
   return {
     ...config,
     pathFilter: {
-      mode: config.pathFilter?.mode ?? CONFIG_DEFAULTS.pathFilterMode,
-      paths: config.pathFilter?.paths ?? [],
+      mode:
+        config.pathFilter?.mode === "include" ||
+        config.pathFilter?.mode === "exclude"
+          ? config.pathFilter.mode
+          : CONFIG_DEFAULTS.pathFilterMode,
+      // Shape-checked, not just null-coalesced. A hand-edited `"paths":
+      // "navigation.*"` is a string, and PathMatcher iterates a string
+      // character by character -- the `*` compiles to a glob matching every
+      // path, which in exclude mode records nothing at all.
+      paths: stringArray(config.pathFilter?.paths),
     },
-    samplingRates: config.samplingRates ?? {},
+    samplingRates: numberRecord(config.samplingRates),
     defaultSamplingRate: nonNegative(
       config.defaultSamplingRate,
       CONFIG_DEFAULTS.defaultSamplingRate,
     ),
     // A missing toggle takes the schema default; an explicit false is honoured.
-    recordSelf: config.recordSelf ?? true,
-    recordOthers: config.recordOthers ?? false,
+    recordSelf: config.recordSelf ?? CONFIG_DEFAULTS.recordSelf,
+    recordOthers: config.recordOthers ?? CONFIG_DEFAULTS.recordOthers,
     maxRecordedPaths: positive(
       config.maxRecordedPaths,
       CONFIG_DEFAULTS.maxRecordedPaths,
@@ -123,7 +149,10 @@ export function normalizeConfig(config: Config): Config {
       config.maxRecordedContexts,
       CONFIG_DEFAULTS.maxRecordedContexts,
     ),
-    dataDir: config.dataDir ?? "",
+    dataDir:
+      typeof config.dataDir === "string"
+        ? config.dataDir
+        : CONFIG_DEFAULTS.dataDir,
     retentionDays: nonNegative(
       config.retentionDays,
       CONFIG_DEFAULTS.retentionDays,
@@ -133,6 +162,23 @@ export function normalizeConfig(config: Config): Config {
       CONFIG_DEFAULTS.rollIntervalMinutes,
     ),
   };
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [...CONFIG_DEFAULTS.pathFilterPaths];
+  return value.filter((entry): entry is string => typeof entry === "string");
+}
+
+function numberRecord(value: unknown): Record<string, number> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ...CONFIG_DEFAULTS.samplingRates };
+  }
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, number] =>
+        typeof entry[1] === "number" && Number.isFinite(entry[1]),
+    ),
+  );
 }
 
 function positive(value: number | undefined, fallback: number): number {

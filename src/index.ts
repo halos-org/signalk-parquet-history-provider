@@ -1,6 +1,10 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { Config, ConfigSchema, normalizeConfig } from "./config/schema.js";
+import {
+  ConfigSchema,
+  StoredConfig,
+  normalizeConfig,
+} from "./config/schema.js";
 import { DATA_LAYOUT, resolveDataDir } from "./data-dir.js";
 import { PLUGIN_ID } from "./plugin-id.js";
 
@@ -33,7 +37,7 @@ export default (app: App) => {
 
     schema: ConfigSchema,
 
-    start(rawConfig: Config) {
+    start(rawConfig: StoredConfig) {
       try {
         const config = normalizeConfig(rawConfig);
         dataDir = resolveDataDir(config.dataDir, app.getDataDirPath());
@@ -43,14 +47,20 @@ export default (app: App) => {
         app.debug(`data directory: ${dataDir}`);
 
         // Deliberately blunt. This build carries the configuration surface and
-        // the storage layout, and records nothing: the writer process is
-        // halos-org/halos#164 and the query surfaces are #171 and #172. A
-        // cheerful status line here would read as working history.
+        // the storage layout, and records nothing. A cheerful status line here
+        // would read as working history.
+        // Writer: https://github.com/halos-org/halos/issues/164
+        // Query surfaces: .../issues/171 and .../issues/172
         app.setPluginStatus(
           `Not recording: this build is the scaffold only. ` +
             `Data directory ${dataDir}.`,
         );
       } catch (err) {
+        // Both surfaces, deliberately. setPluginError writes to a field
+        // nobody sees unless they open the Admin UI; the server log is what
+        // survives a reboot and what ships in a support bundle, and it is the
+        // only one that gets the stack.
+        app.error(err);
         app.setPluginError(
           `Startup failed: ${err instanceof Error ? err.message : String(err)}`,
         );
