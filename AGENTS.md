@@ -35,8 +35,10 @@ allocator does not return memory in-process, and each query is a spawned
 DuckDB that exits.
 
 So `src/index.ts` and everything it imports must never reach
-`@duckdb/node-api`. One import undoes the plugin's entire reason to exist by
-mapping a ~100 MB native addon into the server, and nothing else would fail.
+`@duckdb/node-api` — nor `node:sqlite`, which is a native module and would
+put a database handle and its WAL in the server's heap. One import undoes the
+plugin's entire reason to exist by mapping a ~100 MB native addon into the
+server, and nothing else would fail.
 `src/test/plugin-import-graph.test.ts` matches any `@duckdb/*` specifier — the
 native addon lives in `@duckdb/node-bindings-<platform>`, not in the wrapper —
 including `require()` and `createRequire` forms, and then starts the plugin in
@@ -47,8 +49,17 @@ a check on module evaluation alone.
 
 ## Layout
 
-- `src/index.ts` — the plugin the server loads. Currently registers, renders
-  its schema and resolves the data directory; it records nothing yet.
+- `src/index.ts` — the plugin the server loads. Subscribes to the delta bus,
+  spawns the writer process, and reports what is happening in the status line.
+- `src/recorder.ts` — the whole of the Signal K process's involvement: path
+  filter, rate cap, cardinality cap, and a sample handed onwards.
+- `src/flush-buffer.ts` — what is held between flushes. Bounded in **bytes**,
+  not elements, and the bytes are measured by serialising rather than
+  estimated, because JSON escaping can expand a value sixfold and an estimate
+  below the truth makes the ceiling fictional.
+- `src/writer/` — the writer process and the socket to it. `main.ts` is its
+  entry point and must never be imported by the plugin; `contract.ts` holds the
+  exit codes and paths both sides need, which is why it exists at all.
 - `src/config/schema.ts` — TypeBox. One source for both the Admin UI's JSON
   schema and the `Config` type. Add options here, and add a README row.
 - `src/plugin-id.ts` — the id, in one place. It reappears as `plugin.id`, as
@@ -72,8 +83,31 @@ a check on module evaluation alone.
 - `src/duckdb/` — version and platform naming, the bundled-extension resolver,
   and the standalone offline check. This is the only place that may import the
   engine.
+
 - `src/bench/` — the measurement harness. Every unit that reports a number
   reports it through this, so figures stay comparable.
+
+## The writer
+
+One writer process per plugin run, spawned by the plugin, holding the hot
+store under an explicit lock file. The lock is not decoration: SQLite takes
+per-transaction locks rather than per-handle ones, so two writers would both
+open the file and interleave their rows and their sequence numbers.
+`PRAGMA locking_mode = EXCLUSIVE` would prevent that and is unavailable,
+because it also blocks readers and the roll reading the store while the writer
+holds it is why the store is SQLite at all.
+
+The socket is a Unix domain socket in a `0700` directory, mode `0600` — never
+a TCP port, not even on loopback, which is shared with every local process and
+container in the namespace. Node exposes no way to read peer credentials
+without a native addon, so filesystem permission is the enforcement.
+
+A batch carries a sequence number, and the writer skips one it has already
+committed. That is what makes a resend after a lost acknowledgement
+idempotent, and it is scoped by a session id from the handshake: the plugin's
+counter restarts at 1 when the plugin does, so without the session a writer
+outliving its plugin would discard the new run's batches as duplicates of the
+old run's, acknowledge them, and record nothing while reporting healthy.
 
 ## Conventions
 
