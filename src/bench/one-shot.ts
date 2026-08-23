@@ -48,6 +48,14 @@ export interface OneShotOptions {
    * stdout; returns bytes, or null when the output carries no such figure.
    */
   selfReportedPeak?: (stdout: string) => number | null;
+  /**
+   * Written to the subject's stdin, which is then closed.
+   *
+   * The query process takes its request this way, and a subject that reads
+   * stdin never finishes if nothing closes it — so the absence of this is
+   * `stdin: "ignore"` rather than an open pipe.
+   */
+  stdin?: string;
 }
 
 const DEFAULT_SAMPLE_INTERVAL_MS = 10;
@@ -57,8 +65,13 @@ export async function measureOneShot(
 ): Promise<OneShotResult> {
   const started = performance.now();
   const child = spawn(options.command, options.args, {
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
   });
+  if (options.stdin !== undefined) {
+    // EPIPE, when the subject exits before reading it.
+    child.stdin?.on("error", () => {});
+    child.stdin?.end(options.stdin);
+  }
 
   let stdout = "";
   let stderr = "";

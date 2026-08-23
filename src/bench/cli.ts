@@ -6,12 +6,15 @@
  *   node dist/bench/cli.js selftest
  *   node dist/bench/cli.js roll --data-dir /path/to/a/copy --max-rowid 1267241
  *
+ *   node dist/bench/cli.js query --data-dir /path --from <ms> --to <ms>
+ *
  * `run` measures one condition. `compare` puts several side by side, which is
  * the only form in which these numbers mean anything. `selftest` runs the
  * whole path against a load generator with a known duty cycle, so a machine
  * can show that the harness reports what it should before anyone trusts it
  * about a real workload. `roll` measures one roll, which `run` cannot: a roll
- * has no steady state and is gone before a window closes.
+ * has no steady state and is gone before a window closes. `query` measures one
+ * query the same way, and for the same reason.
  */
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -45,8 +48,9 @@ async function main(): Promise<void> {
   if (command === "compare") return doCompare(rest);
   if (command === "selftest") return doSelftest(rest);
   if (command === "roll") return doRoll(rest);
+  if (command === "query") return doQuery(rest);
   console.error(
-    "usage: cli.js run|compare|selftest|roll ... (see the file header)",
+    "usage: cli.js run|compare|selftest|roll|query ... (see the file header)",
   );
   process.exitCode = 2;
 }
@@ -194,6 +198,113 @@ async function doRoll(argv: string[]): Promise<void> {
     console.error(`wrote ${values.out}`);
   } else {
     process.stdout.write(json);
+  }
+}
+
+/**
+ * One query, measured from the outside.
+ *
+ * **Wall clock is from spawn, not from the engine.** Process start, extension
+ * load and the tree's Parquet footers are paid before a row is read, and they
+ * outweigh a well-shaped query over a day of data — so an in-engine figure
+ * describes something no request can buy. The query's own `queryMs` is
+ * reported beside this one so the difference stays visible.
+ *
+ * Safe against a live writer, unlike `roll`: a query only reads.
+ */
+async function doQuery(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      "data-dir": { type: "string" },
+      kind: { type: "string", default: "range" },
+      from: { type: "string" },
+      to: { type: "string" },
+      context: { type: "string", default: "self" },
+      path: { type: "string", multiple: true, default: [] },
+      limit: { type: "string" },
+      repeat: { type: "string", default: "3" },
+      "memory-limit": { type: "string" },
+      out: { type: "string", short: "o" },
+    },
+  });
+  const dataDir = values["data-dir"];
+  if (!dataDir) throw new Error("--data-dir is required");
+  if (!values.from || !values.to) {
+    throw new Error("--from and --to are required, in epoch milliseconds");
+  }
+  requireLinux();
+
+  const request = {
+    kind: values.kind,
+    from: Number(values.from),
+    to: Number(values.to),
+    context: values.context,
+    ...(values.path.length > 0 ? { paths: values.path } : {}),
+    ...(values.limit ? { limit: Number(values.limit) } : {}),
+  };
+
+  // Repeated, and every run reported. One figure from one run says nothing
+  // about a query whose first call pays for a page cache the second one finds
+  // warm — which is the difference this harness exists to keep visible.
+  const runs = [];
+  for (let attempt = 0; attempt < numberOr(values.repeat, 3); attempt += 1) {
+    const result = await measureOneShot({
+      command: process.execPath,
+      args: [
+        join(HERE, "..", "query", "main.js"),
+        "--data-dir",
+        dataDir,
+        ...(values["memory-limit"]
+          ? ["--memory-limit", values["memory-limit"]]
+          : []),
+      ],
+      stdin: `${JSON.stringify(request)}\n`,
+      selfReportedPeak: (stdout) => summaryOf(stdout)?.peakRssBytes ?? null,
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `the query exited ${result.exitCode}: ${result.stderr.trim()}`,
+      );
+    }
+    const summary = summaryOf(result.stdout);
+    runs.push({
+      wallMs: Math.round(result.wallMs),
+      queryMs: summary?.queryMs ?? null,
+      rows: summary?.rows ?? null,
+      truncated: summary?.truncated ?? null,
+      treeFiles: summary?.treeFiles ?? null,
+      peakMb: +(result.peakBytes / 1048576).toFixed(1),
+      peakSource: result.peakSource,
+    });
+  }
+
+  const json = `${JSON.stringify({ request, runs }, null, 2)}\n`;
+  if (values.out) {
+    writeFileSync(values.out, json);
+    console.error(`wrote ${values.out}`);
+  } else {
+    process.stdout.write(json);
+  }
+}
+
+interface QuerySummary {
+  rows?: number;
+  truncated?: boolean;
+  treeFiles?: number;
+  queryMs?: number;
+  peakRssBytes?: number | null;
+}
+
+/** The query's last line, which is its summary. Rows are arrays; this is not. */
+function summaryOf(stdout: string): QuerySummary | null {
+  try {
+    const parsed = JSON.parse(
+      stdout.trim().split("\n").pop() ?? "",
+    ) as QuerySummary;
+    return Array.isArray(parsed) ? null : parsed;
+  } catch {
+    return null;
   }
 }
 
