@@ -102,7 +102,7 @@ The build and the dependency install both run on the machine you invoke this
 from, so keep that a dev host. Nothing is compiled or downloaded on the device.
 
 Examples:
-  ./run deploy-halos halpi.hurma
+  ./run deploy-halos my-boat.local
   ./run deploy-halos local          # on the device itself
 USAGE
     return 1

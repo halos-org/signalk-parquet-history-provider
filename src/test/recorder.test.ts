@@ -189,7 +189,11 @@ describe("vessel identity", () => {
 
   it("records the own vessel's name whatever recordOthers says", () => {
     const t = build({ recordOthers: false });
-    t.recorder.handle({ context: SELF, path: "", value: { name: "HURMA" } });
+    t.recorder.handle({
+      context: SELF,
+      path: "",
+      value: { name: "OWN VESSEL" },
+    });
 
     assert.strictEqual(t.samples.length, 1);
     assert.strictEqual(t.samples[0].context, SELF_CONTEXT);
