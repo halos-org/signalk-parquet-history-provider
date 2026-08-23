@@ -236,6 +236,79 @@ describe("a delta reaching the writer's store", () => {
     }
   });
 
+  it("sends what is buffered before it stops, and waits for the writer", async () => {
+    // A graceful stop used to throw the buffer away. At the measured rate that
+    // is several hundred samples on every config save, while the configuration
+    // describes the flush interval as the window a *power cut* loses. Not
+    // waiting for the writer also left the next start racing it, which the
+    // plugin then latched as "another writer holds the store".
+    const base = mkdtempSync(join(tmpdir(), "sk-parquet-e2e-"));
+    const paths = writerPaths(base);
+    const { app, feed, calls } = stubApp(base);
+    const plugin = createPlugin(app);
+    try {
+      // A flush interval far longer than the test, so nothing drains by itself.
+      plugin.start({
+        defaultSamplingRate: 0,
+        flushIntervalMs: 600_000,
+        flushBatchSize: 1000,
+      });
+      await eventually(
+        () => calls.status.some((s) => /Recording/.test(s)),
+        "the handshake",
+      );
+      for (let i = 1; i <= 4; i++) feed({ value: i });
+      assert.equal(storedRows(paths.store).length, 0, "it flushed too early");
+
+      await plugin.stop();
+
+      assert.equal(
+        storedRows(paths.store).length,
+        4,
+        "the buffer was discarded rather than sent",
+      );
+      assert.equal(
+        existsSync(paths.pidFile),
+        false,
+        "the writer outlived stop",
+      );
+      assert.deepEqual(calls.errors, []);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("starts again straight after a stop, without latching on a held store", async () => {
+    // Signal K restarts a plugin on every config save. Before stop() waited,
+    // the incoming writer could find the outgoing one still listening, exit
+    // EXIT_LOCKED, and the plugin latched that as fatal -- for a condition
+    // that resolves itself in milliseconds.
+    const base = mkdtempSync(join(tmpdir(), "sk-parquet-e2e-"));
+    const paths = writerPaths(base);
+    const { app, feed, calls } = stubApp(base);
+    try {
+      for (let run = 0; run < 3; run++) {
+        const plugin = createPlugin(app);
+        plugin.start({ defaultSamplingRate: 0, flushIntervalMs: 50 });
+        await eventually(
+          () => calls.status.some((s) => /Recording/.test(s)),
+          `run ${run} to connect (errors: ${JSON.stringify(calls.errors)})`,
+        );
+        feed({ value: run });
+        await plugin.stop();
+        calls.status.length = 0;
+      }
+      assert.deepEqual(
+        calls.errors.filter((e) => /holds the hot store/.test(e)),
+        [],
+        "a restart latched on a held store",
+      );
+      assert.ok(storedRows(paths.store).length >= 3);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it("says so when the writer dies, instead of staying green", async () => {
     // The writer is a separate process, so it can die without taking the
     // server with it. What must not happen is the plugin carrying on showing

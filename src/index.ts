@@ -52,6 +52,16 @@ const WRITER_ENTRY = fileURLToPath(
 /** How often the status line is refreshed while recording. */
 const STATUS_INTERVAL_MS = 10_000;
 
+/** How long the plugin gives a departing writer before it is killed. */
+const WRITER_EXIT_TIMEOUT_MS = 3000;
+
+/** How long the buffer gets to reach the writer on a graceful stop. */
+const DRAIN_TIMEOUT_MS = 2000;
+
+/** A held store is usually a predecessor still exiting, so retry before giving up. */
+const MAX_LOCKED_RETRIES = 3;
+const LOCKED_RETRY_MS = 500;
+
 export default (app: App) => {
   let unsubscribe: (() => void) | null = null;
   let client: WriterClient | null = null;
@@ -60,6 +70,8 @@ export default (app: App) => {
   let recorder: Recorder | null = null;
   let fatal: string | null = null;
   let stopping = false;
+  let dataDir = "";
+  let lockedRetries = 0;
 
   function spawnWriter(dataDir: string): ChildProcess {
     // An argument array, never a shell: a data directory an operator typed
@@ -106,8 +118,24 @@ export default (app: App) => {
       if (writer !== child) return;
       writer = null;
       if (code === EXIT_LOCKED) {
-        // Distinct from any other exit because the remedy is different: some
-        // other writer owns the store, and retrying cannot help.
+        // Usually transient rather than real. Signal K restarts a plugin on
+        // every config save, and until this branch waited for the outgoing
+        // writer, the incoming one could find it still listening. Latching
+        // that as fatal stopped recording for a condition that resolves itself
+        // in milliseconds, and the operator's only remedy -- toggling the
+        // plugin -- re-ran the race.
+        if (lockedRetries < MAX_LOCKED_RETRIES && !stopping) {
+          lockedRetries++;
+          const delay = LOCKED_RETRY_MS * lockedRetries;
+          app.debug(
+            `the hot store is still held; retry ${lockedRetries} in ${delay}ms`,
+          );
+          const timer = setTimeout(() => {
+            if (!stopping && writer === null) writer = spawnWriter(dataDir);
+          }, delay);
+          timer.unref();
+          return;
+        }
         fatal =
           "another writer already holds the hot store; " +
           "recording is stopped until it exits";
@@ -149,6 +177,24 @@ export default (app: App) => {
     app.setPluginStatus(`${parts.join(". ")}.`);
   }
 
+  /** SIGTERM, then SIGKILL, then give up — never block the server's shutdown. */
+  async function stopWriter(): Promise<void> {
+    const departing = writer;
+    writer = null;
+    if (departing === null || departing.exitCode !== null) return;
+    const exited = new Promise<void>((resolve) =>
+      departing.once("exit", () => resolve()),
+    );
+    departing.kill("SIGTERM");
+    const killer = setTimeout(() => {
+      app.error("the writer did not exit on SIGTERM; killing it");
+      departing.kill("SIGKILL");
+    }, WRITER_EXIT_TIMEOUT_MS);
+    killer.unref();
+    await exited;
+    clearTimeout(killer);
+  }
+
   const plugin = {
     id: PLUGIN_ID,
     name: "Parquet History",
@@ -158,7 +204,7 @@ export default (app: App) => {
     start(rawConfig: StoredConfig) {
       try {
         const config: Config = normalizeConfig(rawConfig);
-        const dataDir = resolveDataDir(config.dataDir, app.getDataDirPath());
+        dataDir = resolveDataDir(config.dataDir, app.getDataDirPath());
         mkdirSync(dataDir, { recursive: true, mode: DATA_DIR_MODE });
         chmodSync(dataDir, DATA_DIR_MODE);
         for (const sub of Object.values(DATA_LAYOUT)) {
@@ -172,6 +218,7 @@ export default (app: App) => {
 
         fatal = null;
         stopping = false;
+        lockedRetries = 0;
         writer = spawnWriter(dataDir);
 
         const buffer = new FlushBuffer({
@@ -218,7 +265,7 @@ export default (app: App) => {
       }
     },
 
-    stop() {
+    async stop() {
       stopping = true;
       unsubscribe?.();
       unsubscribe = null;
@@ -227,13 +274,26 @@ export default (app: App) => {
         statusTimer = null;
       }
       recorder = null;
-      const closing = client?.stop();
+
+      // Send what is buffered before tearing anything down. Discarding it lost
+      // several hundred samples on every config save, while the configuration
+      // describes the flush interval as the window a power cut loses.
+      const departing = client;
       client = null;
-      // SIGTERM rather than SIGKILL: the writer flushes and releases its lock
-      // on the way out, and a lock left behind makes the next start refuse.
-      writer?.kill("SIGTERM");
-      writer = null;
-      void closing;
+      if (departing !== null) {
+        try {
+          await departing.drain(DRAIN_TIMEOUT_MS);
+        } catch (err) {
+          app.error(err);
+        }
+        await departing.stop();
+      }
+
+      // SIGTERM rather than SIGKILL: the writer removes its pid file and closes
+      // the store on the way out. Awaited, because Signal K calls start()
+      // straight after a config save and the next writer's probe would
+      // otherwise find this one still listening.
+      await stopWriter();
     },
   };
 

@@ -139,6 +139,38 @@ export class WriterClient {
     if (this.options.buffer.isDue(now)) this.pump();
   }
 
+  /**
+   * Sends what is buffered, up to a deadline.
+   *
+   * A graceful stop used to throw the buffer away: at the measured rate that is
+   * several hundred samples on every config save, and `flushIntervalMs` is
+   * documented as the window a *power cut* loses. Bounded, because a writer
+   * that has stopped answering must not hold the server's shutdown open.
+   */
+  async drain(deadlineMs = 2000): Promise<void> {
+    const until = this.options.now() + deadlineMs;
+    while (this.options.now() < until) {
+      if (!this.connected || !this.welcomed) break;
+      if (this.inFlight === null && this.options.buffer.length === 0) return;
+      // Force the pump regardless of the flush interval: this is the last
+      // chance these samples get.
+      if (this.inFlight === null && this.options.buffer.length > 0) {
+        this.forcePump();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  private forcePump(): void {
+    const now = this.options.now();
+    const samples = this.options.buffer.take(now);
+    if (samples.length === 0) return;
+    this.seq++;
+    this.inFlight = { seq: this.seq, samples };
+    this.send({ type: "batch", seq: this.seq, samples });
+    this.armAckTimer();
+  }
+
   async stop(): Promise<void> {
     this.stopped = true;
     this.clearTimer("pumpTimer");
@@ -232,9 +264,20 @@ export class WriterClient {
   private receive(message: Message): void {
     switch (message.type) {
       case "welcome": {
-        // The writer's counter is authoritative on reconnect: it may have
-        // committed a batch whose acknowledgement never arrived.
-        this.seq = Math.max(this.seq, message.lastSeq);
+        // The writer's counter is authoritative on reconnect -- it may have
+        // committed a batch whose acknowledgement never arrived -- but only up
+        // to what this client could actually have sent. A higher value cannot
+        // be true, and trusting it would count never-written samples as stored
+        // and push the counter past MAX_SAFE_INTEGER, after which the writer's
+        // own validator rejects every batch and the client reconnect-loops
+        // forever.
+        if (message.lastSeq > this.seq) {
+          this.options.log(
+            `writer reported seq ${message.lastSeq}, past the ${this.seq} this run has sent`,
+          );
+          this.socket?.destroy();
+          return;
+        }
         this.settleInFlight(message.lastSeq);
         this.welcomed = true;
         // Reported rather than left for the next status tick: a plugin that
