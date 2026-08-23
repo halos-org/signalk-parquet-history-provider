@@ -276,6 +276,43 @@ describe("only a roll's own output may be replaced", () => {
     assert.equal(args.length, 0, "and nothing was rolled again");
   });
 
+  it("starts no new roll while a finished one's rows cannot be removed", async () => {
+    // Reachable without a restart: if the delete throws — ENOSPC is the
+    // realistic case — the record stays `written` and the timer re-arms. A
+    // fresh name then writes rows that are already in the tree, under a
+    // second name, permanently.
+    record(sample({ ts: AUG_23 }));
+    writeFileSync(
+      writerPaths(dir).pendingRoll,
+      JSON.stringify({ rollId: SLOT, maxRowid: 1, phase: "written" }),
+    );
+    const wedged = {
+      oldestTimestamp: () => AUG_23,
+      rollBound: () => ({ maxRowid: 1, rows: 1 }),
+      deleteThrough: () => {
+        throw new Error("database or disk is full");
+      },
+    } as unknown as HotStore;
+
+    let spawned = 0;
+    await new RollScheduler({
+      store: wedged,
+      dataDir: dir,
+      intervalMinutes: 60,
+      log: (line) => logged.push(line),
+      onError: (line) => errors.push(line),
+      now: () => NOW,
+      spawnRoll: () => {
+        spawned += 1;
+        return succeeds()([]);
+      },
+    }).rollOnce(SLOT);
+
+    assert.equal(spawned, 0, "no roll may start while the record stands");
+    assert.equal(pendingFile()?.phase, "written", "and the record stands");
+    assert.match(errors.join("\n"), /a second time/);
+  });
+
   it("ignores a pending record it cannot read, or one naming roll id 0", async () => {
     // `nextRollAt` really can return 0 — for any clock set before the epoch —
     // and the roll process rejects it, so adopting one wedged every future

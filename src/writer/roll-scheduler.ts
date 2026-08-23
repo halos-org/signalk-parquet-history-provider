@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { commitFile } from "../durable-write.js";
 import { fileURLToPath } from "node:url";
 import { delayToNextRoll, nextRollAt } from "../roll/schedule.js";
 import {
@@ -105,7 +106,15 @@ export class RollScheduler {
    */
   start(): void {
     this.stopped = false;
-    this.completeInterruptedRoll();
+    if (this.pending?.phase === "rolling") {
+      this.options.log(
+        `roll ${this.pending.rollId} was left unfinished; the next roll reuses its name`,
+      );
+    }
+    // Its failure must not reach main(), which calls start() outside any try:
+    // a truncate that could not be written would end the writer, and
+    // recording with it, for something that should cost one roll.
+    this.finishPendingRoll();
     this.arm();
     if (this.backlogPredatesThisProcess()) {
       this.options.log(
@@ -124,28 +133,40 @@ export class RollScheduler {
   }
 
   /**
-   * A roll that exited 0 and was killed before its rows were deleted.
+   * Finish a roll that exited 0 and whose rows were not deleted, and say
+   * whether a new roll may start.
    *
-   * Completing it is the whole reason the record carries a phase. Reusing the
-   * name instead — which is what an id alone leads to — replaces a file whose
-   * rows are already durable and gone from the store.
+   * Completing it is the whole reason the record carries a phase. This runs
+   * before every roll and not only at startup, because the state is reachable
+   * without a restart: if the delete or the checkpoint throws — ENOSPC, or an
+   * IO error, the failures those lines exist for — the record stays `written`
+   * and the timer re-arms. A new roll then would take a fresh name and write
+   * rows that are already in the tree, under a second name, permanently.
+   *
+   * So while it cannot be finished, nothing else rolls. The store grows and
+   * the reason is reported every slot, which is the recoverable failure; the
+   * duplicate is not.
    */
-  private completeInterruptedRoll(): void {
+  private finishPendingRoll(): boolean {
     const pending = this.pending;
-    if (pending === null) return;
-    if (pending.phase !== "written") {
+    if (pending === null || pending.phase !== "written") return true;
+    try {
+      const removed = this.options.store.deleteThrough(pending.maxRowid);
+      this.options.store.checkpoint();
+      this.pending = null;
+      clearPendingRoll(this.options.dataDir, this.options.onError);
       this.options.log(
-        `roll ${pending.rollId} was left unfinished; the next roll reuses its name`,
+        `roll ${pending.rollId} had finished but not truncated; removed ${removed} rows now`,
       );
-      return;
+      return true;
+    } catch (err) {
+      this.reportFailure(
+        `roll ${pending.rollId} wrote its rows and they could not be removed from the hot store ` +
+          `(${err instanceof Error ? err.message : String(err)}); no roll will start until they are, ` +
+          `because rolling again would write them to the tree a second time`,
+      );
+      return false;
     }
-    const removed = this.options.store.deleteThrough(pending.maxRowid);
-    this.options.store.checkpoint();
-    this.pending = null;
-    clearPendingRoll(this.options.dataDir, this.options.onError);
-    this.options.log(
-      `roll ${pending.rollId} had finished but not truncated; removed ${removed} rows now`,
-    );
   }
 
   /** Whether the store holds rows from before this process started. */
@@ -192,6 +213,10 @@ export class RollScheduler {
    */
   async rollOnce(slot: number): Promise<void> {
     if (this.stopped || this.running !== null) return;
+    // Before anything else: a record left in `written` means rows are in the
+    // tree and still in the store, and starting a fresh roll would put them
+    // there twice.
+    if (!this.finishPendingRoll()) return;
     const bound = this.options.store.rollBound();
     if (bound === null) {
       // Nothing recorded since the last roll. No file, no empty directory.
@@ -421,12 +446,17 @@ function writePendingRoll(
   pending: PendingRoll,
   onError?: (line: string) => void,
 ): void {
+  const path = writerPaths(dataDir).pendingRoll;
   try {
-    writeFileSync(
-      writerPaths(dataDir).pendingRoll,
-      `${JSON.stringify(pending)}\n`,
-      { mode: 0o600 },
-    );
+    // Temp, fsync, rename, fsync the directory — the same order the tree's
+    // files get. Rewriting in place leaves a torn record after a power cut,
+    // and `readPendingRoll` reads a torn record as absent, which is the state
+    // that duplicates rows for a `written` roll and republishes files for a
+    // `rolling` one.
+    writeFileSync(`${path}.tmp`, `${JSON.stringify(pending)}\n`, {
+      mode: 0o600,
+    });
+    commitFile(`${path}.tmp`, path);
   } catch (err) {
     // Recording this is a safeguard against one narrow failure, and refusing
     // to roll because the safeguard could not be written would be worse than

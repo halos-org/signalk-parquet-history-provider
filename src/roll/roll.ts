@@ -317,16 +317,23 @@ async function writeSidecar(args: {
       const quarantine = `${final}.unreadable`;
       rmSync(quarantine, { force: true });
       renameSync(final, quarantine);
-      writeStderr(
-        `the sidecar could not be read (${err instanceof Error ? err.message.split("\n")[0] : String(err)}); ` +
-          `moved aside and rebuilt from the tree\n`,
-      );
+      const why = message(err);
       try {
         await write(foldTree(dataDir));
-      } catch {
+        writeStderr(
+          `the sidecar could not be read (${why}); moved aside and rebuilt from the tree\n`,
+        );
+      } catch (treeErr) {
         // A tree with no files yet, or one that cannot be read either. The
-        // window alone is worse than the tree and better than nothing.
+        // window alone is worse than the tree and better than nothing — and
+        // the operator has to be told which of the two they got, because the
+        // difference is every path that went quiet before this window.
         await write("");
+        writeStderr(
+          `the sidecar could not be read (${why}) and neither could the tree ` +
+            `(${message(treeErr)}); rebuilt from this roll's window alone, so ` +
+            `paths that stopped reporting earlier are no longer in it\n`,
+        );
       }
     }
   } else {
@@ -347,6 +354,11 @@ function foldTree(dataDir: string): string {
     ` UNION ALL BY NAME SELECT ${COLUMN_LIST} ` +
     `FROM read_parquet('${sqlLiteral(glob)}', union_by_name = true)`
   );
+}
+
+/** An error's first line, which is its message rather than a stack frame. */
+function message(err: unknown): string {
+  return err instanceof Error ? err.message.split("\n")[0] : String(err);
 }
 
 /** Write to stderr and be sure it arrives: this process exits soon after. */

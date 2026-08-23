@@ -357,6 +357,10 @@ describe(
       );
       try {
         const refused = attemptRoll(["--max-rowid", "1", "--roll-id", "1"]);
+        // Anchored to a refusal that happened: empty stderr would satisfy the
+        // absence check on its own and prove nothing about the message.
+        assert.equal(refused.status, EXIT_LOCKED);
+        assert.match(refused.stderr, /already running/);
         assert.ok(
           !refused.stderr.includes(dir),
           `the refusal must not echo the data directory: ${refused.stderr}`,
