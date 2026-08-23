@@ -88,9 +88,10 @@ export function renderComparison(runs: RunResult[]): string {
         const label = METRIC_LABELS[row.metric] ?? row.metric;
         return found?.peak === undefined
           ? null
-          : `${row.subject} ${label} in ${run.label}: mean ` +
-              `${found.dispersion.mean.toFixed(1)} ${row.unit}, peak ` +
-              `${found.peak.toFixed(1)} ${row.unit}`;
+          : `${escapeInline(row.subject)} ${label} in ` +
+              `${escapeInline(run.label)}: mean ` +
+              `${found.dispersion.mean.toFixed(1)} ${escapeInline(row.unit)}, peak ` +
+              `${found.peak.toFixed(1)} ${escapeInline(row.unit)}`;
       })
       .filter((v): v is string => v !== null),
   );
@@ -108,7 +109,10 @@ export function renderComparison(runs: RunResult[]): string {
   if (notes.length > 0) {
     lines.push("", "Conditions:");
     for (const run of notes) {
-      lines.push(`- **${run.label}** — ${run.notes.join("; ")}`);
+      lines.push(
+        `- **${escapeInline(run.label)}** — ` +
+          `${run.notes.map(escapeInline).join("; ")}`,
+      );
     }
   }
 
@@ -133,8 +137,9 @@ function methodBlock(runs: RunResult[]): string[] {
   const devices = [...new Set(runs.flatMap((r) => r.devices))].sort();
   const lines = [
     `${first.windows} × ${first.windowSeconds}s windows after a ` +
-      `${first.settleSeconds}s settle, on ${[...new Set(runs.map((r) => r.host))].join(", ")}. ` +
-      `System rows count ${devices.join(", ") || "no disks"}.`,
+      `${first.settleSeconds}s settle, on ` +
+      `${[...new Set(runs.map((r) => escapeInline(r.host)))].join(", ")}. ` +
+      `System rows count ${devices.map(escapeInline).join(", ") || "no disks"}.`,
   ];
   if (mismatched.length > 0) {
     lines.push(
@@ -143,7 +148,8 @@ function methodBlock(runs: RunResult[]): string[] {
         mismatched
           .map(
             (r) =>
-              `${r.label} used ${r.windows} × ${r.windowSeconds}s after ${r.settleSeconds}s`,
+              `${escapeInline(r.label)} used ${r.windows} × ` +
+              `${r.windowSeconds}s after ${r.settleSeconds}s`,
           )
           .join(", ") +
         ".",
@@ -180,14 +186,25 @@ function orderMetrics(names: string[]): string[] {
   });
 }
 
-/** `--label` is free text and a subject name is whatever the operator typed, so
- * either can carry a pipe — which would add a column and shift every cell in
- * the row under the wrong condition. */
-function escapeCell(value: string): string {
+/**
+ * Labels, subject names, notes, hosts and device names are all free text —
+ * `--label` and `--note` come straight off the command line, and a result file
+ * can come from anywhere. Rendered raw, a newline in any of them starts a new
+ * Markdown block and a `*` or a backtick closes the construct it sits inside,
+ * so the report ends up describing something other than the run.
+ */
+function escapeInline(value: string): string {
   return value
     .replaceAll("\\", "\\\\")
-    .replaceAll("|", "\\|")
-    .replace(/\r?\n/g, " ");
+    .replace(/[*_`[\]<>]/g, (c) => `\\${c}`)
+    .replace(/\s*\r?\n\s*/g, " ")
+    .trim();
+}
+
+/** A table cell needs the same treatment plus the pipe, which would otherwise
+ * add a column and shift every later cell under the wrong condition. */
+function escapeCell(value: string): string {
+  return escapeInline(value).replaceAll("|", "\\|");
 }
 
 function markdownTable(rawHeader: string[], rawBody: string[][]): string[] {

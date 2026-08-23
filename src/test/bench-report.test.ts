@@ -172,6 +172,47 @@ describe("renderComparison", () => {
     assert.match(table, /a\\\|b/);
   });
 
+  it("keeps a newline in a label from forging Markdown structure", () => {
+    // The table was escaped; the Conditions list, the peaks list and the
+    // method line interpolated the same free text raw, so a newline there
+    // started a new block and the report described something else.
+    const sneaky = run(
+      "real\n\n## Injected heading\n\n- forged bullet",
+      [1, 1, 1],
+      {
+        notes: ["note\nwith a break"],
+      },
+    );
+    const table = renderComparison([sneaky]);
+    // The text survives — it is the operator's label. What must not survive is
+    // its position: nothing from inside a value may begin a line, because that
+    // is what makes it Markdown structure rather than content.
+    const lines = table.split("\n");
+    assert.ok(
+      !lines.some((line) => line.startsWith("#")),
+      `a label started a heading:\n${table}`,
+    );
+    assert.ok(
+      !lines.some((line) => line.startsWith("- forged bullet")),
+      `a label forged a list item:\n${table}`,
+    );
+    // The text itself survives, on one line, where it belongs.
+    const conditions = table
+      .split("\n")
+      .find((line) => line.startsWith("- **real"));
+    assert.ok(conditions, `expected a Conditions bullet, got:\n${table}`);
+    assert.match(conditions, /note with a break/);
+  });
+
+  it("keeps emphasis characters from closing the construct they sit in", () => {
+    // The Conditions bullet wraps the label in **…**; an unescaped asterisk
+    // would close it early and re-style the rest of the line.
+    const table = renderComparison([
+      run("a*b_c`d", [1, 1, 1], { notes: ["n"] }),
+    ]);
+    assert.match(table, /- \*\*a\\\*b\\_c\\`d\*\* —/);
+  });
+
   it("refuses to compare nothing", () => {
     assert.throws(() => renderComparison([]));
   });

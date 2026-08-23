@@ -243,6 +243,34 @@ describe("ensureExtensionExtracted", () => {
     }
   });
 
+  it("gives each extraction its own temporary", () => {
+    // Worker threads share a pid, so a pid-named temporary collided between
+    // two concurrent extractions in one process: the second openSync(…, "wx")
+    // failed EEXIST and its catch unlinked the FIRST caller's live file, whose
+    // rename then failed ENOENT — both callers failing and no cache written.
+    const { root, cacheDir, cleanup } = fixture();
+    try {
+      const first = ensureExtensionExtracted({ root, cacheDir, platform });
+      const directory = dirname(first);
+      rmSync(first);
+
+      // A live temporary from a concurrent extraction, under the name a
+      // pid-based scheme would have picked for this call too.
+      const concurrent = join(directory, `sqlite_scanner.${process.pid}.tmp`);
+      writeFileSync(concurrent, "another extraction is writing this");
+
+      const second = ensureExtensionExtracted({ root, cacheDir, platform });
+      assert.equal(second, first);
+      assert.ok(
+        existsSync(concurrent),
+        "the concurrent extraction's temporary was destroyed",
+      );
+      assert.deepEqual(readFileSync(second), payload);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("refuses a bundled binary the manifest does not describe", () => {
     // The fetch script writes binaries inside its loop and the manifest only
     // after it, so an interrupted fetch leaves exactly this state. Skipping

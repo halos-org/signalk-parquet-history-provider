@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -187,7 +187,13 @@ export function ensureExtensionExtracted(options: ResolveOptions): string {
   // 27 MB binary. The fsync is what makes that survive a power cut — rename is
   // atomic against a concurrent reader and says nothing about what reached
   // the disk, and power loss is the normal way a vessel's Pi shuts down.
-  const temp = join(targetDir, `${SQLITE_SCANNER}.${process.pid}.tmp`);
+  // Unique per call, not per process. Worker threads share a pid, so a
+  // pid-named temporary collides between two concurrent extractions in one
+  // process: the second `openSync(…, "wx")` fails EEXIST and its catch then
+  // unlinks the FIRST caller's live temporary, whose rename fails ENOENT.
+  // Both callers fail and the cache is never populated. A unique name means
+  // the catch can only ever remove its own file.
+  const temp = join(targetDir, `${SQLITE_SCANNER}.${randomUUID()}.tmp`);
   sweepStaleTemporaries(targetDir, temp);
   try {
     const fd = openSync(temp, "wx", 0o644);
