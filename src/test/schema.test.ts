@@ -261,3 +261,29 @@ describe("count-shaped options are whole numbers", () => {
     assert.equal(normalizeConfig({ maxBufferMB: 0.5 }).maxBufferMB, 0.5);
   });
 });
+
+describe("the roll interval has to describe a schedule", () => {
+  it("keeps an interval that divides the day", () => {
+    for (const minutes of [1, 5, 15, 30, 60, 120, 240, 720, 1440]) {
+      assert.equal(
+        normalizeConfig({ rollIntervalMinutes: minutes }).rollIntervalMinutes,
+        minutes,
+      );
+    }
+  });
+
+  it("falls back when the interval does not divide the day", () => {
+    // "Aligned to UTC midnight" has no meaning for an interval that does not
+    // divide 1,440 minutes: the schedule either drifts or jumps at midnight,
+    // and which one it does is an accident of the arithmetic. The rows
+    // themselves are safe either way — each lands in the date directory its
+    // own timestamp names — so this is about the schedule, not the tree.
+    for (const minutes of [7, 100, 1441, 0.5]) {
+      assert.equal(
+        normalizeConfig({ rollIntervalMinutes: minutes }).rollIntervalMinutes,
+        CONFIG_DEFAULTS.rollIntervalMinutes,
+        `${minutes} does not divide 1,440`,
+      );
+    }
+  });
+});

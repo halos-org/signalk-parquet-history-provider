@@ -214,8 +214,13 @@ defensible other answer. Hourly is chosen because 24 files a day is already past
 the point where file count is doing any harm, and the remaining 40 ms is inside
 the startup cost of the process asking for it.
 
-Two constraints come with it. The interval must divide 24 hours and align to UTC
-midnight, so that no roll straddles a date directory.
+One constraint comes with it: the interval must divide 1,440 minutes, because
+"every N minutes from UTC midnight" describes a cadence only when it does. At
+100 minutes the last slot before midnight is 40 minutes long. This was written
+here as the thing that stops a roll straddling a date directory, and
+implementation showed that is not what it does — the roll places each row in
+the directory its own timestamp names, so a roll spanning midnight writes two
+files and both are correct. The constraint is about the schedule alone.
 
 And the interval has to be configurable, because the rate that produced these
 figures — 125.7 rows/second, 552 paths — is one vessel's and the hot store
@@ -276,6 +281,33 @@ the sidecar's does not.
 It bounds the tree half of that query only. The hot-store half is still a full
 scan — 94 ms at 13 MB, 441 ms at 130 MB — which is the roll interval again.
 
+## What the shipped roll measures, on the device
+
+Unit 3b's roll, running on a HALPI2 against a copy of a live hot store —
+2,493,029 rows, 552 `(context, path)` pairs — through `./run bench roll`. The
+figure is the roll process's own `VmHWM`, with an external poll of `/proc`
+beside it as a cross-check; the two agreed to within 1% on every run.
+
+| rows      | peak     | wall  |
+| --------- | -------- | ----- |
+| 156,000   | 146.1 MB | 4.2 s |
+| 623,000   | 161.0 MB | 4.3 s |
+| 1,246,000 | 159.6 MB | 4.8 s |
+| 2,493,029 | 163.0 MB | 6.1 s |
+
+Sixteen times the rows for 12% more memory. That is the streaming claim this
+layout rests on, now measured through the shipped code rather than a scratch
+script, and it is better than this document's own scale test (204–246 MB at
+11.4M rows) because that test unioned one store with itself nine times and
+widened every scan.
+
+**The first roll after a DuckDB version change costs 40–50 MB more**, twice
+reproduced at 623,000 rows: 193.9 and 203.7 MB cold against 151.7 and
+153.5 MB warm. It
+is the bundled `sqlite_scanner` being gunzipped from 8 MB to 27 MB into the
+roll's own heap before any query runs. One roll per device per version pays it,
+and nothing was added to avoid it.
+
 ## Provisional
 
 **Every query figure here is provisional, including the ordering between
@@ -307,10 +339,16 @@ task assignments.
 
 - **Nothing untrusted becomes a path.** Contexts and paths are columns. Only the
   roll's own UTC date is a directory.
-- **The interval must divide 1,440 minutes and align to UTC midnight.** A value
-  that does not — `rollIntervalMinutes` accepts one today, since
-  `src/config/schema.ts` normalizes it with `positive()` alone — puts one roll's
-  rows in two date directories.
+- **The interval must divide 1,440 minutes.** Not because a roll would
+  otherwise straddle a date directory — rows are placed by their own timestamp,
+  so a roll spanning midnight writes two files — but because a schedule of
+  "every N minutes from UTC midnight" only describes a cadence when N divides
+  the day.
+- **The set a roll covers is identified by rowid, not by a time window.** The
+  recorder stamps `ts` on arrival and the buffer holds it for up to a flush
+  interval, so a sample older than any window routinely reaches the store after
+  the roll has read it. What Parquet receives and what the store then deletes
+  have to be the same set, and only a monotonic id makes them so.
 - **Selection is by date directory and timestamp, not by partition pruning.** A
   reader narrows to files with a directory glob and a `ts` filter; nothing in
   the tree prunes on `path`.
@@ -319,7 +357,8 @@ task assignments.
   the boundary is an interval wide — whether that makes retention a storage
   bound or a deletion guarantee is for the unit that ships it to state.
 - **The sidecar is read as well as written.** Each roll folds the previous one
-  in, so it is an input to the roll that produces it.
+  in, so it is an input to the roll that produces it. It lives at
+  `latest/latest.parquet`, a sibling of the tree rather than a file inside it.
 - **A roll's peak needs a measurement the harness does not have.** `src/bench/`
   measures running subjects over settled windows; a roll's only quantity is
   `VmHWM` at exit.

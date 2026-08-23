@@ -13,6 +13,7 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { syncDirectory } from "../durable-write.js";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import {
@@ -248,20 +249,6 @@ function sweepStaleTemporaries(directory: string, own: string): void {
     } catch {
       /* it may have been renamed into place, or swept by another process */
     }
-  }
-}
-
-function syncDirectory(directory: string): void {
-  try {
-    const fd = openSync(directory, "r");
-    try {
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    // Not every platform allows fsync on a directory handle. The device target
-    // is Linux, where it works and where it is what makes the rename durable.
   }
 }
 

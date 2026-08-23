@@ -75,7 +75,7 @@ function check-extension {
 # Measurement
 
 function bench {
-  #@ Run the measurement harness (run|compare|selftest)
+  #@ Run the measurement harness (run|compare|selftest|roll)
   #@ Category: Measurement
   npm run build
   node dist/bench/cli.js "$@"

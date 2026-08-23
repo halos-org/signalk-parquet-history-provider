@@ -1,4 +1,5 @@
 import { Type, Static } from "typebox";
+import { dividesTheDay } from "../roll/schedule.js";
 
 /**
  * The single source of truth for both the JSON schema the Signal K Admin UI
@@ -91,7 +92,7 @@ export const ConfigSchema = Type.Object({
     default: 60,
     title: "Roll interval (minutes)",
     description:
-      "How often the hot store is rolled into the Parquet tree and truncated. Shorter keeps the hot store small and costs more Parquet files; longer does the reverse.",
+      "How often the hot store is rolled into the Parquet tree and truncated. Shorter keeps the hot store small and costs more Parquet files; longer does the reverse. Must divide 1440 — the schedule runs every N minutes from UTC midnight — and anything else falls back to the default.",
   }),
 });
 
@@ -188,11 +189,28 @@ export function normalizeConfig(config: StoredConfig): Config {
       config.retentionDays,
       CONFIG_DEFAULTS.retentionDays,
     ),
-    rollIntervalMinutes: positive(
+    rollIntervalMinutes: dayDivisor(
       config.rollIntervalMinutes,
       CONFIG_DEFAULTS.rollIntervalMinutes,
     ),
   };
+}
+
+/**
+ * A whole number of minutes that divides the day.
+ *
+ * The schedule is "every N minutes from UTC midnight", which only describes a
+ * cadence when N divides 1,440 — at 100 minutes the last slot before midnight
+ * is 40 minutes long, and whether the schedule drifts or jumps there is an
+ * accident of the arithmetic rather than anything an operator chose.
+ *
+ * It is not what keeps a roll inside one date directory. The roll places each
+ * row by its own timestamp, so a window spanning midnight writes into two
+ * directories and stays correct.
+ */
+function dayDivisor(value: number | undefined, fallback: number): number {
+  const positiveValue = positive(value, fallback);
+  return dividesTheDay(positiveValue) ? positiveValue : fallback;
 }
 
 function stringArray(value: unknown): string[] {

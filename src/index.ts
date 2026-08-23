@@ -16,7 +16,11 @@ import { PLUGIN_ID } from "./plugin-id.js";
 import { Recorder } from "./recorder.js";
 import type { BusValue } from "./recorder.js";
 import { WriterClient } from "./writer/client.js";
-import { EXIT_LOCKED, writerPaths } from "./writer/contract.js";
+import {
+  EXIT_LOCKED,
+  WRITER_EXIT_TIMEOUT_MS,
+  writerPaths,
+} from "./writer/contract.js";
 
 /**
  * Nothing in this file's import graph may reach `@duckdb/node-api`.
@@ -52,9 +56,6 @@ const WRITER_ENTRY = fileURLToPath(
 /** How often the status line is refreshed while recording. */
 const STATUS_INTERVAL_MS = 10_000;
 
-/** How long the plugin gives a departing writer before it is killed. */
-const WRITER_EXIT_TIMEOUT_MS = 3000;
-
 /** How long the buffer gets to reach the writer on a graceful stop. */
 const DRAIN_TIMEOUT_MS = 2000;
 
@@ -73,7 +74,10 @@ export default (app: App) => {
   let dataDir = "";
   let lockedRetries = 0;
 
-  function spawnWriter(dataDir: string): ChildProcess {
+  function spawnWriter(
+    dataDir: string,
+    rollIntervalMinutes: number,
+  ): ChildProcess {
     // An argument array, never a shell: a data directory an operator typed
     // into the Admin UI would otherwise be a command line.
     //
@@ -88,6 +92,8 @@ export default (app: App) => {
         WRITER_ENTRY,
         "--data-dir",
         dataDir,
+        "--roll-interval-minutes",
+        String(rollIntervalMinutes),
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
@@ -131,7 +137,9 @@ export default (app: App) => {
             `the hot store is still held; retry ${lockedRetries} in ${delay}ms`,
           );
           const timer = setTimeout(() => {
-            if (!stopping && writer === null) writer = spawnWriter(dataDir);
+            if (!stopping && writer === null) {
+              writer = spawnWriter(dataDir, rollIntervalMinutes);
+            }
           }, delay);
           timer.unref();
           return;
@@ -219,7 +227,7 @@ export default (app: App) => {
         fatal = null;
         stopping = false;
         lockedRetries = 0;
-        writer = spawnWriter(dataDir);
+        writer = spawnWriter(dataDir, config.rollIntervalMinutes);
 
         const buffer = new FlushBuffer({
           flushIntervalMs: config.flushIntervalMs,

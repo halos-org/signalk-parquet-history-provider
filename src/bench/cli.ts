@@ -4,12 +4,14 @@
  *   node dist/bench/cli.js run --label sqhp --subject signalk:pid=1234 -o sqhp.json
  *   node dist/bench/cli.js compare control.json sqhp.json parquet.json
  *   node dist/bench/cli.js selftest
+ *   node dist/bench/cli.js roll --data-dir /path/to/a/copy --max-rowid 1267241
  *
  * `run` measures one condition. `compare` puts several side by side, which is
  * the only form in which these numbers mean anything. `selftest` runs the
  * whole path against a load generator with a known duty cycle, so a machine
  * can show that the harness reports what it should before anyone trusts it
- * about a real workload.
+ * about a real workload. `roll` measures one roll, which `run` cannot: a roll
+ * has no steady state and is gone before a window closes.
  */
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -30,6 +32,9 @@ import {
  * note that describes it cannot disagree. */
 const SELFTEST_WRITE_INTERVAL_MS = 250;
 import { createProcSampler, parseSubjectSpec } from "./subjects.js";
+import { measureOneShot } from "./one-shot.js";
+import { writerPaths } from "../writer/contract.js";
+import { probeLiveWriter } from "../writer/server.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -39,7 +44,10 @@ async function main(): Promise<void> {
   if (command === "run") return doRun(rest);
   if (command === "compare") return doCompare(rest);
   if (command === "selftest") return doSelftest(rest);
-  console.error("usage: cli.js run|compare|selftest ... (see the file header)");
+  if (command === "roll") return doRoll(rest);
+  console.error(
+    "usage: cli.js run|compare|selftest|roll ... (see the file header)",
+  );
   process.exitCode = 2;
 }
 
@@ -103,6 +111,89 @@ async function doCompare(argv: string[]): Promise<void> {
     console.error(`wrote ${values.out}`);
   } else {
     process.stdout.write(table);
+  }
+}
+
+/**
+ * One roll, measured.
+ *
+ * **Point this at a copy of a data directory, never at a live one.** A roll
+ * writes into the tree and does not truncate the hot store, so a roll run
+ * beside a live writer puts those rows in the tree twice — once here, once
+ * when the writer rolls them itself under a different name. The live-writer
+ * probe is what enforces that: if anything answers on the socket, this
+ * refuses.
+ */
+async function doRoll(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      "data-dir": { type: "string" },
+      "max-rowid": { type: "string" },
+      "memory-limit": { type: "string" },
+      out: { type: "string", short: "o" },
+    },
+  });
+  const dataDir = values["data-dir"];
+  if (!dataDir) throw new Error("--data-dir is required");
+  if (!values["max-rowid"]) throw new Error("--max-rowid is required");
+  requireLinux();
+
+  if (await probeLiveWriter(writerPaths(dataDir).socket)) {
+    throw new Error(
+      `a writer is live on ${dataDir}. Measuring a roll there would write ` +
+        `its rows into the tree twice — copy the data directory first.`,
+    );
+  }
+
+  const result = await measureOneShot({
+    command: process.execPath,
+    args: [
+      join(HERE, "..", "roll", "main.js"),
+      "--data-dir",
+      dataDir,
+      "--max-rowid",
+      values["max-rowid"],
+      "--roll-id",
+      String(Date.now()),
+      ...(values["memory-limit"]
+        ? ["--memory-limit", values["memory-limit"]]
+        : []),
+    ],
+    selfReportedPeak: (stdout) => {
+      try {
+        const summary = JSON.parse(stdout.trim().split("\n").pop() ?? "") as {
+          peakRssBytes?: number | null;
+        };
+        return summary.peakRssBytes ?? null;
+      } catch {
+        return null;
+      }
+    },
+  });
+
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `the roll exited ${result.exitCode}: ${result.stderr.trim()}`,
+    );
+  }
+  const json = `${JSON.stringify(
+    {
+      peakMb: +(result.peakBytes / 1048576).toFixed(1),
+      peakSource: result.peakSource,
+      sampledPeakMb: +(result.sampledPeakBytes / 1048576).toFixed(1),
+      samples: result.samples,
+      wallMs: Math.round(result.wallMs),
+      roll: JSON.parse(result.stdout.trim().split("\n").pop() ?? "null"),
+    },
+    null,
+    2,
+  )}\n`;
+  if (values.out) {
+    writeFileSync(values.out, json);
+    console.error(`wrote ${values.out}`);
+  } else {
+    process.stdout.write(json);
   }
 }
 

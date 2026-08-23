@@ -1,7 +1,15 @@
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR_MODE, DATA_LAYOUT } from "../data-dir.js";
+import { dividesTheDay } from "../roll/schedule.js";
 import { HotStore } from "./hot-store.js";
+import { RollScheduler } from "./roll-scheduler.js";
 import { StoreLockedError, WriterServer } from "./server.js";
 import { EXIT_LOCKED, writerPaths } from "./contract.js";
 
@@ -13,7 +21,7 @@ import { EXIT_LOCKED, writerPaths } from "./contract.js";
  * event loop; keeping it a separate process rather than a worker thread is
  * what makes that true of memory as well as CPU.
  *
- *   node dist/writer/main.js --data-dir <path>
+ *   node dist/writer/main.js --data-dir <path> --roll-interval-minutes <n>
  *
  * Exit codes are read by the plugin, which turns them into a status an
  * operator can see:
@@ -21,6 +29,18 @@ import { EXIT_LOCKED, writerPaths } from "./contract.js";
  *   3  another writer already holds the hot store
  *   1  anything else
  */
+
+/**
+ * Write to stderr and be sure it arrives.
+ *
+ * `process.stderr.write` is asynchronous when stderr is a pipe — which it
+ * always is here, since the parent spawns this with piped stdio — and
+ * `process.exit` right after it truncates whatever is still queued. The
+ * message this loses is the one the parent logs as the reason.
+ */
+function writeStderr(line: string): void {
+  writeSync(2, line);
+}
 
 function argValue(flag: string): string | undefined {
   const index = process.argv.indexOf(flag);
@@ -30,7 +50,21 @@ function argValue(flag: string): string | undefined {
 async function main(): Promise<void> {
   const dataDir = argValue("--data-dir");
   if (dataDir === undefined || dataDir === "") {
-    process.stderr.write("usage: writer/main.js --data-dir <path>\n");
+    writeStderr(
+      "usage: writer/main.js --data-dir <path> --roll-interval-minutes <n>\n",
+    );
+    process.exit(1);
+  }
+  // Checked here, beside --data-dir, rather than left to the scheduler. An
+  // unchecked NaN reached `arm()` only AFTER the store was open, the socket
+  // claimed and the pid file written, and the plugin then latched that exit as
+  // fatal — recording stopped for a missing argument.
+  const rollIntervalMinutes = Number(argValue("--roll-interval-minutes"));
+  if (!dividesTheDay(rollIntervalMinutes)) {
+    writeStderr(
+      `--roll-interval-minutes must be a whole number of minutes dividing 1440, ` +
+        `not ${argValue("--roll-interval-minutes") ?? "(missing)"}\n`,
+    );
     process.exit(1);
   }
 
@@ -54,7 +88,7 @@ async function main(): Promise<void> {
     if (err instanceof StoreLockedError) {
       // Named separately from any other failure because the plugin's remedy is
       // different: a second writer is a problem to resolve, not to retry.
-      process.stderr.write(`${err.message}\n`);
+      writeStderr(`${err.message}\n`);
       process.exit(EXIT_LOCKED);
     }
     throw err;
@@ -63,11 +97,27 @@ async function main(): Promise<void> {
   writeFileSync(paths.pidFile, `${process.pid}\n`, { mode: 0o600 });
   process.stdout.write(`writer ready on ${paths.socket}\n`);
 
+  // The roll runs here rather than in the plugin because only this process may
+  // write to the store: the roll reads it read-only, and the delete that
+  // follows a successful roll has nowhere else it could happen.
+  const rolls = new RollScheduler({
+    store,
+    dataDir,
+    intervalMinutes: rollIntervalMinutes,
+    log: (line) => process.stdout.write(`${line}\n`),
+    // stderr, because the plugin routes it to app.error while stdout goes to
+    // app.debug. A roll failure nobody sees is the shape this whole design
+    // exists to make impossible.
+    onError: (line) => writeStderr(`${line}\n`),
+  });
+  rolls.start();
+
   let stopping = false;
   const stop = async (signal: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
     process.stdout.write(`writer stopping on ${signal}\n`);
+    await rolls.stop();
     await server.close();
     store.close();
     rmSync(paths.pidFile, { force: true });
@@ -78,7 +128,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  process.stderr.write(
+  writeStderr(
     `${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
   );
   process.exit(1);

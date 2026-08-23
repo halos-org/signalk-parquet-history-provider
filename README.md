@@ -14,11 +14,24 @@ anyone queries it.
 
 ## Status
 
-Recording works: the plugin filters, rate-caps and buffers, and a separate
-writer process owns a SQLite hot store. The roll into Parquet, the query layer
-and the two history API surfaces are not implemented yet, so nothing reads this
-data back yet. Progress is tracked in
+The plugin records and rolls: it filters, rate-caps and buffers, a separate
+writer process owns a SQLite hot store, and that writer rolls the store into a
+Parquet tree on a schedule and truncates it. The query layer and the two
+history API surfaces do not exist yet, so nothing reads this data back.
+Progress is tracked in
 [halos-org/halos#152](https://github.com/halos-org/halos/issues/152).
+
+## The tree
+
+    <data directory>/
+      hot/hot.sqlite            the writer's store, truncated after each roll
+      parquet/date=YYYY-MM-DD/  one file per roll, named for the slot it ran in
+      latest/latest.parquet     every path's last value, cumulative
+
+`context` and `path` are columns, never directories, and each row lands under
+the date its own timestamp names — so a roll spanning midnight writes two
+files. Why it is shaped this way, with the measurements behind it, is
+`docs/layout-decision.md`.
 
 ## Installation
 
@@ -31,22 +44,22 @@ directory.
 Every option is rendered in the Signal K Admin UI from the plugin's own schema
 (`src/config/schema.ts`), which is also the source of the `Config` type.
 
-| Option                                              | Default               | What it does                                                                                                                                                                                                                  |
-| --------------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Filter mode                                         | `exclude`             | Whether the path patterns below name what to skip or what to keep.                                                                                                                                                            |
-| Path patterns (glob supported)                      | none                  | Globs over Signal K paths, e.g. `notifications.*`.                                                                                                                                                                            |
-| Default sampling rate (ms)                          | `2000`                | Minimum interval between recorded samples for a path. `0` records every update.                                                                                                                                               |
-| Per-path sampling rates (ms)                        | none                  | Overrides for individual paths or globs.                                                                                                                                                                                      |
-| Record own vessel                                   | on                    | Whether `vessels.self` is recorded.                                                                                                                                                                                           |
-| Record other vessels                                | **off**               | Whether AIS targets and other vessels are recorded. Off by default because every vessel is a context, and the roll holds one Parquet writer per partition — this setting, more than data volume, sets the roll's memory peak. |
-| Maximum distinct recorded paths                     | `2000`                | Paths beyond this are ignored, so a misbehaving source cannot inflate the partition count without limit.                                                                                                                      |
-| Maximum distinct recorded contexts                  | `100`                 | The same bound for vessel contexts.                                                                                                                                                                                           |
-| Flush interval (ms)                                 | `5000`                | No sample waits longer than this before reaching the writer. Also the crash-loss window: a hard power cut loses at most this much.                                                                                            |
-| Flush batch size (samples)                          | `1000`                | Samples per write, whichever comes first with the interval. Each batch is one SQLite transaction.                                                                                                                             |
-| Buffer ceiling while the writer is unreachable (MB) | `8`                   | Memory held for samples that could not be sent. When full the oldest are dropped and the count is reported in the plugin status.                                                                                              |
-| Data directory                                      | plugin data directory | Where the hot store and the Parquet tree live. A relative value resolves against the plugin's own directory.                                                                                                                  |
-| Retention (days, 0 = keep forever)                  | `0`                   | How long data is kept.                                                                                                                                                                                                        |
-| Roll interval (minutes)                             | `60`                  | How often the hot store becomes Parquet and is truncated. Shorter keeps the hot store small at the cost of more Parquet files.                                                                                                |
+| Option                                              | Default               | What it does                                                                                                                                                                                                                                |
+| --------------------------------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Filter mode                                         | `exclude`             | Whether the path patterns below name what to skip or what to keep.                                                                                                                                                                          |
+| Path patterns (glob supported)                      | none                  | Globs over Signal K paths, e.g. `notifications.*`.                                                                                                                                                                                          |
+| Default sampling rate (ms)                          | `2000`                | Minimum interval between recorded samples for a path. `0` records every update.                                                                                                                                                             |
+| Per-path sampling rates (ms)                        | none                  | Overrides for individual paths or globs.                                                                                                                                                                                                    |
+| Record own vessel                                   | on                    | Whether `vessels.self` is recorded.                                                                                                                                                                                                         |
+| Record other vessels                                | **off**               | Whether AIS targets and other vessels are recorded. Off by default because every vessel is a context, and the roll holds one Parquet writer per partition — this setting, more than data volume, sets the roll's memory peak.               |
+| Maximum distinct recorded paths                     | `2000`                | Paths beyond this are ignored, so a misbehaving source cannot inflate the partition count without limit.                                                                                                                                    |
+| Maximum distinct recorded contexts                  | `100`                 | The same bound for vessel contexts.                                                                                                                                                                                                         |
+| Flush interval (ms)                                 | `5000`                | No sample waits longer than this before reaching the writer. Also the crash-loss window: a hard power cut loses at most this much.                                                                                                          |
+| Flush batch size (samples)                          | `1000`                | Samples per write, whichever comes first with the interval. Each batch is one SQLite transaction.                                                                                                                                           |
+| Buffer ceiling while the writer is unreachable (MB) | `8`                   | Memory held for samples that could not be sent. When full the oldest are dropped and the count is reported in the plugin status.                                                                                                            |
+| Data directory                                      | plugin data directory | Where the hot store and the Parquet tree live. A relative value resolves against the plugin's own directory.                                                                                                                                |
+| Retention (days, 0 = keep forever)                  | `0`                   | How long data is kept.                                                                                                                                                                                                                      |
+| Roll interval (minutes)                             | `60`                  | How often the hot store becomes Parquet and is truncated. Shorter keeps the hot store small at the cost of more Parquet files. Must divide 1440 — the schedule runs every N minutes from UTC midnight — and anything else falls back to 60. |
 
 ## The bundled DuckDB extension
 
@@ -97,10 +110,19 @@ the kernel's own high-water mark (`VmHWM`, or cgroup `memory.peak`) rather than
 from the samples, because the roll process is short-lived by design and its
 peak is exactly what a sampling interval misses.
 
+That method needs a subject that is still running, which a roll is not: it
+lives seconds, has no steady state, and is gone before a window closes. `roll`
+measures one instead, by asking the roll process for the high-water mark the
+kernel kept for it and polling `/proc` from outside as a cross-check. **Point
+it at a copy of a data directory** — a roll writes into the tree and does not
+truncate the hot store, so one run beside a live writer puts those rows in the
+tree twice. It refuses if anything answers on the writer's socket.
+
 ```bash
 ./run bench run --label sqhp --subject signalk:pid=1234 -o sqhp.json
 ./run bench compare control.json sqhp.json parquet.json
 ./run bench selftest
+./run bench roll --data-dir /path/to/a/copy --max-rowid 1267241
 ```
 
 `selftest` measures a load generator with a known duty cycle and compares the

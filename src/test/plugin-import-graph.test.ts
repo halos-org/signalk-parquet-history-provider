@@ -107,6 +107,32 @@ describe("the plugin's import graph", () => {
     );
   });
 
+  it("keeps the engine out of the writer as well", () => {
+    // The writer is long-lived, so an import here would make the ~100 MB
+    // addon resident for as long as recording runs — the same cost as
+    // mapping it into the server, one process over. It reaches the roll by
+    // spawning it, which is the only reason the roll's memory is transient.
+    const writer = join(DIST, "writer", "main.js");
+    assert.ok(
+      existsSync(writer),
+      "build first: dist/writer/main.js is missing",
+    );
+    const { bare, builtins, files } = walk(writer);
+    // The positive control the plugin's own check has: without it, a walk that
+    // resolved nothing at all passes, and the writer could be importing the
+    // engine while this stays green.
+    assert.ok(files.length > 1, "expected the writer to import something");
+    assert.ok(
+      builtins.has("node:sqlite"),
+      "the writer must reach node:sqlite through hot-store.js; if it does " +
+        "not, this walk did not traverse and proves nothing",
+    );
+    assert.deepEqual(
+      [...bare].filter((specifier) => FORBIDDEN.test(specifier)),
+      [],
+    );
+  });
+
   it("loads no DuckDB library when a real process starts and runs it", () => {
     // The static walk covers this package's own files. This covers everything
     // else — a dependency that pulls the addon in transitively would map it

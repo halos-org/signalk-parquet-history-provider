@@ -42,4 +42,18 @@ export const DATA_LAYOUT = {
   tree: "parquet",
   /** Expanded DuckDB extension binaries, keyed by version and platform. */
   extensionCache: "duckdb-extensions",
+  /**
+   * The cumulative last-value sidecar the roll rewrites.
+   *
+   * Outside `tree` on purpose: its rows are copies of rows already in the
+   * tree, so a reader globbing the tree would count every path's last value
+   * twice.
+   */
+  sidecar: "latest",
+  /**
+   * Where a roll lets DuckDB spill. Explicit because the engine's default for
+   * an in-memory database is relative to the current working directory, which
+   * for a spawned process is the Signal K server's.
+   */
+  scratch: "tmp",
 } as const;
