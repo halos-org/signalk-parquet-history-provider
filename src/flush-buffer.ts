@@ -130,7 +130,11 @@ export class FlushBuffer {
     let count = 0;
     let bytes = 0;
     while (count < this.entries.length && count < this.options.batchSize) {
-      const next = bytes + this.entries[count].bytes;
+      // The comma between array elements is a byte per sample beyond the
+      // first, and at these batch sizes that is not a rounding error: a batch
+      // of ~54,000 small samples summed to 4,194,138 bytes and framed to
+      // 4,247,945, so encodeFrame refused the batch this method produced.
+      const next = bytes + this.entries[count].bytes + (count === 0 ? 0 : 1);
       if (count > 0 && next > budget) break;
       bytes = next;
       count++;

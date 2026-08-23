@@ -152,23 +152,28 @@ describe("a batch is one transaction", () => {
   });
 
   it("reports why the batch failed, not why the rollback did", () => {
-    // SQLITE_FULL and SQLITE_IOERR can roll the transaction back themselves,
-    // after which an explicit ROLLBACK fails with "no transaction is active".
-    // Rethrowing that would report a bookkeeping problem on a disk-full.
-    store.close();
+    // The failure has to happen *inside* the transaction. Closing the store
+    // makes BEGIN IMMEDIATE throw before the try block, which exercises none
+    // of the rollback path this test is named for. A CHECK violation on the
+    // second row does: the transaction is open, the insert fails, and the
+    // reported error must still be the insert's.
     let raised: unknown;
     try {
-      store.insertBatch(1, [sample()]);
+      store.insertBatch(1, [
+        sample({ ts: 1 }),
+        { ...sample({ ts: 2 }), kind: "elephant" } as unknown as Sample,
+      ]);
     } catch (err) {
       raised = err;
     }
+
     assert.ok(raised instanceof Error);
     assert.match(
-      String((raised as { code?: string }).code ?? (raised as Error).message),
-      /ERR_INVALID_STATE|not open/,
-      `the original cause was replaced: ${String(raised)}`,
+      (raised as Error).message,
+      /CHECK constraint/,
+      `the insert's error was replaced by the rollback's: ${String(raised)}`,
     );
-    store = HotStore.open(join(dir, "hot.sqlite"));
+    assert.strictEqual(store.rowCount(), 0, "the good row was not rolled back");
   });
 
   it("leaves the sequence counter untouched when a batch rolls back", () => {

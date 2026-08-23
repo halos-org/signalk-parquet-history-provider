@@ -340,6 +340,11 @@ describe("a writer that stops answering", () => {
         `the silence to be reported (saw ${JSON.stringify(unhealthy)})`,
       );
     } finally {
+      // Before closing the server: close() waits for active sockets, and the
+      // client's reconnect loop would keep handing it new ones until the outer
+      // teardown runs -- which cannot run until this block returns.
+      await client?.stop();
+      client = null;
       await new Promise<void>((resolve) => silent.close(() => resolve()));
     }
   });

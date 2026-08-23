@@ -131,7 +131,7 @@ describe("a delta reaching the writer's store", () => {
       assert.equal(rows[0].source, "n2k.0");
       assert.deepEqual(calls.errors, []);
     } finally {
-      plugin.stop();
+      await plugin.stop();
       // The writer removes its pid file on SIGTERM. The claim on the store is
       // the socket, not this file, but a writer that never got its stop signal
       // would leave it behind and that is worth noticing.
@@ -231,7 +231,7 @@ describe("a delta reaching the writer's store", () => {
       }
       assert.deepEqual(calls.errors, []);
     } finally {
-      plugin.stop();
+      await plugin.stop();
       rmSync(base, { recursive: true, force: true });
     }
   });
@@ -355,7 +355,7 @@ describe("a delta reaching the writer's store", () => {
         `the death to be reported (errors: ${JSON.stringify(calls.errors)})`,
       );
     } finally {
-      plugin.stop();
+      await plugin.stop();
       rmSync(base, { recursive: true, force: true });
     }
   });

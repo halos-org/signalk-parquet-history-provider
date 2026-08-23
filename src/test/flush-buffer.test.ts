@@ -3,7 +3,7 @@ import assert from "node:assert";
 import { fat, sample } from "./fixtures.js";
 import { FlushBuffer, sampleBytes } from "../flush-buffer.js";
 import type { FlushBufferOptions } from "../flush-buffer.js";
-import { MAX_FRAME_BYTES } from "../writer/protocol.js";
+import { MAX_FRAME_BYTES, encodeFrame } from "../writer/protocol.js";
 
 function buffer(over: Partial<FlushBufferOptions> = {}) {
   return new FlushBuffer({
@@ -167,15 +167,33 @@ describe("the frame limit binds as well as the budget", () => {
 
     const taken = buf.take(0);
     assert.ok(taken.length < 8, "the whole backlog was handed over at once");
-    const bytes = taken.reduce((sum, s) => sum + sampleBytes(s), 0);
-    assert.ok(
-      bytes <= MAX_FRAME_BYTES,
-      `a batch of ${bytes} bytes exceeds the ${MAX_FRAME_BYTES}-byte frame limit`,
+    // Measured by framing it, not by summing sampleBytes. Summing re-derives
+    // the accounting under test, so it agreed with a take() that ignored the
+    // commas between array elements and let a 4,247,945-byte frame through.
+    assert.doesNotThrow(() =>
+      encodeFrame({ type: "batch", seq: 1, samples: taken }),
     );
     assert.strictEqual(
       buf.length,
       8 - taken.length,
       "the rest stayed buffered",
+    );
+  });
+
+  it("frames a batch of many small samples, separators included", () => {
+    // The case the byte sum misses: one comma per sample beyond the first. At
+    // ~54,000 small samples that is ~53 KB, enough on its own to push a batch
+    // that summed under the limit past it.
+    const buf = buffer({ maxBytes: 64 * 1024 * 1024, batchSize: 1_000_000 });
+    const per = sampleBytes(sample());
+    const enough = Math.ceil((MAX_FRAME_BYTES - 128) / per) + 10;
+    for (let i = 0; i < enough; i++) buf.add(sample(), 0);
+
+    const taken = buf.take(0);
+    assert.ok(taken.length > 1000, "not enough samples to expose separators");
+    assert.doesNotThrow(
+      () => encodeFrame({ type: "batch", seq: 1, samples: taken }),
+      "take() produced a batch encodeFrame refuses",
     );
   });
 
