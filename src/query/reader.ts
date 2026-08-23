@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance, listValue } from "@duckdb/node-api";
-import type { DuckDBValue } from "@duckdb/node-api";
+import type { DuckDBConnection, DuckDBValue } from "@duckdb/node-api";
 import { DATA_DIR_MODE, DATA_LAYOUT } from "../data-dir.js";
 import {
   BASE_DUCKDB_CONFIG,
@@ -114,13 +114,19 @@ export async function read(
   );
   mkdirSync(scratch, { recursive: true, mode: DATA_DIR_MODE });
 
-  const instance = await DuckDBInstance.create(":memory:", {
-    ...BASE_DUCKDB_CONFIG,
-    memory_limit: options.memoryLimit ?? DEFAULT_MEMORY_LIMIT,
-    temp_directory: scratch,
-  });
-  const connection = await instance.connect();
+  // Opened inside the scope that removes them. An engine that fails to start —
+  // a memory limit the device cannot honour, a temp directory it cannot write
+  // — would otherwise leave its scratch directory behind on every attempt, and
+  // only the next roll's hourly sweep would collect them.
+  let instance: DuckDBInstance | null = null;
+  let connection: DuckDBConnection | null = null;
   try {
+    instance = await DuckDBInstance.create(":memory:", {
+      ...BASE_DUCKDB_CONFIG,
+      memory_limit: options.memoryLimit ?? DEFAULT_MEMORY_LIMIT,
+      temp_directory: scratch,
+    });
+    connection = await instance.connect();
     if (plan.storeExists) {
       // Only when there is a store to attach. Loading the extension is 80 ms
       // of a query's ~350 ms floor on the device, and a range old enough to
@@ -164,8 +170,8 @@ export async function read(
       treeFiles: plan.files.length,
     };
   } finally {
-    connection.closeSync();
-    instance.closeSync();
+    connection?.closeSync();
+    instance?.closeSync();
     rmSync(scratch, { recursive: true, force: true });
   }
 }
@@ -356,16 +362,25 @@ function rowLimit(request: QueryRequest): number {
   return Math.max(1, Math.min(Math.floor(asked), DEFAULT_ROW_LIMIT));
 }
 
+/** The kinds a request may name. Anything else is not a query. */
+const KINDS = ["range", "paths", "contexts"] as const;
+
 /**
  * Check the request at the boundary it crosses.
  *
  * It arrives as JSON from another process, which built it from an HTTP
- * request. Everything user-supplied in it is bound rather than composed, so
- * this is about shape rather than about injection: a `to` of `undefined`
- * otherwise reaches `BigInt()` and fails with a message naming neither the
- * field nor the request.
+ * request, and the type it is cast to on arrival is a claim rather than a
+ * check. Everything user-supplied is bound rather than composed, so this is
+ * about shape rather than about injection — but a shape nobody checked still
+ * reaches SQL: an unrecognised `kind` compiled to the contexts query and
+ * answered it, and a `limit` of `"x"` compiled to `LIMIT NaN`.
  */
 function validate(request: QueryRequest): void {
+  if (!KINDS.includes(request.kind)) {
+    throw new Error(
+      `${JSON.stringify(request.kind)} is not a query kind; expected one of ${KINDS.join(", ")}`,
+    );
+  }
   const time = (name: "from" | "to", value: unknown) => {
     if (typeof value !== "number" || !Number.isFinite(value)) {
       throw new Error(`${name} must be a timestamp in milliseconds`);
@@ -376,12 +391,19 @@ function validate(request: QueryRequest): void {
   if (request.kind !== "contexts" && typeof request.context !== "string") {
     throw new Error("context must be a string");
   }
-  if (request.kind === "range" && request.paths !== undefined) {
+  if (request.kind !== "range") return;
+  if (request.paths !== undefined) {
     if (
       !Array.isArray(request.paths) ||
       request.paths.some((path) => typeof path !== "string")
     ) {
       throw new Error("paths must be an array of strings");
     }
+  }
+  if (
+    request.limit !== undefined &&
+    (typeof request.limit !== "number" || !Number.isFinite(request.limit))
+  ) {
+    throw new Error("limit must be a number of rows");
   }
 }

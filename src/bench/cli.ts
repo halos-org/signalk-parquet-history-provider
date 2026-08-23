@@ -235,20 +235,25 @@ async function doQuery(argv: string[]): Promise<void> {
   }
   requireLinux();
 
+  // Through `numberOr`, which names the offending text. `Number("noon")` is
+  // NaN, `JSON.stringify` writes it as null, and the query then fails with a
+  // message about a field rather than about the flag that set it.
   const request = {
     kind: values.kind,
-    from: Number(values.from),
-    to: Number(values.to),
+    from: numberOr(values.from, 0),
+    to: numberOr(values.to, 0),
     context: values.context,
     ...(values.path.length > 0 ? { paths: values.path } : {}),
-    ...(values.limit ? { limit: Number(values.limit) } : {}),
+    ...(values.limit ? { limit: numberOr(values.limit, 0) } : {}),
   };
+  const repeat = numberOr(values.repeat, 3);
+  if (repeat < 1) throw new Error(`--repeat ${repeat} measures nothing`);
 
   // Repeated, and every run reported. One figure from one run says nothing
   // about a query whose first call pays for a page cache the second one finds
   // warm — which is the difference this harness exists to keep visible.
   const runs = [];
-  for (let attempt = 0; attempt < numberOr(values.repeat, 3); attempt += 1) {
+  for (let attempt = 0; attempt < repeat; attempt += 1) {
     const result = await measureOneShot({
       command: process.execPath,
       args: [

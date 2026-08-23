@@ -104,6 +104,30 @@ describe("a query", () => {
     assert.deepEqual(result.rows, [[3]]);
   });
 
+  it("reassembles a row whose text is split across two chunks", async () => {
+    // A vessel name or a notification message can put a multi-byte character
+    // on a 64 kB boundary. Decoding each chunk on its own replaces the split
+    // bytes with U+FFFD in both halves, so the row comes back mangled — or
+    // stops being JSON and takes the whole query with it. Here the split is
+    // deliberate and mid-character.
+    const written = JSON.stringify([1, "self", "n.name", "Kärppä ⛵"]);
+    const bytes = Buffer.from(`${written}\n`, "utf8");
+    const cut = bytes.indexOf(Buffer.from("ä", "utf8")) + 1;
+    const splitWriter = (): ChildProcess =>
+      child(
+        `const b = Buffer.from(${JSON.stringify(bytes.toString("base64"))}, "base64");` +
+          `process.stdout.write(b.subarray(0, ${cut}));` +
+          `setTimeout(() => {` +
+          `  process.stdout.write(b.subarray(${cut}));` +
+          `  console.log(JSON.stringify({rows:1,truncated:false,treeFiles:0}));` +
+          `}, 10);`,
+      );
+
+    const result = await make({ spawnQuery: splitWriter }).run(RANGE);
+
+    assert.deepEqual(result.rows, [[1, "self", "n.name", "Kärppä ⛵"]]);
+  });
+
   it("reports a failing query with what it said, not with a stack", async () => {
     const fails = (): ChildProcess =>
       child(

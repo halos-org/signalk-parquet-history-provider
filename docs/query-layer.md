@@ -1,9 +1,10 @@
 # What a query costs
 
-Unit 4a of [halos-org/halos#152](https://github.com/halos-org/halos/issues/152):
-the execution layer, and what it measures on the device. Unit 3a priced these
-queries with ad-hoc statements and said every figure in it was provisional
-until a real reader ran them. This is that reader.
+What a history query costs on the device, measured through the shipped reader
+rather than through an ad-hoc statement, and what follows from the figures.
+`docs/layout-decision.md` is its counterpart for what the roll writes; the plan
+both belong to is
+[halos-org/halos#152](https://github.com/halos-org/halos/issues/152).
 
 ## The shape
 
@@ -57,8 +58,8 @@ excludes its own startup and is reported only so the difference stays visible.
 **The plan's query criterion is not met, and cannot be by this shape.** It asks
 for a single-path range "within sqhp's range (~34 ms for an hour-long
 request)". The measured answer is 526–684 ms, of which ~345 ms is the floor
-above. Unit 3a's 16–37 ms was in-engine time for a statement in an
-already-running process, which is what the unit issue suspected. A history
+above. The 16–37 ms in `docs/layout-decision.md` was in-engine time for a
+statement inside an already-running process. A history
 provider that spawns per query answers in half a second; one that talks to a
 running server answers in tens of milliseconds. That is the trade the design
 makes for not having a database server resident, and it is now a measurement
@@ -69,9 +70,9 @@ while this is 0 MB standing and ~120 MB for as long as a query runs.
 
 ## The layout decision, re-checked
 
-Unit 3a chose one file per roll, no path partitioning and no compaction, and
-named what would reopen it: "if Unit 4a's real reader shows a multi-day query
-dominated by per-file cost rather than by startup."
+`docs/layout-decision.md` chose one file per roll, no path partitioning and no
+compaction, and named what would reopen it: a multi-day query dominated by per-file cost
+rather than by startup.
 
 Both trees below are one day of real data hard-linked into 30 dated
 directories, with no hot store. The rows therefore repeat, and a 30-day range
@@ -85,10 +86,10 @@ returns 30× the rows — so these numbers overstate the row cost of a real
 
 **Per-file planning cost is about 1 ms.** Collapsing 240 files into 30 saves
 ~230 ms of a 2,200 ms query and ~60 ms of a 660 ms one. The 30-day query is
-dominated by its 82,590 rows, not by its files, so the condition Unit 3a set
-for reopening compaction is not met. Compacting one day cost 639 ms in a
-process Unit 3a measured at 344–484 MB — the largest transient in the design —
-to save 230 ms on a query nobody has to make.
+dominated by its 82,590 rows, not by its files, so the condition for reopening
+compaction is not met. Compacting one day cost 639 ms in a process measured
+there at 344–484 MB — the largest transient in the design — to save 230 ms on a
+query nobody has to make.
 
 **A date-scoped query does not care how large the tree is.** 1 file, 8 files
 and 240 files all answer a one-day single-path range in 360–444 ms. That is
@@ -103,8 +104,8 @@ once a device has one, and it is not worth pre-emptively engineering for.
 `getPaths` is a scan rather than a directory listing, and the flat layout is
 why. It costs 448–486 ms over a day and 601–727 ms over thirty. The cumulative
 sidecar could answer "every path ever" from one 11 kB file, but not "every path
-with data in this range", which is what the history API asks. Nothing in Unit
-4a reads the sidecar.
+with data in this range", which is what the history API asks. Nothing reads
+the sidecar.
 
 ## The seam
 
@@ -136,11 +137,11 @@ queued is failed rather than spawned into a socket nobody is reading.
 schedule and a query arrives when a client asks, so the worst case is the sum
 of separately measured peaks:
 
-| at once                        | MB   |
-| ------------------------------ | ---- |
-| two queries at 220 MB          | 440  |
-| a roll (Unit 3b, on this data) | 163  |
-| **summed transient**           | ~600 |
+| at once               | MB   |
+| --------------------- | ---- |
+| two queries at 220 MB | 440  |
+| a roll, on this data  | 163  |
+| **summed transient**  | ~600 |
 
 That is a sum of peaks measured apart, not a measured combination. It fits a
 4 GB device running the marine stack, which is why nothing admission-controls
@@ -154,11 +155,11 @@ ceiling on _that_ process, not on this one.
 
 ## What this does not measure
 
-- **Aggregation.** Unit 4a returns raw rows. Bucketed aggregates are the v2
-  surface's, and nothing here prices them.
+- **Aggregation.** The reader returns raw rows. Bucketed aggregates belong to
+  the v2 surface, and nothing here prices them.
 - **A concurrent roll and query.** The summed transient above is arithmetic.
 - **A tree with a real retention window in it.** Both aged trees are one day of
   data wearing thirty dates.
 - **A file deleted while a query reads it.** The file list is taken before the
-  statement runs, so expiry (Unit 5a) has to decide what a reader that is
-  already holding a list should see.
+  statement runs, so whatever ships expiry has to decide what a reader already
+  holding a list should see.

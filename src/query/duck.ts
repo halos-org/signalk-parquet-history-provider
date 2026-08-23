@@ -291,12 +291,22 @@ export class QueryRunner {
       );
       killer.unref();
 
+      // Decoded by the stream, never per chunk. A chunk boundary can fall
+      // inside a multi-byte UTF-8 sequence, and `Buffer.toString()` on each
+      // half replaces the split bytes with U+FFFD in both — so a vessel name
+      // or a notification message straddling a 64 kB boundary comes back
+      // mangled, or fails `JSON.parse` and takes the whole query with it.
+      // With an encoding set, Node holds the partial sequence for the next
+      // chunk.
+      child.stdout?.setEncoding("utf8");
+      child.stderr?.setEncoding("utf8");
+
       // Line by line as it arrives, rather than one split over a collected
       // string: a range query's answer can be tens of megabytes, and holding
       // it once as text and once as rows doubles that inside the Signal K
       // process.
-      child.stdout?.on("data", (chunk: Buffer) => {
-        pendingLine += chunk.toString();
+      child.stdout?.on("data", (chunk: string) => {
+        pendingLine += chunk;
         let cut = pendingLine.indexOf("\n");
         while (cut >= 0) {
           const line = pendingLine.slice(0, cut);
@@ -315,7 +325,7 @@ export class QueryRunner {
           cut = pendingLine.indexOf("\n");
         }
       });
-      child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+      child.stderr?.on("data", (chunk: string) => (stderr += chunk));
       // An EventEmitter with no error listener rethrows the event, which would
       // take the Signal K process down for a failed query.
       child.stdout?.on("error", () => {});

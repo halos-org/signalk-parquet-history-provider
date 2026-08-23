@@ -91,11 +91,12 @@ a check on module evaluation alone.
   the resolver only finds and expands its binary.
 - `src/roll/` — the roll. `main.ts` is the process the writer spawns, `roll.ts`
   the work it does, `schedule.ts` the every-N-minutes-from-UTC-midnight grid,
-  `tree-path.ts` the tree's paths. **`roll.ts` is the only file in the package
-  that imports `@duckdb/node-api`**, and it may because everything importing it
-  runs in a process that exits. The rule is not "one directory owns the
-  engine"; it is that the engine may never be reachable from `src/index.ts` or
-  from `src/writer/`, both of which run for as long as recording does.
+  `tree-path.ts` the tree's paths. **`roll.ts` and `query/reader.ts` are the
+  only two files in the package that import `@duckdb/node-api`**, and they may
+  because everything importing either runs in a process that exits. The rule is
+  not "one directory owns the engine"; it is that the engine may never be
+  reachable from `src/index.ts` or from `src/writer/`, both of which run for as
+  long as recording does.
 - `src/query/` — reading. `duck.ts` is the side that runs inside the Signal K
   process: it spawns, caps concurrency and enforces the deadline, and it
   imports no engine. `main.ts` is the spawned process, `reader.ts` the work it

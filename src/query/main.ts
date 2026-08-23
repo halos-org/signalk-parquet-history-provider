@@ -1,4 +1,5 @@
 import { writeSync } from "node:fs";
+import { once } from "node:events";
 import { ownPeakBytes } from "../bench/one-shot.js";
 import { read } from "./reader.js";
 import type { QueryRequest } from "./duck.js";
@@ -73,14 +74,19 @@ async function main(): Promise<void> {
   // megabytes, and this process's peak is the figure the design is judged on —
   // joining every line first would add the whole answer to it a second time.
   const batch: string[] = [];
-  const flush = () => {
+  const flush = async (): Promise<void> => {
     if (batch.length === 0) return;
-    process.stdout.write(`${batch.join("\n")}\n`);
+    const full = !process.stdout.write(`${batch.join("\n")}\n`);
     batch.length = 0;
+    // Waiting for the pipe rather than serialising ahead of it. Without this
+    // an answer the caller reads slowly accumulates inside this process
+    // instead — on top of the rows it already holds, and on the one figure
+    // this design is judged on.
+    if (full) await once(process.stdout, "drain");
   };
   for (const row of result.rows) {
     batch.push(JSON.stringify(row));
-    if (batch.length >= OUTPUT_BATCH_ROWS) flush();
+    if (batch.length >= OUTPUT_BATCH_ROWS) await flush();
   }
   batch.push(
     JSON.stringify({
@@ -94,7 +100,7 @@ async function main(): Promise<void> {
       peakRssBytes: ownPeakBytes(),
     }),
   );
-  flush();
+  await flush();
 }
 
 main().catch((err: unknown) => {

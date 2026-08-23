@@ -206,6 +206,33 @@ describe("what a query reads", { skip: NO_BUNDLED_EXTENSION }, () => {
     }
   });
 
+  it("refuses a request whose shape reached it from JSON", async () => {
+    // The type the request is cast to on arrival is a claim, not a check. An
+    // unrecognised `kind` used to compile to the contexts query and answer it,
+    // and a `limit` that is not a number used to compile to `LIMIT NaN`.
+    series(AUG_23 + 1000, 2);
+    const refuses = async (request: unknown, why: RegExp) => {
+      await assert.rejects(
+        runner.run(request as QueryRequest),
+        (err: Error) => why.test(err.message),
+        `${JSON.stringify(request)} was not refused`,
+      );
+    };
+
+    await refuses(
+      { kind: "everything", from: AUG_23, to: AUG_23 + DAY, context: "self" },
+      /is not a query kind/,
+    );
+    await refuses(
+      range(AUG_23, AUG_23 + DAY, { limit: "x" as unknown as number }),
+      /limit must be a number/,
+    );
+    await refuses(
+      { kind: "range", from: AUG_23, to: undefined, context: "self" },
+      /to must be a timestamp/,
+    );
+  });
+
   it("skips a partition a killed roll left half-written", async () => {
     series(AUG_23 + 1000, 2);
     const maxRowid = await rollAll(1);
