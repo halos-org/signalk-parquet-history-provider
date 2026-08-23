@@ -117,7 +117,16 @@ describe("the plugin's import graph", () => {
       existsSync(writer),
       "build first: dist/writer/main.js is missing",
     );
-    const { bare } = walk(writer);
+    const { bare, builtins, files } = walk(writer);
+    // The positive control the plugin's own check has: without it, a walk that
+    // resolved nothing at all passes, and the writer could be importing the
+    // engine while this stays green.
+    assert.ok(files.length > 1, "expected the writer to import something");
+    assert.ok(
+      builtins.has("node:sqlite"),
+      "the writer must reach node:sqlite through hot-store.js; if it does " +
+        "not, this walk did not traverse and proves nothing",
+    );
     assert.deepEqual(
       [...bare].filter((specifier) => FORBIDDEN.test(specifier)),
       [],

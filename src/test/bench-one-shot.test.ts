@@ -16,6 +16,11 @@ describe("measuring a process that does not stay still", () => {
     assert.equal(result.exitCode, 0);
     assert.equal(result.peakBytes, 123_456_789);
     assert.equal(result.peakSource, "self-reported");
+    // The cross-check is the point of keeping both: a reported figure with no
+    // independent reading beside it is a number nobody can audit.
+    if (onLinux) {
+      assert.ok(result.sampledPeakBytes > 0, "the poll must still have run");
+    }
   });
 
   it("falls back to the poll when the subject says nothing", async () => {

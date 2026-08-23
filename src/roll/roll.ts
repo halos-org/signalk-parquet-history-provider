@@ -225,6 +225,7 @@ async function writeDay(args: {
   });
   const temp = rollTempFile(dataDir, from, rollId);
   const final = rollFile(dataDir, from, rollId);
+  sweepStaleTemporaries(dateDirectory(dataDir, from), temp);
   if (!replace && existsSync(final)) {
     throw new NameTakenError(
       `${final} already exists and this roll is not a retry. Overwriting it ` +
@@ -324,6 +325,29 @@ async function writeSidecar(args: {
     `SELECT count(*) FROM read_parquet('${sqlLiteral(final)}')`,
   );
   return Number(counted.getRowsJS()[0][0]);
+}
+
+/**
+ * Remove `.tmp` files a killed roll left in a date directory.
+ *
+ * A `*.parquet` glob skips them, so they are disk cost rather than a
+ * correctness problem — but nothing else collects them, and the rolls most
+ * likely to be killed are the ones with the least free disk. Age is what
+ * makes this safe against a roll running right now.
+ */
+function sweepStaleTemporaries(directory: string, own: string): void {
+  const cutoff = Date.now() - STALE_SCRATCH_MS;
+  for (const entry of readdirSync(directory)) {
+    if (!entry.endsWith(".tmp")) continue;
+    const path = join(directory, entry);
+    if (path === own) continue;
+    try {
+      if (statSync(path).mtimeMs > cutoff) continue;
+      rmSync(path, { force: true });
+    } catch {
+      /* another roll collected it, or it is being written right now */
+    }
+  }
 }
 
 /**

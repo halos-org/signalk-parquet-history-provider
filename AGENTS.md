@@ -87,8 +87,17 @@ a check on module evaluation alone.
   at
   [signalk-questdb-history-provider#23](https://github.com/halos-org/signalk-questdb-history-provider/issues/23).
 - `src/duckdb/` — version and platform naming, the bundled-extension resolver,
-  and the standalone offline check. This is the only place that may import the
-  engine.
+  and the standalone offline check. Nothing here imports the engine either;
+  the resolver only finds and expands its binary.
+- `src/roll/` — the roll. `main.ts` is the process the writer spawns, `roll.ts`
+  the work it does, `schedule.ts` the every-N-minutes-from-UTC-midnight grid,
+  `tree-path.ts` the tree's paths. **`roll.ts` is the only file in the package
+  that imports `@duckdb/node-api`**, and it may because everything importing it
+  runs in a process that exits. The rule is not "one directory owns the
+  engine"; it is that the engine may never be reachable from `src/index.ts` or
+  from `src/writer/`, both of which run for as long as recording does.
+- `src/durable-write.ts` — fsync, rename, fsync the directory. Shared so the
+  order exists once.
 
 - `src/bench/` — the measurement harness. Every unit that reports a number
   reports it through this, so figures stay comparable.

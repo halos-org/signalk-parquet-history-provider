@@ -352,7 +352,18 @@ export class RollScheduler {
     });
   }
 
-  /** Disarm, and stop a roll in flight without truncating anything. */
+  /**
+   * Disarm the timer and kill a roll in flight.
+   *
+   * It does not promise that nothing is truncated: a roll that exits 0 while
+   * this waits has done its work, and `rollOnce` goes on to delete the rows it
+   * wrote. That is correct — the alternative is a roll whose output is in the
+   * tree and whose rows are still in the store.
+   *
+   * The wait is bounded, because the plugin SIGKILLs the writer when its own
+   * budget runs out and an unbounded wait here would spend that budget and
+   * leave the store unclosed.
+   */
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer !== null) {
@@ -367,7 +378,14 @@ export class RollScheduler {
     running.kill("SIGTERM");
     const hard = setTimeout(() => running.kill("SIGKILL"), ROLL_KILL_GRACE_MS);
     hard.unref();
-    await exited;
+    // Bounded by the same budget: past it the roll is unkillable from here
+    // (uninterruptible IO on a failing card), and holding the writer open
+    // only means the plugin kills the writer too.
+    const gaveUp = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ROLL_KILL_GRACE_MS * 2);
+      timer.unref();
+    });
+    await Promise.race([exited, gaveUp]);
     clearTimeout(hard);
   }
 }

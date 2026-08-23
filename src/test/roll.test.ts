@@ -7,14 +7,16 @@ import {
   mkdtempSync,
   readdirSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DATA_LAYOUT } from "../data-dir.js";
 import { roll } from "../roll/roll.js";
-import { dateDirectory, sidecarFile } from "../roll/tree-path.js";
+import { dateDirectory, rollTempFile, sidecarFile } from "../roll/tree-path.js";
+import { EXIT_NAME_TAKEN } from "../writer/contract.js";
 import { writerPaths } from "../writer/contract.js";
 import { HotStore } from "../writer/hot-store.js";
 import { NO_BUNDLED_EXTENSION, sample } from "./fixtures.js";
@@ -43,6 +45,21 @@ afterEach(() => {
   }
   rmSync(dir, { recursive: true, force: true });
 });
+
+/** Runs the roll and returns its failure rather than throwing. */
+function attemptRoll(extra: string[]): { status: number; stderr: string } {
+  try {
+    execFileSync(process.execPath, [ROLL_ENTRY, "--data-dir", dir, ...extra], {
+      encoding: "utf8",
+      timeout: 60_000,
+      stdio: "pipe",
+    });
+    throw new Error("the roll was expected to fail");
+  } catch (err) {
+    const failure = err as { status?: number; stderr?: string };
+    return { status: failure.status ?? -1, stderr: failure.stderr ?? "" };
+  }
+}
 
 function record(...samples: Sample[]): void {
   seq += 1;
@@ -121,17 +138,27 @@ describe("a roll", { skip: NO_BUNDLED_EXTENSION }, () => {
     );
     // One roll, one name, two directories.
     for (const file of result.files) {
-      assert.ok(file.path.endsWith(join("", "7.parquet")), file.path);
+      assert.equal(basename(file.path), "7.parquet");
       assert.equal(file.rows, 1);
     }
   });
 
-  it("writes no file for a date with no rows", async () => {
-    record(sample({ ts: AUG_23 + 1000 }));
-    await roll({ dataDir: dir, maxRowid: 1, rollId: 1 });
-    assert.deepEqual(readdirSync(join(dir, DATA_LAYOUT.tree)), [
+  it("writes a directory per date that has rows, and none for the gap", async () => {
+    // Two dates two days apart. A `coveredDays` that returned the contiguous
+    // range rather than the distinct days would add date=2026-08-24 here, and
+    // a device that had been off for a week would grow seven directories of
+    // empty files that every reader then opens and skips.
+    record(
+      sample({ ts: AUG_23 + 1000, path: "a.b" }),
+      sample({ ts: AUG_23 + 2 * DAY + 1000, path: "c.d" }),
+    );
+    const result = await roll({ dataDir: dir, maxRowid: 2, rollId: 1 });
+
+    assert.deepEqual(readdirSync(join(dir, DATA_LAYOUT.tree)).sort(), [
       "date=2026-08-23",
+      "date=2026-08-25",
     ]);
+    assert.equal(result.files.length, 2);
   });
 
   it("leaves nothing a reader would mistake for a finished file", async () => {
@@ -245,29 +272,65 @@ describe("the roll process", { skip: NO_BUNDLED_EXTENSION }, () => {
     );
   });
 
-  it("exits non-zero and leaves the store alone when it cannot roll", () => {
+  it("exits 1 and leaves the store alone when it cannot roll", () => {
     record(sample({ ts: AUG_23 + 1000 }));
-    assert.throws(() =>
-      execFileSync(
-        process.execPath,
-        [ROLL_ENTRY, "--data-dir", dir, "--max-rowid", "0", "--roll-id", "1"],
-        { encoding: "utf8", timeout: 60_000, stdio: "pipe" },
-      ),
-    );
+    const failure = attemptRoll(["--max-rowid", "0", "--roll-id", "1"]);
+    assert.equal(failure.status, 1);
+    assert.match(failure.stderr, /must be a positive whole number/);
     assert.equal(store.rowCount(), 1);
     assert.ok(!existsSync(join(dir, DATA_LAYOUT.tree, "date=2026-08-23")));
   });
-});
 
-describe("a tree the roll did not finish", () => {
-  it("is not read as complete", () => {
-    // What a killed roll leaves: a temporary that a *.parquet glob skips.
-    // Nothing else marks it, and nothing has to.
-    mkdirSync(dateDirectory(dir, AUG_23), { recursive: true });
-    writeFileSync(join(dateDirectory(dir, AUG_23), "1.parquet.tmp"), "garbage");
-    const found = readdirSync(dateDirectory(dir, AUG_23)).filter((name) =>
-      name.endsWith(".parquet"),
+  it("exits with the name-taken code, which the scheduler treats apart", () => {
+    // The scheduler drops the roll id on this exit and keeps it on every
+    // other, so the two must be distinguishable from outside the process.
+    record(sample({ ts: AUG_23 + 1000 }));
+    execFileSync(
+      process.execPath,
+      [ROLL_ENTRY, "--data-dir", dir, "--max-rowid", "1", "--roll-id", "5"],
+      { encoding: "utf8", timeout: 60_000 },
     );
-    assert.deepEqual(found, []);
+    record(sample({ ts: AUG_23 + 2000 }));
+    const refused = attemptRoll(["--max-rowid", "2", "--roll-id", "5"]);
+
+    assert.equal(refused.status, EXIT_NAME_TAKEN);
+    assert.match(refused.stderr.split("\n")[0], /already exists/);
   });
 });
+
+describe(
+  "a tree the roll did not finish",
+  { skip: NO_BUNDLED_EXTENSION },
+  () => {
+    it("leaves a temporary a *.parquet glob skips, and collects it later", () => {
+      // The previous version of this test wrote its own `1.parquet.tmp` and
+      // asserted that filtering for `.endsWith(".parquet")` found nothing — it
+      // exercised String.endsWith, not the roll. This uses the roll's own
+      // naming, and checks the sweep that eventually collects one.
+      const stale = rollTempFile(dir, AUG_23, 1);
+      mkdirSync(dateDirectory(dir, AUG_23), { recursive: true });
+      writeFileSync(stale, "half a parquet file");
+      // Older than the sweep's cutoff, as a roll killed an hour ago would be.
+      utimesSync(
+        stale,
+        new Date(Date.now() - 7_200_000),
+        new Date(Date.now() - 7_200_000),
+      );
+
+      assert.deepEqual(
+        readdirSync(dateDirectory(dir, AUG_23)).filter((name) =>
+          name.endsWith(".parquet"),
+        ),
+        [],
+        "nothing a reader would treat as finished",
+      );
+
+      record(sample({ ts: AUG_23 + 1000 }));
+      return roll({ dataDir: dir, maxRowid: 1, rollId: 2 }).then(() => {
+        assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), [
+          "2.parquet",
+        ]);
+      });
+    });
+  },
+);

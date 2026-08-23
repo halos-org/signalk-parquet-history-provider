@@ -302,7 +302,8 @@ script, and it is better than this document's own scale test (204–246 MB at
 widened every scan.
 
 **The first roll after a DuckDB version change costs 40–50 MB more**, twice
-reproduced: 194–204 MB cold against 152–154 MB warm, at the same row count. It
+reproduced at 623,000 rows: 193.9 and 203.7 MB cold against 151.7 and
+153.5 MB warm. It
 is the bundled `sqlite_scanner` being gunzipped from 8 MB to 27 MB into the
 roll's own heap before any query runs. One roll per device per version pays it,
 and nothing was added to avoid it.
