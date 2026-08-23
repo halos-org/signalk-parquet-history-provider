@@ -19,16 +19,22 @@ import { DATA_LAYOUT } from "../data-dir.js";
  */
 export const EXIT_LOCKED = 3;
 
-/** Where the writer's three files live under the resolved data directory. */
+/**
+ * Where the writer's files live under the resolved data directory.
+ *
+ * `pidFile` is written for whoever is reading the device, and nothing decides
+ * anything from it. The claim on the store is the socket: a pid means nothing
+ * across the PID namespaces a container restart creates.
+ */
 export function writerPaths(dataDir: string): {
   store: string;
-  lock: string;
+  pidFile: string;
   socket: string;
 } {
   const hot = join(dataDir, DATA_LAYOUT.hotStore);
   return {
     store: join(hot, "hot.sqlite"),
-    lock: join(hot, "writer.lock"),
+    pidFile: join(hot, "writer.pid"),
     socket: join(hot, "writer.sock"),
   };
 }

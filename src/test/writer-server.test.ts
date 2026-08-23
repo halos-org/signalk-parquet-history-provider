@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { connect } from "node:net";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -10,7 +10,7 @@ import { HotStore } from "../writer/hot-store.js";
 import {
   StoreLockedError,
   WriterServer,
-  acquireStoreLock,
+  probeLiveWriter,
 } from "../writer/server.js";
 import { FrameDecoder, encodeFrame } from "../writer/protocol.js";
 import type { Message, Sample } from "../writer/protocol.js";
@@ -90,46 +90,66 @@ describe("the socket is reachable only by its owner", () => {
 });
 
 describe("the store is held against a second writer", () => {
-  it("refuses to start when a live process holds the lock", () => {
-    const lockPath = join(dir, "writer.lock");
-    const release = acquireStoreLock(lockPath);
-    try {
-      assert.throws(() => acquireStoreLock(lockPath), StoreLockedError);
-      assert.throws(
-        () => acquireStoreLock(lockPath),
-        /already held by writer process \d+/,
-      );
-    } finally {
-      release();
-    }
+  it("refuses to start while another writer is listening", async () => {
+    // The first server is already up from beforeEach.
+    await assert.rejects(
+      () => WriterServer.listen({ socketPath, store }),
+      StoreLockedError,
+    );
   });
 
-  it("reclaims a lock left behind by a writer that died", () => {
-    // A pid that has certainly exited: spawned, waited for, and reaped.
-    const gone = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
-    assert.notStrictEqual(gone.pid, undefined);
-    const lockPath = join(dir, "writer.lock");
-    writeFileSync(lockPath, `${gone.pid}\n`);
+  it("takes over a socket file whose writer was killed", async () => {
+    // What a container restart leaves behind. A graceful close would not do:
+    // Node unlinks the socket on close, so there would be nothing stale to
+    // take over. Only an abrupt death leaves the file with no listener.
+    //
+    // A pid-file lock got this wrong on a real device: the pid it held came
+    // from the previous PID namespace and named a live but unrelated process,
+    // so every later writer refused to start, permanently.
+    await server!.close();
+    server = null;
+    const stalePath = join(dir, "run", "stale.sock");
+    const holder = spawn(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `import { createServer } from "node:net";
+         createServer().listen(${JSON.stringify(stalePath)}, () =>
+           process.stdout.write("listening\\n"));`,
+      ],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
+    await new Promise<void>((resolve, reject) => {
+      holder.stdout.on("data", (chunk: Buffer) => {
+        if (chunk.toString().includes("listening")) resolve();
+      });
+      holder.on("error", reject);
+    });
+    assert.strictEqual(await probeLiveWriter(stalePath), true);
 
-    const release = acquireStoreLock(lockPath);
-    release();
+    holder.kill("SIGKILL");
+    await new Promise<void>((resolve) => holder.on("exit", () => resolve()));
+    assert.ok(statSync(stalePath).isSocket(), "the file outlives the process");
+    assert.strictEqual(
+      await probeLiveWriter(stalePath),
+      false,
+      "nothing answers on a dead writer's socket",
+    );
+
+    server = await WriterServer.listen({ socketPath: stalePath, store });
+    assert.ok(statSync(stalePath).isSocket());
   });
 
-  it("reclaims a lock whose contents make no sense", () => {
-    // Refusing on an unreadable lock would wedge the writer permanently on a
-    // file truncated by a power cut.
-    const lockPath = join(dir, "writer.lock");
-    writeFileSync(lockPath, "");
-    acquireStoreLock(lockPath)();
-
-    writeFileSync(lockPath, "not-a-pid\n");
-    acquireStoreLock(lockPath)();
+  it("reports nothing live when the socket file does not exist", async () => {
+    assert.strictEqual(
+      await probeLiveWriter(join(dir, "run", "absent.sock")),
+      false,
+    );
   });
 
-  it("releases the lock so the next writer can take it", () => {
-    const lockPath = join(dir, "writer.lock");
-    acquireStoreLock(lockPath)();
-    acquireStoreLock(lockPath)();
+  it("reports a live writer while one is listening", async () => {
+    assert.strictEqual(await probeLiveWriter(socketPath), true);
   });
 });
 

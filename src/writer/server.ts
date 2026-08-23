@@ -1,13 +1,5 @@
-import {
-  chmodSync,
-  closeSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  rmSync,
-  writeSync,
-} from "node:fs";
-import { createServer } from "node:net";
+import { chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { connect, createServer } from "node:net";
 import type { Server, Socket } from "node:net";
 import { dirname } from "node:path";
 import { FrameDecoder, ProtocolError, encodeFrame } from "./protocol.js";
@@ -23,78 +15,57 @@ import type { HotStore } from "./hot-store.js";
  * no other account on the device can send it frames.
  */
 
-/** Raised when another writer already owns the hot store. */
+/** Raised when another writer is already serving the hot store. */
 export class StoreLockedError extends Error {
-  constructor(readonly holderPid: number) {
+  constructor(socketPath: string) {
     super(
-      `the hot store is already held by writer process ${holderPid}; refusing to open a second writer`,
+      `a writer is already listening on ${socketPath}; refusing to open a second one`,
     );
     this.name = "StoreLockedError";
   }
 }
 
 /**
- * Takes an exclusive claim on the hot store.
+ * Whether a live writer is serving this socket.
  *
- * SQLite will not do this for us. Two processes can both open the same file
- * and both write to it — it takes per-transaction file locks, not per-handle
- * ones — so a second writer would silently interleave its rows and its
- * sequence numbers with the first's. `PRAGMA locking_mode = EXCLUSIVE` would
- * stop that and is not available here: it also blocks readers, and the roll
- * reading the store while the writer holds it is the reason the store is
- * SQLite in the first place.
+ * The socket is the claim on the hot store, and connecting to it is the test.
+ * SQLite will not keep a second writer out on its own — two processes can both
+ * open the file and both write to it, taking per-transaction locks rather than
+ * per-handle ones — and `PRAGMA locking_mode = EXCLUSIVE` is unavailable
+ * because it also blocks readers, which is the reason the store is SQLite at
+ * all.
  *
- * So the claim is a separate lock file. A lock left behind by a writer that
- * died is reclaimed; a lock whose process is still alive is refused, loudly,
- * because a writer that appears to start and then records nothing is the
- * failure this exists to prevent.
+ * A pid file was the obvious alternative and is wrong here. This runs inside a
+ * container, so a pid is only meaningful within one PID namespace; a restart
+ * gives a new namespace where the dead writer's pid is some unrelated live
+ * process. Measured on a device: a stale lock naming pid 31 made every
+ * subsequent writer refuse to start, permanently, while the plugin buffered
+ * and reported an unreachable writer. A socket carries no such ambiguity —
+ * nothing answers on a dead writer's socket, in any namespace.
+ *
+ * The residual race is two writers starting within milliseconds of each other:
+ * both see a refused connection, both unlink, both bind, and the loser serves
+ * an unlinked inode while both hold the store. The plugin spawns exactly one
+ * writer per start and Signal K serialises starts, so the case this has to
+ * survive is the one above — an old writer alive across a restart — which the
+ * probe answers correctly.
  */
-export function acquireStoreLock(lockPath: string): () => void {
-  // Two passes at most: the first may find a lock left by a dead writer, which
-  // this removes; a second EEXIST after that means someone else won the race,
-  // and racing them again would loop.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(lockPath, "wx", 0o600);
-      try {
-        writeSync(fd, `${process.pid}\n`);
-      } finally {
-        closeSync(fd);
-      }
-      return () => rmSync(lockPath, { force: true });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      const holder = readHolderPid(lockPath);
-      if (holder !== null && isProcessAlive(holder)) {
-        throw new StoreLockedError(holder);
-      }
-      rmSync(lockPath, { force: true });
+export function probeLiveWriter(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!existsSync(socketPath)) {
+      resolve(false);
+      return;
     }
-  }
-  throw new Error(`could not take the hot store lock at ${lockPath}`);
-}
-
-function readHolderPid(lockPath: string): number | null {
-  try {
-    const pid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
-  } catch {
-    // Unreadable or already gone: treat it as reclaimable rather than as a
-    // live holder, since refusing on an unreadable lock would wedge the writer
-    // permanently on a truncated file.
-    return null;
-  }
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM means the process exists and belongs to another user, which is
-    // still a live holder. Only ESRCH means nobody is there.
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
+    const socket = connect(socketPath);
+    const settle = (live: boolean) => {
+      socket.destroy();
+      resolve(live);
+    };
+    socket.once("connect", () => settle(true));
+    // ECONNREFUSED on a socket file whose listener is gone; anything else is
+    // equally not a writer we can talk to.
+    socket.once("error", () => settle(false));
+  });
 }
 
 export interface WriterServerOptions {
@@ -118,6 +89,9 @@ export class WriterServer {
 
   static listen(options: WriterServerOptions): Promise<WriterServer> {
     const { socketPath } = options;
+    const server = createServer();
+    const instance = new WriterServer(server, options);
+    server.on("connection", (socket) => instance.handle(socket));
 
     // A Unix domain socket, never a TCP port — not even on loopback, which is
     // shared with every local process and every container in the namespace.
@@ -128,20 +102,25 @@ export class WriterServer {
     // exists to avoid, so filesystem permission is the enforcement.
     mkdirSync(dirname(socketPath), { recursive: true, mode: 0o700 });
     chmodSync(dirname(socketPath), 0o700);
-    // Safe because the caller holds the store lock: any socket file still here
-    // was left by a writer that is gone.
-    rmSync(socketPath, { force: true });
 
-    const server = createServer();
-    const instance = new WriterServer(server, options);
-    server.on("connection", (socket) => instance.handle(socket));
+    return probeLiveWriter(socketPath).then((live) => {
+      if (live) throw new StoreLockedError(socketPath);
+      // Nothing answered, so the file is a leftover rather than a claim.
+      rmSync(socketPath, { force: true });
+      return instance.bind(socketPath);
+    });
+  }
 
+  private bind(socketPath: string): Promise<WriterServer> {
     return new Promise((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(socketPath, () => {
-        server.removeListener("error", reject);
+      this.server.once("error", reject);
+      this.server.listen(socketPath, () => {
+        this.server.removeListener("error", reject);
+        // Belt as well as braces: the 0700 directory is what actually gates
+        // access, since reaching a socket needs execute permission on the
+        // directory holding it.
         chmodSync(socketPath, 0o600);
-        resolve(instance);
+        resolve(this);
       });
     });
   }

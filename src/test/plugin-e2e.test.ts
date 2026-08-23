@@ -125,11 +125,12 @@ describe("a delta reaching the writer's store", () => {
       assert.deepEqual(calls.errors, []);
     } finally {
       plugin.stop();
-      // The writer releases its lock on SIGTERM; a lock left behind makes the
-      // next start refuse to record at all.
+      // The writer removes its pid file on SIGTERM. The claim on the store is
+      // the socket, not this file, but a writer that never got its stop signal
+      // would leave it behind and that is worth noticing.
       await eventually(
-        () => !existsSync(paths.lock),
-        "the writer to release its lock",
+        () => !existsSync(paths.pidFile),
+        "the writer to clean up after itself",
         10_000,
       ).catch(() => {});
       rmSync(base, { recursive: true, force: true });
@@ -161,10 +162,20 @@ describe("a delta reaching the writer's store", () => {
         "the status to say it is recording",
       );
 
-      // The writer writes its own pid into the lock file, which is how a
-      // second writer recognises a live holder -- and how this test finds it.
-      const pid = Number.parseInt(readFileSync(paths.lock, "utf8").trim(), 10);
-      assert.ok(Number.isInteger(pid) && pid > 0, `bad pid in ${paths.lock}`);
+      // The pid file exists for exactly this: finding the writer from outside.
+      // Nothing in the plugin decides anything from it.
+      await eventually(
+        () => existsSync(paths.pidFile),
+        "the writer's pid file",
+      );
+      const pid = Number.parseInt(
+        readFileSync(paths.pidFile, "utf8").trim(),
+        10,
+      );
+      assert.ok(
+        Number.isInteger(pid) && pid > 0,
+        `bad pid in ${paths.pidFile}`,
+      );
       process.kill(pid, "SIGKILL");
 
       await eventually(

@@ -1,8 +1,8 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_LAYOUT } from "../data-dir.js";
 import { HotStore } from "./hot-store.js";
-import { StoreLockedError, WriterServer, acquireStoreLock } from "./server.js";
+import { StoreLockedError, WriterServer } from "./server.js";
 import { EXIT_LOCKED, writerPaths } from "./contract.js";
 
 /**
@@ -37,9 +37,14 @@ async function main(): Promise<void> {
   const paths = writerPaths(dataDir);
   mkdirSync(join(dataDir, DATA_LAYOUT.hotStore), { recursive: true });
 
-  let release: (() => void) | null = null;
+  const store = HotStore.open(paths.store);
+  let server;
   try {
-    release = acquireStoreLock(paths.lock);
+    server = await WriterServer.listen({
+      socketPath: paths.socket,
+      store,
+      log: (line) => process.stdout.write(`${line}\n`),
+    });
   } catch (err) {
     if (err instanceof StoreLockedError) {
       // Named separately from any other failure because the plugin's remedy is
@@ -49,13 +54,8 @@ async function main(): Promise<void> {
     }
     throw err;
   }
-
-  const store = HotStore.open(paths.store);
-  const server = await WriterServer.listen({
-    socketPath: paths.socket,
-    store,
-    log: (line) => process.stdout.write(`${line}\n`),
-  });
+  // Informational only. Nothing decides anything from it -- see writerPaths.
+  writeFileSync(paths.pidFile, `${process.pid}\n`, { mode: 0o600 });
   process.stdout.write(`writer ready on ${paths.socket}\n`);
 
   let stopping = false;
@@ -65,7 +65,7 @@ async function main(): Promise<void> {
     process.stdout.write(`writer stopping on ${signal}\n`);
     await server.close();
     store.close();
-    release?.();
+    rmSync(paths.pidFile, { force: true });
     process.exit(0);
   };
   process.on("SIGTERM", () => void stop("SIGTERM"));
