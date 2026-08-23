@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -10,7 +10,7 @@ import {
   normalizeConfig,
 } from "./config/schema.js";
 import type { Config } from "./config/schema.js";
-import { DATA_LAYOUT, resolveDataDir } from "./data-dir.js";
+import { DATA_DIR_MODE, DATA_LAYOUT, resolveDataDir } from "./data-dir.js";
 import { FlushBuffer } from "./flush-buffer.js";
 import { PLUGIN_ID } from "./plugin-id.js";
 import { Recorder } from "./recorder.js";
@@ -159,8 +159,14 @@ export default (app: App) => {
       try {
         const config: Config = normalizeConfig(rawConfig);
         const dataDir = resolveDataDir(config.dataDir, app.getDataDirPath());
+        mkdirSync(dataDir, { recursive: true, mode: DATA_DIR_MODE });
+        chmodSync(dataDir, DATA_DIR_MODE);
         for (const sub of Object.values(DATA_LAYOUT)) {
-          mkdirSync(join(dataDir, sub), { recursive: true });
+          const path = join(dataDir, sub);
+          mkdirSync(path, { recursive: true, mode: DATA_DIR_MODE });
+          // mkdir's mode is masked by umask and does nothing at all for a
+          // directory that already exists, so the chmod is what enforces this.
+          chmodSync(path, DATA_DIR_MODE);
         }
         app.debug(`data directory: ${dataDir}`);
 

@@ -1,7 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -198,6 +204,34 @@ describe("a delta reaching the writer's store", () => {
         "the failure was survived but never reported",
       );
     } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("creates the whole data layout private, from the first moment", async () => {
+    // mkdir's mode is masked by umask and does nothing for a directory that
+    // already exists, so the chmod is the enforcement. Before both, the
+    // directories were created at 0755 and only the socket's parent was ever
+    // tightened -- so the hot store sat world-readable for as long as the
+    // writer took to boot, and the Parquet tree stayed readable permanently.
+    const base = mkdtempSync(join(tmpdir(), "sk-parquet-e2e-"));
+    const paths = writerPaths(base);
+    const { app, calls } = stubApp(base);
+    const plugin = createPlugin(app);
+    try {
+      plugin.start({});
+      await eventually(() => existsSync(paths.store), "the store to appear");
+
+      for (const dir of [base, join(base, "hot"), join(base, "parquet")]) {
+        assert.equal(
+          statSync(dir).mode & 0o777,
+          0o700,
+          `${dir} is not owner-only`,
+        );
+      }
+      assert.deepEqual(calls.errors, []);
+    } finally {
+      plugin.stop();
       rmSync(base, { recursive: true, force: true });
     }
   });

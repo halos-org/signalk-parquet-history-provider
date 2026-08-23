@@ -239,6 +239,49 @@ describe("batches", () => {
   });
 });
 
+describe("what a peer can put in the log", () => {
+  it("bounds and sanitises the text it echoes", async () => {
+    // These lines reach the Signal K log. Unbounded, one frame carrying a
+    // 200,000-character kind produced a single ~200 KB line, and V8's own JSON
+    // parse error embeds raw bytes from the body -- newlines included -- so a
+    // peer could forge a line.
+    const lines: string[] = [];
+    await server?.close();
+    server = await WriterServer.listen({
+      socketPath,
+      store,
+      log: (line) => lines.push(line),
+    });
+
+    const send = (body: string) => {
+      const c = client();
+      const payload = Buffer.from(body, "utf8");
+      const head = Buffer.alloc(4);
+      head.writeUInt32BE(payload.length, 0);
+      c.socket.write(Buffer.concat([head, payload]));
+      return new Promise<void>((resolve) =>
+        c.socket.on("close", () => resolve()),
+      );
+    };
+
+    await send(
+      JSON.stringify({
+        type: "batch",
+        seq: 1,
+        samples: [{ ...sample(), kind: "z".repeat(200_000) }],
+      }),
+    );
+    await send('{"a":\n[writer] FORGED LINE\nmore');
+
+    assert.ok(lines.length >= 2, `expected two drops, got ${lines.length}`);
+    for (const line of lines) {
+      assert.ok(line.length < 400, `a ${line.length}-byte log line`);
+      assert.ok(!/[\r\n]/.test(line), `a newline reached the log: ${line}`);
+      assert.ok(!line.includes("FORGED"), `raw body bytes reached the log`);
+    }
+  });
+});
+
 describe("one client at a time", () => {
   async function greet(session: string) {
     const c = client();

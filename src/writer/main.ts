@@ -1,6 +1,6 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_LAYOUT } from "../data-dir.js";
+import { DATA_DIR_MODE, DATA_LAYOUT } from "../data-dir.js";
 import { HotStore } from "./hot-store.js";
 import { StoreLockedError, WriterServer } from "./server.js";
 import { EXIT_LOCKED, writerPaths } from "./contract.js";
@@ -35,7 +35,12 @@ async function main(): Promise<void> {
   }
 
   const paths = writerPaths(dataDir);
-  mkdirSync(join(dataDir, DATA_LAYOUT.hotStore), { recursive: true });
+  const hot = join(dataDir, DATA_LAYOUT.hotStore);
+  mkdirSync(hot, { recursive: true, mode: DATA_DIR_MODE });
+  // Before the store is opened: HotStore.open creates hot.sqlite and its WAL
+  // inside this directory, and until the mode is right they are readable by
+  // anyone who can reach it.
+  chmodSync(hot, DATA_DIR_MODE);
 
   const store = HotStore.open(paths.store);
   let server;

@@ -82,6 +82,34 @@ export type Message =
 /** Bounds the session id so a hello cannot be used to store an arbitrary string. */
 export const MAX_SESSION_BYTES = 64;
 
+/**
+ * How much peer-controlled text may appear in an error message.
+ *
+ * These messages reach the Signal K log. Unbounded, a single frame carrying a
+ * 200,000-character `kind` produced one ~200 KB log line, and at
+ * `MAX_FRAME_BYTES` one frame could push ~4 MB into it — a disk-fill primitive
+ * against the server the plugin lives inside.
+ */
+const MAX_ECHOED_BYTES = 48;
+
+/**
+ * A fragment of peer-controlled text, safe to put in a log line.
+ *
+ * Truncated, and stripped of the control characters that would otherwise let a
+ * peer forge a line: V8's own JSON parse error embeds raw bytes from the body,
+ * newlines included.
+ */
+function echo(value: unknown): string {
+  const text =
+    typeof value === "string"
+      ? value
+      : (JSON.stringify(value) ?? String(value));
+  const clean = text.replace(/[\p{Cc}\p{Cf}]/gu, "\uFFFD");
+  return clean.length > MAX_ECHOED_BYTES
+    ? `${clean.slice(0, MAX_ECHOED_BYTES)}…`
+    : clean;
+}
+
 /** A frame that cannot be trusted. The caller logs it and drops the connection. */
 export class ProtocolError extends Error {
   constructor(message: string) {
@@ -153,8 +181,10 @@ function parseMessage(body: Buffer): Message {
   try {
     parsed = JSON.parse(body.toString("utf8"));
   } catch (err) {
+    // The class and the size, not V8's message: that message embeds raw bytes
+    // from the body, newlines included, so a peer could forge a log line.
     throw new ProtocolError(
-      `frame body is not JSON: ${err instanceof Error ? err.message : String(err)}`,
+      `frame body of ${body.length} bytes is not JSON (${err instanceof Error ? err.name : "Error"})`,
     );
   }
   if (!isRecord(parsed)) {
@@ -196,9 +226,7 @@ function parseMessage(body: Buffer): Message {
       return { type: "error", seq, message: parsed.message };
     }
     default:
-      throw new ProtocolError(
-        `unknown message type ${JSON.stringify(parsed.type)}`,
-      );
+      throw new ProtocolError(`unknown message type ${echo(parsed.type)}`);
   }
 }
 
@@ -263,7 +291,7 @@ function parseSample(raw: unknown): Sample {
       };
     }
     default:
-      throw new ProtocolError(`unknown value kind ${JSON.stringify(raw.kind)}`);
+      throw new ProtocolError(`unknown value kind ${echo(raw.kind)}`);
   }
 }
 

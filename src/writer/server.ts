@@ -15,6 +15,9 @@ import type { HotStore } from "./hot-store.js";
  * no other account on the device can send it frames.
  */
 
+/** How long the probe waits before deciding it cannot tell. */
+const PROBE_TIMEOUT_MS = 2000;
+
 /** Raised when another writer is already serving the hot store. */
 export class StoreLockedError extends Error {
   constructor(socketPath: string) {
@@ -57,14 +60,32 @@ export function probeLiveWriter(socketPath: string): Promise<boolean> {
       return;
     }
     const socket = connect(socketPath);
+    let settled = false;
     const settle = (live: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       socket.destroy();
       resolve(live);
     };
+    // A probe that neither connects nor errors would leave `listen` unresolved
+    // forever, so the writer would hang without listening and without exiting
+    // while the plugin buffered.
+    const timer = setTimeout(() => settle(true), PROBE_TIMEOUT_MS);
+    timer.unref();
+
     socket.once("connect", () => settle(true));
-    // ECONNREFUSED on a socket file whose listener is gone; anything else is
-    // equally not a writer we can talk to.
-    socket.once("error", () => settle(false));
+    socket.once("error", (err) => {
+      // Only "nothing is listening" means dead. EMFILE on the writer, EAGAIN
+      // against a saturated backlog, EACCES — all of those come from a writer
+      // that is alive and merely unable to accept right now, and reading them
+      // as dead would unlink a live writer's socket and bind a second one
+      // over it. Both would then hold the store, which is what the claim
+      // exists to prevent, with the loser being the running writer rather
+      // than a starting one.
+      const code = (err as NodeJS.ErrnoException).code;
+      settle(!(code === "ECONNREFUSED" || code === "ENOENT"));
+    });
   });
 }
 
@@ -127,6 +148,8 @@ export class WriterServer {
     chmodSync(dirname(socketPath), 0o700);
 
     return probeLiveWriter(socketPath).then((live) => {
+      // "Cannot tell" resolves as live: refusing to start is recoverable and
+      // visible, displacing a running writer is neither.
       if (live) throw new StoreLockedError(socketPath);
       // Nothing answered, so the file is a leftover rather than a claim.
       rmSync(socketPath, { force: true });
