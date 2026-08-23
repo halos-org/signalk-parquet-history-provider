@@ -133,6 +133,13 @@ over a day of data. The gap between the best layout here and the flat one is
 about 40 ms, against a floor nothing in this design can go below, which is why
 40 ms does not buy a partitioning scheme.
 
+Cardinality growth strengthens this rather than reopening it. 552
+`(context, path)` pairs is one vessel with non-self contexts almost entirely
+filtered out; an installation recording AIS targets can reach thousands. Under a
+partitioned layout that is thousands of partitions, and the write already fails
+at 552. Under a flat one it is more rows in the same file, which the roll is
+bounded against.
+
 There is one more thing the flat layout gets for free. The plan's risk table
 carries "delta-supplied path and context strings become directory names",
 mitigated by an allowlist and a containment assertion. With only the date as a
