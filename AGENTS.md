@@ -11,7 +11,11 @@ Guidance for AI assistants working in this repository.
 - `npm run ci-lint` — what CI checks
 - Single test file: `node --test dist/test/bench-run.test.js` after a build
 
-Node ≥ 22. `./run` lists everything with descriptions.
+Node ≥ 22.13.0. That floor is `node:sqlite`, not a preference: it needs
+`--experimental-sqlite` below 22.13.0, and the writer imports it unflagged. The
+API is identical on 22, 24 and 26 — checked on all three rather than assumed.
+
+`./run` lists everything with descriptions.
 
 ## What this is
 
@@ -74,9 +78,12 @@ a check on module evaluation alone.
   this store's `value_kind` column. Fix bugs in both.
 - `src/path-matcher.ts`, `src/time-range.ts` — copied from
   `signalk-questdb-history-provider` with their suites. Fix bugs in both.
-  They currently **differ** from the sibling by two fixes: `resolveTimeRange`
-  treats a zero duration as a value rather than as absent, and `Throttle` tests
-  a pair for presence rather than using a `0` sentinel. The sibling is tracked
+  They currently **differ** from the sibling by three fixes: `resolveTimeRange`
+  treats a zero duration as a value rather than as absent, `Throttle` tests a
+  pair for presence rather than using a `0` sentinel, and `Throttle` treats a
+  backwards clock step as a discontinuity rather than as a sample arriving too
+  soon — without that, a device whose clock is stepped at boot stops recording
+  for the length of the step. The sibling is tracked
   at
   [signalk-questdb-history-provider#23](https://github.com/halos-org/signalk-questdb-history-provider/issues/23);
   fold the copies back together when it lands.
@@ -89,18 +96,34 @@ a check on module evaluation alone.
 
 ## The writer
 
-One writer process per plugin run, spawned by the plugin, holding the hot
-store under an explicit lock file. The lock is not decoration: SQLite takes
-per-transaction locks rather than per-handle ones, so two writers would both
-open the file and interleave their rows and their sequence numbers.
-`PRAGMA locking_mode = EXCLUSIVE` would prevent that and is unavailable,
-because it also blocks readers and the roll reading the store while the writer
-holds it is why the store is SQLite at all.
+One writer process per plugin run, spawned by the plugin. **Its listening
+socket is the claim on the hot store**: a writer that finds something answering
+on the socket path refuses to start and exits `EXIT_LOCKED`, and a socket file
+nothing answers on is a leftover to take over.
+
+The claim matters because SQLite will not make it: SQLite takes per-transaction
+locks rather than per-handle ones, so two writers would both open the file and
+interleave their rows and their sequence numbers. `PRAGMA locking_mode =
+EXCLUSIVE` would prevent that and is unavailable, because it also blocks
+readers, and the roll reading the store while the writer holds it is why the
+store is SQLite at all.
+
+A pid file is the obvious alternative and is wrong here: a pid means nothing
+across the PID namespaces a container restart creates, so a stale lock names an
+unrelated live process and refuses every later writer, permanently.
+`writer.pid` is still written, for whoever is reading the device, and nothing
+decides anything from it.
 
 The socket is a Unix domain socket in a `0700` directory, mode `0600` — never
 a TCP port, not even on loopback, which is shared with every local process and
 container in the namespace. Node exposes no way to read peer credentials
 without a native addon, so filesystem permission is the enforcement.
+
+The server serves one client at a time. The store's session and sequence
+counter are process-global, so a second connection moving them is enough to
+make every batch on the first skip as a duplicate — acknowledged, never
+written. A new session therefore closes the incumbent, and a second `hello` on
+an established connection is refused.
 
 A batch carries a sequence number, and the writer skips one it has already
 committed. That is what makes a resend after a lost acknowledgement

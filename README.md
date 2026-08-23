@@ -14,10 +14,10 @@ anyone queries it.
 
 ## Status
 
-**This build records nothing.** It carries the configuration surface, the
-storage layout, the bundled DuckDB extension and the measurement harness. The
-writer process, the roll, the query layer and the two history API surfaces are
-tracked as units under
+Recording works: the plugin filters, rate-caps and buffers, and a separate
+writer process owns a SQLite hot store. The roll into Parquet, the query layer
+and the two history API surfaces are not implemented yet, so nothing reads this
+data back yet. Progress is tracked in
 [halos-org/halos#152](https://github.com/halos-org/halos/issues/152).
 
 ## Installation

@@ -2,7 +2,7 @@
   "name": "signalk-parquet-history-provider",
   "version": "0.1.0",
   "type": "module",
-  "description": "Parquet history provider for Signal K: a SQLite hot store rolled into a Parquet tree, queried with DuckDB — no database server",
+  "description": "Parquet history provider for Signal K: a SQLite hot store rolled into a Parquet tree, queried with DuckDB \u2014 no database server",
   "keywords": [
     "signalk-node-server-plugin",
     "signalk-category-database"
@@ -24,7 +24,7 @@
     "prepublishOnly": "npm run build && npm run fetch-extensions && node tools/check-bundled-extensions.mjs --strict"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13.0"
   },
   "author": "Matti Airas <matti.airas@hatlabs.fi>",
   "license": "MIT",
