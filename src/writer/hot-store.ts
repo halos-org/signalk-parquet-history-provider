@@ -200,6 +200,46 @@ export class HotStore {
     return { stored: samples.length, skipped: false };
   }
 
+  /**
+   * What a roll should cover: the highest rowid present now, and how many
+   * rows sit at or below it. `null` when there is nothing to roll.
+   *
+   * The bound is a rowid rather than a timestamp because the two sets have to
+   * be identical — what the roll writes to Parquet and what is then deleted
+   * from here. A timestamp cannot do that: the recorder stamps `ts` when the
+   * delta arrives and the flush buffer holds it for up to a flush interval,
+   * so a sample older than the roll's window routinely lands in the store
+   * after the roll has read it. Deleting by timestamp would drop that sample
+   * unrolled; deleting by rowid cannot, because a row inserted after the
+   * bound was read has a higher one.
+   *
+   * **Read it, use it, drop it.** SQLite hands out `max(rowid) + 1`, so a
+   * store that has just been emptied starts again at 1 — a bound carried
+   * across two rolls could then name rows it never covered.
+   */
+  rollBound(): { maxRowid: number; rows: number } | null {
+    const row = this.db
+      .prepare("SELECT max(rowid) AS maxRowid, count(*) AS rows FROM sample")
+      .get() as { maxRowid: number | null; rows: number };
+    if (row.maxRowid === null) return null;
+    return { maxRowid: row.maxRowid, rows: row.rows };
+  }
+
+  /**
+   * Delete every row through `maxRowid`, in one transaction, and report how
+   * many went. Called only after a roll has written those rows to Parquet and
+   * exited successfully.
+   */
+  deleteThrough(maxRowid: number): number {
+    if (!Number.isSafeInteger(maxRowid) || maxRowid < 1) {
+      throw new Error(`${maxRowid} is not a rowid to delete through`);
+    }
+    const result = this.db
+      .prepare("DELETE FROM sample WHERE rowid <= ?")
+      .run(maxRowid);
+    return Number(result.changes);
+  }
+
   rowCount(): number {
     const row = this.db.prepare("SELECT count(*) AS n FROM sample").get() as {
       n: number;

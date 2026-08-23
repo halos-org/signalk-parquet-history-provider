@@ -346,3 +346,72 @@ describe("integrity", () => {
     assert.strictEqual(store.integrityCheck(), "ok");
   });
 });
+
+describe("the bound a roll is truncated against", () => {
+  it("reports nothing to roll for an empty store", () => {
+    assert.equal(store.rollBound(), null);
+  });
+
+  it("reports the highest rowid and how many rows sit at or below it", () => {
+    store.beginSession("s");
+    store.insertBatch(1, [sample({ ts: 1 }), sample({ ts: 2 })]);
+    store.insertBatch(2, [sample({ ts: 3 })]);
+    assert.deepEqual(store.rollBound(), { maxRowid: 3, rows: 3 });
+  });
+
+  it("deletes through the bound and leaves everything after it", () => {
+    store.beginSession("s");
+    store.insertBatch(1, [sample({ ts: 1 }), sample({ ts: 2 })]);
+    const bound = store.rollBound();
+    assert.ok(bound !== null);
+    // What a roll does between reading the bound and the delete: the writer
+    // keeps ingesting throughout, and those rows were never rolled.
+    store.insertBatch(2, [sample({ ts: 3 })]);
+
+    assert.equal(store.deleteThrough(bound.maxRowid), 2);
+    assert.deepEqual(
+      rows().map((row) => row.ts),
+      [3],
+    );
+  });
+
+  it("does not delete a late sample that arrived after the bound was read", () => {
+    // The recorder stamps ts when the delta arrives and the buffer holds it
+    // for up to a flush interval, so a sample older than the roll's window
+    // routinely reaches the store after the roll started. Truncating by
+    // timestamp would delete it unrolled; truncating by rowid cannot.
+    store.beginSession("s");
+    store.insertBatch(1, [sample({ ts: 5000 })]);
+    const bound = store.rollBound();
+    assert.ok(bound !== null);
+    store.insertBatch(2, [sample({ ts: 1 })]);
+
+    store.deleteThrough(bound.maxRowid);
+    assert.deepEqual(
+      rows().map((row) => row.ts),
+      [1],
+    );
+  });
+
+  it("starts a new rowid sequence once the store has been emptied", () => {
+    // SQLite hands out max(rowid)+1, so emptying the table restarts at 1.
+    // That is why a bound is read, used and dropped inside one roll and is
+    // never carried across two.
+    store.beginSession("s");
+    store.insertBatch(1, [sample({ ts: 1 })]);
+    store.deleteThrough(store.rollBound()!.maxRowid);
+    assert.equal(store.rollBound(), null);
+
+    store.insertBatch(2, [sample({ ts: 2 })]);
+    assert.deepEqual(store.rollBound(), { maxRowid: 1, rows: 1 });
+  });
+
+  it("refuses a bound that is not a rowid", () => {
+    store.beginSession("s");
+    store.insertBatch(1, [sample({ ts: 1 })]);
+    for (const bound of [0, -1, 1.5, NaN]) {
+      assert.throws(() => store.deleteThrough(bound), /rowid/, `${bound}`);
+    }
+    assert.equal(rows().length, 1);
+  });
+});
