@@ -156,7 +156,15 @@ export class HotStore {
       this.saveSeq.run(this.session, seq);
       this.db.exec("COMMIT");
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Swallowed deliberately: the caller needs the reason the batch
+        // failed, not the bookkeeping that followed. SQLITE_FULL and
+        // SQLITE_IOERR can roll the transaction back themselves, after which
+        // this ROLLBACK fails with "no transaction is active" — and rethrowing
+        // that would report a rollback problem on a disk-full.
+      }
       throw err;
     }
 

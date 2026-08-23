@@ -163,11 +163,11 @@ export function normalizeConfig(config: StoredConfig): Config {
     // A missing toggle takes the schema default; an explicit false is honoured.
     recordSelf: config.recordSelf ?? CONFIG_DEFAULTS.recordSelf,
     recordOthers: config.recordOthers ?? CONFIG_DEFAULTS.recordOthers,
-    maxRecordedPaths: positive(
+    maxRecordedPaths: positiveInteger(
       config.maxRecordedPaths,
       CONFIG_DEFAULTS.maxRecordedPaths,
     ),
-    maxRecordedContexts: positive(
+    maxRecordedContexts: positiveInteger(
       config.maxRecordedContexts,
       CONFIG_DEFAULTS.maxRecordedContexts,
     ),
@@ -175,7 +175,7 @@ export function normalizeConfig(config: StoredConfig): Config {
       config.flushIntervalMs,
       CONFIG_DEFAULTS.flushIntervalMs,
     ),
-    flushBatchSize: positive(
+    flushBatchSize: positiveInteger(
       config.flushBatchSize,
       CONFIG_DEFAULTS.flushBatchSize,
     ),
@@ -216,6 +216,20 @@ function numberRecord(value: unknown): Record<string, number> {
         entry[1] > 0,
     ),
   );
+}
+
+/**
+ * A count, rounded down, never below one.
+ *
+ * `Array.prototype.splice` applies ToIntegerOrInfinity to its delete count, so
+ * a batch size of 0.5 removes nothing while `isDue` still reports a full
+ * batch: the buffer never drains, grows to its ceiling and starts evicting,
+ * with the plugin reporting "Recording" throughout. A number field in the
+ * Admin UI accepts 0.5 quite happily.
+ */
+function positiveInteger(value: number | undefined, fallback: number): number {
+  const positiveValue = positive(value, fallback);
+  return Math.max(1, Math.floor(positiveValue));
 }
 
 function positive(value: number | undefined, fallback: number): number {

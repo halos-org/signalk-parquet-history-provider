@@ -350,6 +350,35 @@ describe("the cardinality cap", () => {
     assert.strictEqual(t.recorder.stats.paths, 2);
   });
 
+  it("does not spend a context slot on a vessel whose paths are all filtered", () => {
+    // The cap bounds partition count, and a context that produces no row
+    // produces no partition. Spending the budget on vessels that record
+    // nothing means the one that would have recorded is refused.
+    const t = build({
+      defaultSamplingRate: 0,
+      recordOthers: true,
+      maxRecordedContexts: 1,
+      pathFilter: { mode: "include", paths: ["navigation.position"] },
+    });
+
+    // A target broadcasting only excluded paths.
+    t.feed({
+      context: OTHER,
+      path: "environment.wind.speedApparent",
+      value: 5,
+    });
+    assert.strictEqual(t.recorder.stats.contexts, 0, "a slot was spent");
+
+    // The vessel that does broadcast a recorded path still gets the slot.
+    t.feed({
+      context: "vessels.urn:mrn:imo:mmsi:111111111",
+      path: "navigation.position",
+      value: { latitude: 60.16, longitude: 24.94 },
+    });
+    assert.strictEqual(t.samples.length, 1);
+    assert.strictEqual(t.recorder.stats.contexts, 1);
+  });
+
   it("stops recording new contexts at the cap", () => {
     const t = build({
       defaultSamplingRate: 0,

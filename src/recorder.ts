@@ -141,7 +141,6 @@ export class Recorder {
     if (!item.path || item.value === undefined || item.value === null) return;
     if (isSelf && !this.config.recordSelf) return;
     if (!isSelf && !this.config.recordOthers) return;
-    if (!this.admitContext(context)) return;
 
     // Routed once, before the gates, because an object value is gated on its
     // leaf paths instead. Applying the parent's gates to those would be wrong
@@ -211,9 +210,15 @@ export class Recorder {
     this.emit(sample);
   }
 
-  /** Path filter, cardinality cap and rate cap, in the order that costs least. */
+  /** Path filter, cardinality caps and rate cap, in the order that costs least. */
   private admit(path: string, context: string): boolean {
     if (!this.passesFilter(path)) return false;
+    // Both caps sit behind the filter, so a context whose every path is
+    // excluded neither consumes a slot nor is counted as "being recorded". The
+    // cap exists to bound partition count, and a context that produces no row
+    // produces no partition — the same reasoning the identity branch applies
+    // one gate earlier.
+    if (!this.admitContext(context)) return false;
     if (!this.admitPath(path)) return false;
     // Throttled per path AND context, so the sampling rate bounds each
     // vessel's stream rather than every target's. Deliberately not per source:

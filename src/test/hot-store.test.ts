@@ -162,6 +162,26 @@ describe("a batch is one transaction", () => {
     assert.strictEqual(store.rowCount(), 1, "the good rows rolled back too");
   });
 
+  it("reports why the batch failed, not why the rollback did", () => {
+    // SQLITE_FULL and SQLITE_IOERR can roll the transaction back themselves,
+    // after which an explicit ROLLBACK fails with "no transaction is active".
+    // Rethrowing that would report a bookkeeping problem on a disk-full.
+    store.close();
+    let raised: unknown;
+    try {
+      store.insertBatch(1, [sample()]);
+    } catch (err) {
+      raised = err;
+    }
+    assert.ok(raised instanceof Error);
+    assert.match(
+      String((raised as { code?: string }).code ?? (raised as Error).message),
+      /ERR_INVALID_STATE|not open/,
+      `the original cause was replaced: ${String(raised)}`,
+    );
+    store = HotStore.open(join(dir, "hot.sqlite"));
+  });
+
   it("leaves the sequence counter untouched when a batch rolls back", () => {
     // Otherwise the failed batch is remembered as applied and its retry is
     // discarded as a duplicate — silent loss on the path that already failed.
