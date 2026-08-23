@@ -1,12 +1,14 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { createServer } from "node:net";
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   rmSync,
+  statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -16,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { DATA_LAYOUT } from "../data-dir.js";
 import { roll } from "../roll/roll.js";
 import { dateDirectory, rollTempFile, sidecarFile } from "../roll/tree-path.js";
-import { EXIT_NAME_TAKEN } from "../writer/contract.js";
+import { EXIT_LOCKED, EXIT_NAME_TAKEN } from "../writer/contract.js";
 import { writerPaths } from "../writer/contract.js";
 import { HotStore } from "../writer/hot-store.js";
 import { NO_BUNDLED_EXTENSION, sample } from "./fixtures.js";
@@ -243,6 +245,38 @@ describe("the sidecar", { skip: NO_BUNDLED_EXTENSION }, () => {
     );
   });
 
+  it("rebuilds from the tree when the previous sidecar cannot be read", async () => {
+    // Rebuilding from this roll's window alone would drop every path that
+    // went quiet earlier — the one question the sidecar exists to answer.
+    record(
+      sample({ ts: AUG_23 + 1000, path: "went.quiet", value: 7 }),
+      sample({ ts: AUG_23 + 1000, path: "still.here", value: 1 }),
+    );
+    await roll({ dataDir: dir, maxRowid: 2, rollId: 1 });
+    store.deleteThrough(2);
+
+    // What flash media leaves after a power cut: present, unreadable.
+    writeFileSync(sidecarFile(dir), Buffer.alloc(4096));
+
+    record(sample({ ts: AUG_23 + 5000, path: "still.here", value: 2 }));
+    const second = await roll({
+      dataDir: dir,
+      maxRowid: store.rollBound()!.maxRowid,
+      rollId: 2,
+    });
+
+    assert.equal(second.sidecarRows, 2);
+    assert.deepEqual(
+      readParquet(sidecarFile(dir)).map((row) => [row.path, row.value_num]),
+      [
+        ["went.quiet", 7],
+        ["still.here", 2],
+      ],
+      "the path that went quiet survives the rebuild",
+    );
+    assert.ok(existsSync(`${sidecarFile(dir)}.unreadable`));
+  });
+
   it("stays out of a glob over the tree", async () => {
     record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
     await roll({ dataDir: dir, maxRowid: 1, rollId: 1 });
@@ -252,6 +286,87 @@ describe("the sidecar", { skip: NO_BUNDLED_EXTENSION }, () => {
     assert.equal(tree.length, 1);
   });
 });
+
+describe(
+  "the claim on the data directory",
+  { skip: NO_BUNDLED_EXTENSION },
+  () => {
+    it("refuses to run beside a live roll", async () => {
+      record(sample({ ts: AUG_23 + 1000 }));
+      // Stands in for an orphan roll left by a killed writer.
+      const held = createServer();
+      await new Promise<void>((resolve) =>
+        held.listen(writerPaths(dir).rollSocket, () => resolve()),
+      );
+      try {
+        const refused = attemptRoll(["--max-rowid", "1", "--roll-id", "1"]);
+        assert.equal(refused.status, EXIT_LOCKED);
+        assert.match(refused.stderr, /already running/);
+        // And nothing was written while the other roll holds the directory.
+        assert.ok(!existsSync(join(dir, DATA_LAYOUT.tree, "date=2026-08-23")));
+      } finally {
+        held.close();
+      }
+    });
+
+    it("takes over a socket nothing answers on", async () => {
+      // What a roll killed mid-flight leaves behind. The file is not the claim;
+      // a process answering on it is. Killed abruptly, because a clean close
+      // unlinks the socket and there would be nothing stale to take over.
+      const socketPath = writerPaths(dir).rollSocket;
+      const holder = spawn(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          [
+            'import { createServer } from "node:net";',
+            `createServer().listen(${JSON.stringify(socketPath)}, () =>`,
+            '  console.log("listening"));',
+          ].join("\n"),
+        ],
+        { stdio: ["ignore", "pipe", "inherit"] },
+      );
+      await new Promise<void>((resolve, reject) => {
+        holder.stdout.on("data", (chunk: Buffer) => {
+          if (chunk.toString().includes("listening")) resolve();
+        });
+        holder.on("exit", () => reject(new Error("the holder never listened")));
+      });
+      holder.kill("SIGKILL");
+      await new Promise<void>((resolve) => holder.on("exit", () => resolve()));
+      assert.ok(
+        statSync(socketPath).isSocket(),
+        "the file outlives the process",
+      );
+
+      record(sample({ ts: AUG_23 + 1000 }));
+      execFileSync(
+        process.execPath,
+        [ROLL_ENTRY, "--data-dir", dir, "--max-rowid", "1", "--roll-id", "1"],
+        { encoding: "utf8", timeout: 60_000 },
+      );
+      assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), ["1.parquet"]);
+    });
+
+    it("names no path an operator configured when it refuses", async () => {
+      record(sample({ ts: AUG_23 + 1000 }));
+      const held = createServer();
+      await new Promise<void>((resolve) =>
+        held.listen(writerPaths(dir).rollSocket, () => resolve()),
+      );
+      try {
+        const refused = attemptRoll(["--max-rowid", "1", "--roll-id", "1"]);
+        assert.ok(
+          !refused.stderr.includes(dir),
+          `the refusal must not echo the data directory: ${refused.stderr}`,
+        );
+      } finally {
+        held.close();
+      }
+    });
+  },
+);
 
 describe("the roll process", { skip: NO_BUNDLED_EXTENSION }, () => {
   it("prints what it wrote and exits 0", () => {

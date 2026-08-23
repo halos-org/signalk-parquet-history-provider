@@ -5,6 +5,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  writeSync,
 } from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
@@ -19,6 +20,7 @@ import {
   rollTempFile,
   sidecarFile,
   sidecarTempFile,
+  treeRoot,
   utcDateSegment,
 } from "./tree-path.js";
 
@@ -304,17 +306,28 @@ async function writeSidecar(args: {
       // A file that exists and cannot be read would otherwise throw here on
       // every roll for ever, and nothing else regenerates it — so the store
       // would never be truncated again. Flash media that acknowledges a flush
-      // without writing produces exactly this after a power cut. The bad file
-      // is kept for whoever is diagnosing the device, and the sidecar is
-      // rebuilt from this roll's own window.
+      // without writing produces exactly this after a power cut.
+      //
+      // Rebuilt from the tree, not from this roll's window alone: the sidecar
+      // answers "the last value of everything", and a window carries only the
+      // paths that reported inside it. Rebuilding from the window would drop
+      // every path that went quiet earlier — which is the one question the
+      // sidecar exists to answer. Reading the whole tree is expensive and this
+      // is the path where that is the cheaper mistake.
       const quarantine = `${final}.unreadable`;
       rmSync(quarantine, { force: true });
       renameSync(final, quarantine);
-      process.stderr.write(
-        `the sidecar at ${final} could not be read (${err instanceof Error ? err.message.split("\n")[0] : String(err)}); ` +
-          `moved to ${quarantine} and rebuilt from this roll\n`,
+      writeStderr(
+        `the sidecar could not be read (${err instanceof Error ? err.message.split("\n")[0] : String(err)}); ` +
+          `moved aside and rebuilt from the tree\n`,
       );
-      await write("");
+      try {
+        await write(foldTree(dataDir));
+      } catch {
+        // A tree with no files yet, or one that cannot be read either. The
+        // window alone is worse than the tree and better than nothing.
+        await write("");
+      }
     }
   } else {
     await write("");
@@ -325,6 +338,20 @@ async function writeSidecar(args: {
     `SELECT count(*) FROM read_parquet('${sqlLiteral(final)}')`,
   );
   return Number(counted.getRowsJS()[0][0]);
+}
+
+/** The whole tree as a sidecar source, for the rebuild path. */
+function foldTree(dataDir: string): string {
+  const glob = join(treeRoot(dataDir), "**", "*.parquet");
+  return (
+    ` UNION ALL BY NAME SELECT ${COLUMN_LIST} ` +
+    `FROM read_parquet('${sqlLiteral(glob)}', union_by_name = true)`
+  );
+}
+
+/** Write to stderr and be sure it arrives: this process exits soon after. */
+function writeStderr(line: string): void {
+  writeSync(2, line);
 }
 
 /**
