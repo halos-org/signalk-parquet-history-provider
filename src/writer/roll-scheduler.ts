@@ -3,7 +3,11 @@ import type { ChildProcess } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { delayToNextRoll, nextRollAt } from "../roll/schedule.js";
-import { writerPaths } from "./contract.js";
+import {
+  EXIT_NAME_TAKEN,
+  ROLL_KILL_GRACE_MS,
+  writerPaths,
+} from "./contract.js";
 import type { HotStore } from "./hot-store.js";
 
 /**
@@ -34,20 +38,28 @@ const ROLL_ENTRY = fileURLToPath(new URL("../roll/main.js", import.meta.url));
  */
 const ROLL_TIMEOUT_MS = 15 * 60_000;
 
-/** How long a killed roll gets to die before SIGKILL. */
-const ROLL_KILL_GRACE_MS = 5000;
+/** How long after start a backlog roll waits, so it does not collide with
+ * the plugin's own startup work. */
+const START_ROLL_DELAY_MS = 5000;
 
 export interface RollSchedulerOptions {
   store: HotStore;
   dataDir: string;
   intervalMinutes: number;
+  /** Ordinary progress. The plugin routes the writer's stdout to `app.debug`. */
   log: (line: string) => void;
+  /** Anything an operator has to see. The plugin routes stderr to `app.error`;
+   * without a separate sink every roll failure is debug-level, and a device
+   * can fail every roll for weeks while the status line says "Recording". */
+  onError?: (line: string) => void;
   /** Injected in tests. Production reads the clock. */
   now?: () => number;
   /** Injected in tests, so a roll need not be a real DuckDB process. */
   spawnRoll?: (args: string[]) => ChildProcess;
   /** Injected in tests. Production waits ROLL_TIMEOUT_MS. */
   timeoutMs?: number;
+  /** Injected in tests. Production waits START_ROLL_DELAY_MS. */
+  startDelayMs?: number;
 }
 
 export class RollScheduler {
@@ -57,40 +69,90 @@ export class RollScheduler {
   private running: ChildProcess | null = null;
   private stopped = false;
   /**
-   * The id of a roll that has been started and not yet truncated.
+   * What a roll that has not been truncated yet was doing.
    *
-   * Kept across a failure so the retry writes the same filenames and replaces
-   * the failed attempt's files. Without it, a roll that wrote its Parquet and
-   * then died would leave those rows in the tree AND in the store, and the
-   * next roll would write them again under a new name — the same rows twice,
-   * silently and for good.
+   * It records a phase, not just an id, and the distinction is what keeps a
+   * retry from destroying somebody else's file. `rolling` means a roll may
+   * have written files under this id and nothing has been truncated: a retry
+   * may replace them, because they are its own. `written` means the roll
+   * finished and the truncate had not happened yet: the successor must NOT
+   * reuse the name — those rows are already durable — and instead completes
+   * the truncate, which is idempotent.
    *
-   * It outlives the writer as well, in a file, because the writer is not the
-   * only thing that can die: a SIGKILL or an OOM kill leaves the roll process
-   * running, and an orphan that finishes has written a file this scheduler
-   * would otherwise know nothing about. The successor reads the id and its
-   * next roll overwrites that file.
-   *
-   * The two cannot collide over one filename. The successor rolls at the next
-   * slot, minutes or an hour away, and an orphan roll is seconds long.
+   * It outlives the writer, in a file, because the writer is not the only
+   * thing that can die: a SIGKILL or an OOM kill leaves the roll running, and
+   * an orphan that finishes has written a file this scheduler would otherwise
+   * know nothing about.
    */
-  private pendingRollId: number | null;
+  private pending: PendingRoll | null;
 
   constructor(options: RollSchedulerOptions) {
     this.options = options;
     this.now = options.now ?? (() => Date.now());
-    this.pendingRollId = readPendingRoll(options.dataDir);
-    if (this.pendingRollId !== null) {
-      options.log(
-        `roll ${this.pendingRollId} was left unfinished; the next roll reuses its name`,
+    this.pending = readPendingRoll(options.dataDir);
+  }
+
+  /**
+   * Finish whatever the last writer left, then arm the timer.
+   *
+   * Two things can be outstanding. A roll that completed and was not truncated
+   * is finished here, because its rows are already in the tree and leaving
+   * them in the store would write them a second time. And a store holding rows
+   * older than one interval means this device's uptime never crosses a slot —
+   * a boat powered up at 08:10 and shut down at 08:55 would otherwise never
+   * roll at all — so one roll is scheduled shortly rather than at the next
+   * boundary.
+   */
+  start(): void {
+    this.stopped = false;
+    this.completeInterruptedRoll();
+    this.arm();
+    if (this.backlogPredatesThisProcess()) {
+      this.options.log(
+        "the hot store holds rows older than one roll interval; rolling shortly",
       );
+      const soon = setTimeout(() => {
+        // Named for the instant it runs, not for a slot. The armed timer owns
+        // the next slot, and two rolls sharing one name would make the second
+        // a stranger to the first's file.
+        void this.rollOnce(this.now()).catch((err: unknown) =>
+          this.reportFailure(err),
+        );
+      }, this.options.startDelayMs ?? START_ROLL_DELAY_MS);
+      soon.unref();
     }
   }
 
-  /** Arm the timer for the next slot. Nothing rolls at start. */
-  start(): void {
-    this.stopped = false;
-    this.arm();
+  /**
+   * A roll that exited 0 and was killed before its rows were deleted.
+   *
+   * Completing it is the whole reason the record carries a phase. Reusing the
+   * name instead — which is what an id alone leads to — replaces a file whose
+   * rows are already durable and gone from the store.
+   */
+  private completeInterruptedRoll(): void {
+    const pending = this.pending;
+    if (pending === null) return;
+    if (pending.phase !== "written") {
+      this.options.log(
+        `roll ${pending.rollId} was left unfinished; the next roll reuses its name`,
+      );
+      return;
+    }
+    const removed = this.options.store.deleteThrough(pending.maxRowid);
+    this.options.store.checkpoint();
+    this.pending = null;
+    clearPendingRoll(this.options.dataDir, this.options.onError);
+    this.options.log(
+      `roll ${pending.rollId} had finished but not truncated; removed ${removed} rows now`,
+    );
+  }
+
+  /** Whether the store holds rows from before this process started. */
+  private backlogPredatesThisProcess(): boolean {
+    const oldest = this.options.store.oldestTimestamp();
+    if (oldest === null) return false;
+    return this.now() - oldest > this.options.intervalMinutes * 60_000;
   }
 
   private arm(): void {
@@ -111,11 +173,7 @@ export class RollScheduler {
         // a full disk, say — would take recording down with it instead of
         // costing one roll.
         void this.rollOnce(slot)
-          .catch((err: unknown) => {
-            this.options.log(
-              `roll ${slot} failed: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          })
+          .catch((err: unknown) => this.reportFailure(err))
           .finally(() => this.arm());
       },
       delayToNextRoll(now, this.options.intervalMinutes),
@@ -137,43 +195,89 @@ export class RollScheduler {
     const bound = this.options.store.rollBound();
     if (bound === null) {
       // Nothing recorded since the last roll. No file, no empty directory.
-      this.pendingRollId = null;
-      clearPendingRoll(this.options.dataDir);
+      this.pending = null;
+      clearPendingRoll(this.options.dataDir, this.options.onError);
       return;
     }
 
-    // A retry keeps the failed attempt's name, and only a retry may replace a
-    // file that is already there.
-    const retry = this.pendingRollId !== null;
-    const rollId = this.pendingRollId ?? slot;
-    this.pendingRollId = rollId;
+    // Only a `rolling` record grants a replacement, and only ever of files
+    // that record's own attempt wrote. A `written` record is finished by
+    // start(); anything else takes a fresh name.
+    const retry = this.pending?.phase === "rolling";
+    const rollId = retry ? (this.pending as PendingRoll).rollId : slot;
     // Before the spawn, so a writer that dies during the roll still leaves the
     // name behind for its successor.
-    writePendingRoll(this.options.dataDir, rollId);
+    this.pending = { rollId, maxRowid: bound.maxRowid, phase: "rolling" };
+    writePendingRoll(this.options.dataDir, this.pending, this.options.onError);
 
     const outcome = await this.runRoll(rollId, bound.maxRowid, retry);
     if (!outcome.ok) {
-      this.options.log(
+      if (outcome.nameTaken) {
+        // The one failure a retry cannot fix. Keeping the id would hand the
+        // next slot a `--replace` for a file this roll did not write, and it
+        // would overwrite an earlier roll's rows with a fraction of them.
+        this.pending = null;
+        clearPendingRoll(this.options.dataDir, this.options.onError);
+        this.reportFailure(
+          `roll ${rollId} found its name already taken and will not reuse it (${outcome.why}); ` +
+            `the next roll takes a fresh name and ${bound.rows} rows stay in the hot store`,
+        );
+        return;
+      }
+      this.reportFailure(
         `roll ${rollId} did not finish (${outcome.why}); ${bound.rows} rows stay in the hot store`,
       );
       return;
     }
 
+    // The roll echoes back the inputs it was given. They must match, and
+    // checking them is the only end-to-end verification this two-process
+    // boundary can have before rows are deleted.
+    const mismatch = describeMismatch(outcome.result, rollId, bound);
+    if (mismatch !== null) {
+      this.reportFailure(
+        `roll ${rollId} reported ${mismatch}; nothing truncated`,
+      );
+      return;
+    }
+
+    // Recorded as finished BEFORE the delete. A writer killed between the two
+    // otherwise leaves a record its successor reads as unfinished, and that
+    // successor replaces a file whose rows are already durable.
+    this.pending = { rollId, maxRowid: bound.maxRowid, phase: "written" };
+    writePendingRoll(this.options.dataDir, this.pending, this.options.onError);
+
     // Only now, and only through the bound the roll was given: the store has
     // kept ingesting throughout, and those rows were never written.
     const removed = this.options.store.deleteThrough(bound.maxRowid);
-    this.pendingRollId = null;
-    clearPendingRoll(this.options.dataDir);
+    // Durable before the record goes. The store runs `synchronous = NORMAL`,
+    // so without this an unclean power-off can keep the record's removal and
+    // lose the delete — and the next roll then writes those rows a second
+    // time, under a second name, for ever.
+    this.options.store.checkpoint();
+    this.pending = null;
+    clearPendingRoll(this.options.dataDir, this.options.onError);
     this.options.log(
       `roll ${rollId} wrote ${outcome.summary}; ${removed} rows truncated`,
     );
+  }
+
+  /** Roll failures go to the error sink, which the plugin routes to
+   * `app.error`. The success log is debug-level; a failure nobody sees is the
+   * shape this design exists to make impossible. */
+  private reportFailure(problem: unknown): void {
+    const line =
+      problem instanceof Error
+        ? `roll failed: ${problem.message}`
+        : String(problem);
+    (this.options.onError ?? this.options.log)(line);
   }
 
   private runRoll(
     rollId: number,
     maxRowid: number,
     retry: boolean,
-  ): Promise<{ ok: true; summary: string } | { ok: false; why: string }> {
+  ): Promise<RollOutcome> {
     const args = [
       ROLL_ENTRY,
       "--data-dir",
@@ -194,9 +298,7 @@ export class RollScheduler {
       let out = "";
       let err = "";
       let settled = false;
-      const settle = (
-        result: { ok: true; summary: string } | { ok: false; why: string },
-      ) => {
+      const settle = (result: RollOutcome) => {
         if (settled) return;
         settled = true;
         clearTimeout(killer);
@@ -210,7 +312,9 @@ export class RollScheduler {
       // writer would exit for a failure that should cost one roll.
       child.stdout?.on("error", () => {});
       child.stderr?.on("error", () => {});
-      child.on("error", (error) => settle({ ok: false, why: error.message }));
+      child.on("error", (error) =>
+        settle({ ok: false, why: error.message, nameTaken: false }),
+      );
 
       const killer = setTimeout(() => {
         this.options.log(`roll ${rollId} exceeded its timeout; killing it`);
@@ -223,15 +327,26 @@ export class RollScheduler {
       }, this.options.timeoutMs ?? ROLL_TIMEOUT_MS);
       killer.unref();
 
-      child.on("exit", (code, signal) => {
+      // `close`, not `exit`: exit can fire while the last line is still in the
+      // pipe, and that line is the roll's whole report.
+      child.on("close", (code, signal) => {
         if (code === 0) {
-          settle({ ok: true, summary: summarize(out) });
+          const result = parseSummary(out);
+          settle(
+            result === null
+              ? { ok: false, why: "an unreadable summary", nameTaken: false }
+              : { ok: true, summary: describe(result), result },
+          );
           return;
         }
         const how = code === null ? `signal ${signal}` : `code ${code}`;
+        // The first line of stderr is the message; the rest is a stack, and a
+        // stack frame tells an operator nothing about why the roll stopped.
+        const reason = err.trim().split("\n")[0] ?? "";
         settle({
           ok: false,
-          why: `${how}: ${err.trim().split("\n").pop() ?? ""}`,
+          why: `${how}: ${reason}`,
+          nameTaken: code === EXIT_NAME_TAKEN,
         });
       });
     });
@@ -257,14 +372,25 @@ export class RollScheduler {
   }
 }
 
-function readPendingRoll(dataDir: string): number | null {
+function readPendingRoll(dataDir: string): PendingRoll | null {
   try {
     const raw = JSON.parse(
       readFileSync(writerPaths(dataDir).pendingRoll, "utf8"),
-    ) as { rollId?: unknown };
-    return Number.isSafeInteger(raw.rollId) && (raw.rollId as number) >= 0
-      ? (raw.rollId as number)
-      : null;
+    ) as Partial<PendingRoll>;
+    // `>= 1`, matching what the roll process accepts. Accepting 0 here made a
+    // `{"rollId":0}` file wedge every future roll: the scheduler adopted it
+    // and the roll refused it, for ever. `nextRollAt` really can return 0 —
+    // for any clock set before the epoch.
+    if (
+      !Number.isSafeInteger(raw.rollId) ||
+      (raw.rollId as number) < 1 ||
+      !Number.isSafeInteger(raw.maxRowid) ||
+      (raw.maxRowid as number) < 1 ||
+      (raw.phase !== "rolling" && raw.phase !== "written")
+    ) {
+      return null;
+    }
+    return raw as PendingRoll;
   } catch {
     // Absent is the normal case. Unreadable is treated the same way on
     // purpose: a corrupt file must not be able to stop a device rolling.
@@ -272,22 +398,110 @@ function readPendingRoll(dataDir: string): number | null {
   }
 }
 
-function writePendingRoll(dataDir: string, rollId: number): void {
+function writePendingRoll(
+  dataDir: string,
+  pending: PendingRoll,
+  onError?: (line: string) => void,
+): void {
   try {
     writeFileSync(
       writerPaths(dataDir).pendingRoll,
-      `${JSON.stringify({ rollId })}\n`,
+      `${JSON.stringify(pending)}\n`,
       { mode: 0o600 },
     );
-  } catch {
-    // Recording the name is a safeguard against one narrow failure. Refusing
+  } catch (err) {
+    // Recording this is a safeguard against one narrow failure, and refusing
     // to roll because the safeguard could not be written would be worse than
-    // the failure it guards.
+    // the failure it guards. But a device running without it must say so —
+    // ENOSPC is both the likeliest cause and the condition under which the
+    // safeguard matters.
+    onError?.(
+      `could not record the pending roll (${err instanceof Error ? err.message : String(err)}); ` +
+        `a roll interrupted now could be written to the tree twice`,
+    );
   }
 }
 
-function clearPendingRoll(dataDir: string): void {
-  rmSync(writerPaths(dataDir).pendingRoll, { force: true });
+function clearPendingRoll(
+  dataDir: string,
+  onError?: (line: string) => void,
+): void {
+  try {
+    rmSync(writerPaths(dataDir).pendingRoll, { force: true });
+  } catch (err) {
+    // Unguarded, this threw after the rows were already deleted — leaving a
+    // record naming a completed roll and a log line that never printed.
+    onError?.(
+      `could not clear the pending roll record (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+}
+
+/** What one roll attempt was doing, durable across a writer's death. */
+interface PendingRoll {
+  rollId: number;
+  maxRowid: number;
+  /** `rolling`: files may exist and nothing is truncated — a retry owns them.
+   * `written`: the roll finished; only the truncate is outstanding. */
+  phase: "rolling" | "written";
+}
+
+type RollOutcome =
+  | { ok: true; summary: string; result: RollSummary }
+  | { ok: false; why: string; nameTaken: boolean };
+
+/** The fields of the roll's JSON line this side depends on. */
+interface RollSummary {
+  rollId: number;
+  maxRowid: number;
+  rows: number;
+  files: { date: string }[];
+  sidecarRows: number;
+  peakRssBytes: number | null;
+}
+
+function parseSummary(stdout: string): RollSummary | null {
+  try {
+    const parsed = JSON.parse(
+      stdout.trim().split("\n").pop() ?? "",
+    ) as Partial<RollSummary>;
+    if (
+      !Number.isSafeInteger(parsed.rollId) ||
+      !Number.isSafeInteger(parsed.maxRowid) ||
+      !Number.isSafeInteger(parsed.rows) ||
+      !Array.isArray(parsed.files)
+    ) {
+      return null;
+    }
+    return parsed as RollSummary;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether the roll wrote what it was asked to write.
+ *
+ * The roll echoes its inputs back, and under this design `bound.rows` and the
+ * roll's own count must be equal — nothing but the writer inserts, and nothing
+ * deletes while a roll runs. It is the only end-to-end check available on this
+ * boundary, and it costs a comparison.
+ */
+function describeMismatch(
+  result: RollSummary,
+  rollId: number,
+  bound: { maxRowid: number; rows: number },
+): string | null {
+  if (result.rollId !== rollId) {
+    return `roll id ${result.rollId}, not ${rollId}`;
+  }
+  if (result.maxRowid !== bound.maxRowid) {
+    return `bound ${result.maxRowid}, not ${bound.maxRowid}`;
+  }
+  if (result.rows !== bound.rows) {
+    return `${result.rows} rows written against ${bound.rows} in the store`;
+  }
+  return null;
 }
 
 function defaultSpawn(args: string[]): ChildProcess {
@@ -296,23 +510,12 @@ function defaultSpawn(args: string[]): ChildProcess {
   return spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
 }
 
-/** The roll's own JSON summary, reduced to a log line. */
-function summarize(stdout: string): string {
-  const line = stdout.trim().split("\n").pop() ?? "";
-  try {
-    const result = JSON.parse(line) as {
-      rows: number;
-      files: { date: string }[];
-      sidecarRows: number;
-      peakRssBytes: number | null;
-    };
-    const dates = result.files.map((file) => file.date).join(", ") || "nothing";
-    const peak =
-      result.peakRssBytes === null
-        ? ""
-        : `, peaking at ${Math.round(result.peakRssBytes / 1048576)} MB`;
-    return `${result.rows} rows to ${dates} and ${result.sidecarRows} sidecar rows${peak}`;
-  } catch {
-    return "an unreadable summary";
-  }
+/** The roll's own summary, reduced to a log line. */
+function describe(result: RollSummary): string {
+  const dates = result.files.map((file) => file.date).join(", ") || "nothing";
+  const peak =
+    typeof result.peakRssBytes === "number"
+      ? `, peaking at ${Math.round(result.peakRssBytes / 1048576)} MB`
+      : "";
+  return `${result.rows} rows to ${dates} and ${result.sidecarRows} sidecar rows${peak}`;
 }

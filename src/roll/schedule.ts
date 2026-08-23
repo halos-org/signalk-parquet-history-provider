@@ -27,12 +27,23 @@ export function delayToNextRoll(now: number, intervalMinutes: number): number {
   return Math.max(0, nextRollAt(now, intervalMinutes) - now);
 }
 
+/**
+ * Whether an interval names a schedule at all.
+ *
+ * One predicate, because the config normalizer and the writer's argument check
+ * disagreeing would mean a value the Admin UI accepts and the writer refuses —
+ * and refusing here stops recording, it does not warn.
+ */
+export function dividesTheDay(intervalMinutes: number): boolean {
+  return (
+    Number.isInteger(intervalMinutes) &&
+    intervalMinutes >= 1 &&
+    DAY_MINUTES % intervalMinutes === 0
+  );
+}
+
 function intervalMs(intervalMinutes: number): number {
-  if (
-    !Number.isInteger(intervalMinutes) ||
-    intervalMinutes < 1 ||
-    DAY_MINUTES % intervalMinutes !== 0
-  ) {
+  if (!dividesTheDay(intervalMinutes)) {
     throw new RangeError(
       `${intervalMinutes} minutes does not divide the day, so it names no schedule`,
     );

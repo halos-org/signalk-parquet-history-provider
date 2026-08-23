@@ -1,5 +1,13 @@
+import { createServer } from "node:net";
+import { chmodSync, rmSync } from "node:fs";
 import { ownPeakBytes } from "../bench/one-shot.js";
-import { roll } from "./roll.js";
+import {
+  EXIT_LOCKED,
+  EXIT_NAME_TAKEN,
+  writerPaths,
+} from "../writer/contract.js";
+import { probeLiveWriter } from "../writer/server.js";
+import { NameTakenError, roll } from "./roll.js";
 
 /**
  * The roll process.
@@ -21,7 +29,13 @@ import { roll } from "./roll.js";
  *
  * Exit codes:
  *   0  rolled, and the files are fsynced and renamed into place
+ *   3  another roll is already running against this data directory
+ *   4  the filename is taken by a roll that is not this one
  *   1  anything else; the hot store is untouched and the next roll retries
+ *
+ * 3 and 4 are named apart from 1 because the scheduler acts differently on
+ * each: 3 means wait for the next slot, and 4 means abandon this name — the
+ * one failure a retry under the same id must not inherit.
  */
 
 function argValue(flag: string): string | undefined {
@@ -47,6 +61,27 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // The claim on the data directory, made the way the writer claims the store:
+  // if something answers here, a roll is already running and this one must not
+  // race it for the same filenames. A socket carries no ambiguity across the
+  // PID namespaces a container restart creates, which is why it is not a pid
+  // file — that lesson is already written down in writer/server.ts.
+  const paths = writerPaths(dataDir);
+  if (await probeLiveWriter(paths.rollSocket)) {
+    process.stderr.write(
+      `a roll is already running against ${dataDir}; refusing to start a second one\n`,
+    );
+    process.exit(EXIT_LOCKED);
+  }
+  rmSync(paths.rollSocket, { force: true });
+  const claim = createServer();
+  await new Promise<void>((resolve, reject) => {
+    claim.once("error", reject);
+    claim.listen(paths.rollSocket, () => resolve());
+  });
+  chmodSync(paths.rollSocket, 0o600);
+  claim.unref();
+
   const result = await roll({
     dataDir,
     maxRowid: requireNumber("--max-rowid"),
@@ -63,8 +98,10 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
+  // The message first, then the stack. The scheduler reports the first line,
+  // and a stack frame tells an operator nothing about why the roll stopped.
   process.stderr.write(
-    `${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
+    `${err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err)}\n`,
   );
-  process.exit(1);
+  process.exit(err instanceof NameTakenError ? EXIT_NAME_TAKEN : 1);
 });

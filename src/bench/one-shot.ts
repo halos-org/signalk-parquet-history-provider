@@ -91,7 +91,9 @@ export async function measureOneShot(
     signal: NodeJS.Signals | null;
   }>((resolve) => {
     child.on("error", () => resolve({ exitCode: null, signal: null }));
-    child.on("exit", (code, sig) => resolve({ exitCode: code, signal: sig }));
+    // `close`, not `exit`: exit can fire while the subject's last line is
+    // still in the pipe, and that line is the figure being measured.
+    child.on("close", (code, sig) => resolve({ exitCode: code, signal: sig }));
   });
   clearInterval(sampler);
 

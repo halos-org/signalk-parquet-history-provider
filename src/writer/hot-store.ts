@@ -240,6 +240,32 @@ export class HotStore {
     return Number(result.changes);
   }
 
+  /**
+   * The timestamp of the oldest row still in the store, or `null` when it is
+   * empty.
+   *
+   * By rowid rather than `min(ts)`: rowid order is insertion order, so this is
+   * one row rather than a scan of a table that can hold millions.
+   */
+  oldestTimestamp(): number | null {
+    const row = this.db
+      .prepare("SELECT ts FROM sample ORDER BY rowid LIMIT 1")
+      .get() as { ts: number } | undefined;
+    return row?.ts ?? null;
+  }
+
+  /**
+   * Push the WAL into the database file.
+   *
+   * `synchronous = NORMAL` means a commit is not fsynced, so a delete can be
+   * lost to an unclean power-off while whatever the caller did afterwards
+   * survives. The roll's truncate is the one place that matters: losing it
+   * while its bookkeeping survives puts the same rows in the tree twice.
+   */
+  checkpoint(): void {
+    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  }
+
   rowCount(): number {
     const row = this.db.prepare("SELECT count(*) AS n FROM sample").get() as {
       n: number;

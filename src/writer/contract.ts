@@ -20,6 +20,31 @@ import { DATA_LAYOUT } from "../data-dir.js";
 export const EXIT_LOCKED = 3;
 
 /**
+ * A roll found its filename already taken and is not a retry of the roll that
+ * wrote it.
+ *
+ * Named separately because the scheduler must treat it as the one failure a
+ * retry cannot fix. Every other failure keeps the roll's id so the retry
+ * replaces its own half-written output; keeping it for this one turns the
+ * refusal into permission at the next slot, and the roll then overwrites an
+ * earlier roll's file with a fraction of its rows.
+ */
+export const EXIT_NAME_TAKEN = 4;
+
+/**
+ * The shutdown budget the plugin and the writer have to agree on.
+ *
+ * `ROLL_KILL_GRACE_MS` is strictly under `WRITER_EXIT_TIMEOUT_MS`: the
+ * writer's SIGTERM handler waits for a running roll, and the plugin SIGKILLs
+ * the writer when that takes too long. With the grace above the budget, a roll
+ * slow to die outlives its writer, keeps writing to the tree with nothing left
+ * to kill it, and races the successor's roll for the same filename. The two
+ * live here because neither file can see the other's constant.
+ */
+export const WRITER_EXIT_TIMEOUT_MS = 3000;
+export const ROLL_KILL_GRACE_MS = 1500;
+
+/**
  * Where the writer's files live under the resolved data directory.
  *
  * `pidFile` is written for whoever is reading the device, and nothing decides
@@ -31,6 +56,7 @@ export function writerPaths(dataDir: string): {
   pidFile: string;
   socket: string;
   pendingRoll: string;
+  rollSocket: string;
 } {
   const hot = join(dataDir, DATA_LAYOUT.hotStore);
   return {
@@ -41,5 +67,10 @@ export function writerPaths(dataDir: string): {
     // the pid file, something does decide from this one — see
     // roll-scheduler.ts.
     pendingRoll: join(hot, "roll-pending.json"),
+    // A roll's claim on the data directory, made the same way the writer
+    // claims the store: something answering here is a live roll. A pid would
+    // not do — this runs in a container, where a restart makes a dead roll's
+    // pid some unrelated live process.
+    rollSocket: join(hot, "roll.sock"),
   };
 }

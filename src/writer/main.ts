@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR_MODE, DATA_LAYOUT } from "../data-dir.js";
+import { dividesTheDay } from "../roll/schedule.js";
 import { HotStore } from "./hot-store.js";
 import { RollScheduler } from "./roll-scheduler.js";
 import { StoreLockedError, WriterServer } from "./server.js";
@@ -14,7 +15,7 @@ import { EXIT_LOCKED, writerPaths } from "./contract.js";
  * event loop; keeping it a separate process rather than a worker thread is
  * what makes that true of memory as well as CPU.
  *
- *   node dist/writer/main.js --data-dir <path>
+ *   node dist/writer/main.js --data-dir <path> --roll-interval-minutes <n>
  *
  * Exit codes are read by the plugin, which turns them into a status an
  * operator can see:
@@ -36,11 +37,18 @@ async function main(): Promise<void> {
     );
     process.exit(1);
   }
-  // Already normalized by the plugin, which refuses an interval that does not
-  // divide the day. Re-read rather than re-derived, so the writer and the
-  // plugin cannot disagree about the schedule; the scheduler throws if the
-  // value is one it cannot turn into a grid.
+  // Checked here, beside --data-dir, rather than left to the scheduler. An
+  // unchecked NaN reached `arm()` only AFTER the store was open, the socket
+  // claimed and the pid file written, and the plugin then latched that exit as
+  // fatal — recording stopped for a missing argument.
   const rollIntervalMinutes = Number(argValue("--roll-interval-minutes"));
+  if (!dividesTheDay(rollIntervalMinutes)) {
+    process.stderr.write(
+      `--roll-interval-minutes must be a whole number of minutes dividing 1440, ` +
+        `not ${argValue("--roll-interval-minutes") ?? "(missing)"}\n`,
+    );
+    process.exit(1);
+  }
 
   const paths = writerPaths(dataDir);
   const hot = join(dataDir, DATA_LAYOUT.hotStore);
@@ -79,6 +87,10 @@ async function main(): Promise<void> {
     dataDir,
     intervalMinutes: rollIntervalMinutes,
     log: (line) => process.stdout.write(`${line}\n`),
+    // stderr, because the plugin routes it to app.error while stdout goes to
+    // app.debug. A roll failure nobody sees is the shape this whole design
+    // exists to make impossible.
+    onError: (line) => process.stderr.write(`${line}\n`),
   });
   rolls.start();
 

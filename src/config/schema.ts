@@ -1,4 +1,5 @@
 import { Type, Static } from "typebox";
+import { dividesTheDay } from "../roll/schedule.js";
 
 /**
  * The single source of truth for both the JSON schema the Signal K Admin UI
@@ -195,9 +196,6 @@ export function normalizeConfig(config: StoredConfig): Config {
   };
 }
 
-/** Minutes in a day. The roll schedule is anchored to UTC midnight. */
-const DAY_MINUTES = 1440;
-
 /**
  * A whole number of minutes that divides the day.
  *
@@ -212,9 +210,7 @@ const DAY_MINUTES = 1440;
  */
 function dayDivisor(value: number | undefined, fallback: number): number {
   const positiveValue = positive(value, fallback);
-  return Number.isInteger(positiveValue) && DAY_MINUTES % positiveValue === 0
-    ? positiveValue
-    : fallback;
+  return dividesTheDay(positiveValue) ? positiveValue : fallback;
 }
 
 function stringArray(value: unknown): string[] {

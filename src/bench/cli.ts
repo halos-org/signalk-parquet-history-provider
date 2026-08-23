@@ -136,6 +136,7 @@ async function doRoll(argv: string[]): Promise<void> {
   });
   const dataDir = values["data-dir"];
   if (!dataDir) throw new Error("--data-dir is required");
+  if (!values["max-rowid"]) throw new Error("--max-rowid is required");
   requireLinux();
 
   if (await probeLiveWriter(writerPaths(dataDir).socket)) {
@@ -152,7 +153,7 @@ async function doRoll(argv: string[]): Promise<void> {
       "--data-dir",
       dataDir,
       "--max-rowid",
-      values["max-rowid"] ?? "0",
+      values["max-rowid"],
       "--roll-id",
       String(Date.now()),
       ...(values["memory-limit"]

@@ -16,7 +16,11 @@ import { PLUGIN_ID } from "./plugin-id.js";
 import { Recorder } from "./recorder.js";
 import type { BusValue } from "./recorder.js";
 import { WriterClient } from "./writer/client.js";
-import { EXIT_LOCKED, writerPaths } from "./writer/contract.js";
+import {
+  EXIT_LOCKED,
+  WRITER_EXIT_TIMEOUT_MS,
+  writerPaths,
+} from "./writer/contract.js";
 
 /**
  * Nothing in this file's import graph may reach `@duckdb/node-api`.
@@ -51,9 +55,6 @@ const WRITER_ENTRY = fileURLToPath(
 
 /** How often the status line is refreshed while recording. */
 const STATUS_INTERVAL_MS = 10_000;
-
-/** How long the plugin gives a departing writer before it is killed. */
-const WRITER_EXIT_TIMEOUT_MS = 3000;
 
 /** How long the buffer gets to reach the writer on a graceful stop. */
 const DRAIN_TIMEOUT_MS = 2000;

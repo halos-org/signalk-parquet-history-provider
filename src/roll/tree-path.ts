@@ -14,8 +14,16 @@ import { DATA_LAYOUT } from "../data-dir.js";
  * interval's divisibility rule is about the schedule, not about this.
  */
 
-/** Largest timestamp this will name. Beyond it `Date` stops being a date. */
-const MAX_TIMESTAMP = 8.64e15;
+/**
+ * The range `YYYY-MM-DD` can express.
+ *
+ * Narrower than `Date`'s own ±8.64e15: `toISOString` switches to an extended
+ * form outside years 0000–9999, and slicing that to ten characters yields
+ * `+011476-08` — a directory name no reader can parse as a date and that does
+ * not sort with the others.
+ */
+const MAX_TIMESTAMP = 253402300799999;
+const MIN_TIMESTAMP = -62167219200000;
 
 /**
  * The UTC date a row belongs to, as the directory segment names it.
@@ -25,7 +33,7 @@ const MAX_TIMESTAMP = 8.64e15;
  * which timezone wrote it.
  */
 export function utcDateSegment(ts: number): string {
-  if (!Number.isFinite(ts) || Math.abs(ts) > MAX_TIMESTAMP) {
+  if (!Number.isFinite(ts) || ts > MAX_TIMESTAMP || ts < MIN_TIMESTAMP) {
     throw new RangeError(`${ts} is not a timestamp this can name a date from`);
   }
   return new Date(ts).toISOString().slice(0, 10);
@@ -93,7 +101,10 @@ export function sidecarTempFile(dataDir: string): string {
 }
 
 function rollIdSegment(rollStartMs: number): string {
-  if (!Number.isInteger(rollStartMs) || rollStartMs < 0) {
+  // `>= 1`, the same floor the roll process and the pending-roll record use.
+  // `nextRollAt` returns 0 for any clock set before the epoch, and a roll id
+  // of 0 that one side accepts and another rejects wedged every future roll.
+  if (!Number.isInteger(rollStartMs) || rollStartMs < 1) {
     throw new RangeError(`${rollStartMs} is not a roll id`);
   }
   return String(rollStartMs);

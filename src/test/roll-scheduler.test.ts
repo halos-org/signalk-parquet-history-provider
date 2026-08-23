@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -17,7 +18,7 @@ import { dateDirectory } from "../roll/tree-path.js";
 import { writerPaths } from "../writer/contract.js";
 import { HotStore } from "../writer/hot-store.js";
 import { RollScheduler } from "../writer/roll-scheduler.js";
-import { NO_BUNDLED_EXTENSION, sample } from "./fixtures.js";
+import { NO_BUNDLED_EXTENSION, eventually, sample } from "./fixtures.js";
 import type { Sample } from "../writer/protocol.js";
 
 const AUG_23 = Date.UTC(2026, 7, 23);
@@ -30,6 +31,7 @@ let dir: string;
 let store: HotStore;
 let seq = 0;
 let logged: string[];
+let errors: string[];
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "roll-scheduler-"));
@@ -38,6 +40,7 @@ beforeEach(() => {
   store.beginSession("test");
   seq = 0;
   logged = [];
+  errors = [];
 });
 
 afterEach(() => {
@@ -49,42 +52,54 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-/** How many rows a Parquet file holds, read the way a reader would. */
-function readParquetRows(path: string): number {
-  const probe = [
-    `const { DuckDBInstance } = await import("@duckdb/node-api");`,
-    `const c = await (await DuckDBInstance.create(":memory:")).connect();`,
-    `const r = await c.runAndReadAll(${JSON.stringify(
-      `SELECT count(*) FROM read_parquet('${path}')`,
-    )});`,
-    `console.log(String(r.getRowsJS()[0][0]));`,
-  ].join("\n");
-  return Number(
-    execFileSync(process.execPath, ["--input-type=module", "-e", probe], {
-      encoding: "utf8",
-      timeout: 60_000,
-    }).trim(),
-  );
-}
-
 function record(...samples: Sample[]): void {
   seq += 1;
   store.insertBatch(seq, samples);
 }
 
-/** A stand-in roll that does what the argument says and nothing else. */
-function fakeRoll(script: string): (args: string[]) => ChildProcess {
-  return () =>
-    spawn(process.execPath, ["-e", script], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+const argOf = (args: string[], flag: string): string =>
+  args[args.indexOf(flag) + 1];
+
+const child = (script: string): ChildProcess =>
+  spawn(process.execPath, ["-e", script], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+/**
+ * A stand-in roll that reports what a real one would for these arguments.
+ *
+ * It echoes back the id and bound it was given rather than carrying its own
+ * constants, because the scheduler now refuses to truncate when those
+ * disagree — a fake with hard-coded values would exercise a path production
+ * never takes.
+ */
+function succeeds(rows?: number): (args: string[]) => ChildProcess {
+  return (args) => {
+    const count = rows ?? store.rollBound()?.rows ?? 0;
+    const summary = {
+      rollId: Number(argOf(args, "--roll-id")),
+      maxRowid: Number(argOf(args, "--max-rowid")),
+      rows: count,
+      files: [{ date: "2026-08-23", path: "x", rows: count }],
+      sidecarRows: 2,
+      peakRssBytes: null,
+    };
+    return child(`console.log(${JSON.stringify(JSON.stringify(summary))})`);
+  };
 }
 
-const SUCCEEDS = fakeRoll(
-  `console.log(JSON.stringify({rows:2,files:[{date:"2026-08-23"}],sidecarRows:2}))`,
-);
-const FAILS = fakeRoll(`console.error("boom"); process.exit(3)`);
-const HANGS = fakeRoll(`setTimeout(() => {}, 60000)`);
+const FAILS = (): ChildProcess =>
+  child(
+    `console.error("boom: the roll could not finish\\n    at some.frame"); process.exit(3)`,
+  );
+/** Exits the way a roll refused for a name it does not own does. */
+const NAME_TAKEN = (): ChildProcess =>
+  child(
+    `console.error("x.parquet already exists and this roll is not a retry"); process.exit(4)`,
+  );
+const HANGS = (): ChildProcess => child(`setTimeout(() => {}, 60000)`);
+const UNSPAWNABLE = (): ChildProcess =>
+  spawn("/nonexistent/roll", [], { stdio: ["ignore", "pipe", "pipe"] });
 
 function scheduler(
   over: Partial<ConstructorParameters<typeof RollScheduler>[0]> = {},
@@ -94,10 +109,21 @@ function scheduler(
     dataDir: dir,
     intervalMinutes: 60,
     log: (line) => logged.push(line),
+    onError: (line) => errors.push(line),
     now: () => NOW,
-    spawnRoll: SUCCEEDS,
+    spawnRoll: succeeds(),
     ...over,
   });
+}
+
+function pendingFile(): Record<string, unknown> | null {
+  try {
+    return JSON.parse(
+      readFileSync(writerPaths(dir).pendingRoll, "utf8"),
+    ) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 describe("a scheduled roll", () => {
@@ -106,11 +132,12 @@ describe("a scheduled roll", () => {
     let seenRowid = "";
     const rolls = scheduler({
       spawnRoll: (args) => {
-        seenRowid = args[args.indexOf("--max-rowid") + 1];
+        seenRowid = argOf(args, "--max-rowid");
+        const spawned = succeeds(2)(args);
         // The writer keeps ingesting while the roll runs, and this row was
         // never handed to it.
         record(sample({ ts: AUG_23 + 2 }));
-        return SUCCEEDS([]);
+        return spawned;
       },
     });
 
@@ -121,28 +148,30 @@ describe("a scheduled roll", () => {
     assert.match(logged.join("\n"), /2 rows truncated/);
   });
 
-  it("names the roll after the slot it belongs to, not the clock", async () => {
-    record(sample({ ts: AUG_23 }));
-    let rollId = "";
-    const rolls = scheduler({
-      spawnRoll: (args) => {
-        rollId = args[args.indexOf("--roll-id") + 1];
-        return SUCCEEDS([]);
-      },
-    });
-    await rolls.rollOnce(SLOT);
-    assert.equal(
-      new Date(Number(rollId)).toISOString(),
-      "2026-08-23T15:00:00.000Z",
-    );
+  it("names the roll after the slot it was given, whichever side of it the clock sits", async () => {
+    // The clock is made to disagree with the slot in both directions. A
+    // scheduler that re-derived the slot from `now()` — the shipped bug —
+    // produces a different id for at least one of these.
+    for (const clock of [SLOT - 1, SLOT + 30_000]) {
+      record(sample({ ts: AUG_23 }));
+      let rollId = "";
+      await scheduler({
+        now: () => clock,
+        spawnRoll: (args) => {
+          rollId = argOf(args, "--roll-id");
+          return succeeds()(args);
+        },
+      }).rollOnce(SLOT);
+      assert.equal(Number(rollId), SLOT, `clock at ${clock}`);
+    }
   });
 
   it("spawns nothing when there is nothing to roll", async () => {
     let spawned = 0;
     const rolls = scheduler({
-      spawnRoll: () => {
+      spawnRoll: (args) => {
         spawned += 1;
-        return SUCCEEDS([]);
+        return succeeds()(args);
       },
     });
     await rolls.rollOnce(SLOT);
@@ -150,15 +179,144 @@ describe("a scheduled roll", () => {
     // Not even a directory: an empty roll leaves no trace in the tree.
     assert.ok(!existsSync(join(dir, DATA_LAYOUT.tree)));
   });
+
+  it("refuses to truncate when the roll reports a different bound", async () => {
+    // The roll echoes its inputs back, and comparing them is the only
+    // end-to-end check this two-process boundary can have before rows go.
+    record(sample({ ts: AUG_23 }));
+    await scheduler({
+      spawnRoll: (args) =>
+        child(
+          `console.log(JSON.stringify({rollId:${argOf(args, "--roll-id")},maxRowid:99,rows:1,files:[],sidecarRows:0,peakRssBytes:null}))`,
+        ),
+    }).rollOnce(SLOT);
+
+    assert.equal(store.rowCount(), 1);
+    assert.match(errors.join("\n"), /bound 99, not 1/);
+    assert.match(errors.join("\n"), /nothing truncated/);
+  });
+
+  it("refuses to truncate when the roll reports a different row count", async () => {
+    record(sample({ ts: AUG_23 }), sample({ ts: AUG_23 + 1 }));
+    await scheduler({ spawnRoll: succeeds(1) }).rollOnce(SLOT);
+
+    assert.equal(store.rowCount(), 2);
+    assert.match(errors.join("\n"), /1 rows written against 2 in the store/);
+  });
+});
+
+describe("only a roll's own output may be replaced", () => {
+  it("does not keep a name the roll refused, and the next slot takes a fresh one", async () => {
+    // The P0. A refused roll used to keep its id, so the next slot inherited
+    // `--replace` and overwrote the file the refusal had just protected.
+    record(sample({ ts: AUG_23 }));
+    await scheduler({ spawnRoll: NAME_TAKEN }).rollOnce(SLOT);
+
+    assert.equal(pendingFile(), null, "the refused id must not be kept");
+    assert.match(errors.join("\n"), /found its name already taken/);
+
+    const args: string[][] = [];
+    await scheduler({
+      spawnRoll: (a) => {
+        args.push(a);
+        return succeeds()(a);
+      },
+      now: () => NOW + 3_600_000,
+    }).rollOnce(SLOT + 3_600_000);
+
+    assert.equal(Number(argOf(args[0], "--roll-id")), SLOT + 3_600_000);
+    assert.ok(!args[0].includes("--replace"), args[0].join(" "));
+  });
+
+  it("passes --replace only when retrying its own unfinished roll", async () => {
+    record(sample({ ts: AUG_23 }));
+    const args: string[][] = [];
+    await scheduler({
+      spawnRoll: (a) => {
+        args.push(a);
+        return FAILS();
+      },
+    }).rollOnce(SLOT);
+    assert.ok(!args[0].includes("--replace"), "the first attempt owns nothing");
+    assert.equal(pendingFile()?.phase, "rolling");
+
+    await scheduler({
+      spawnRoll: (a) => {
+        args.push(a);
+        return succeeds()(a);
+      },
+      now: () => NOW + 3_600_000,
+    }).rollOnce(SLOT + 3_600_000);
+
+    assert.equal(Number(argOf(args[1], "--roll-id")), SLOT, "the same name");
+    assert.ok(args[1].includes("--replace"), args[1].join(" "));
+  });
+
+  it("finishes a roll that completed but was not truncated, without rewriting its file", async () => {
+    // A writer killed between the delete and the record's removal used to
+    // leave an id its successor read as unfinished, and the successor then
+    // replaced a file whose rows were already durable.
+    record(sample({ ts: AUG_23 }), sample({ ts: AUG_23 + 1 }));
+    writeFileSync(
+      writerPaths(dir).pendingRoll,
+      JSON.stringify({ rollId: SLOT, maxRowid: 2, phase: "written" }),
+    );
+
+    const args: string[][] = [];
+    scheduler({
+      spawnRoll: (a) => {
+        args.push(a);
+        return succeeds()(a);
+      },
+    }).start();
+
+    assert.equal(store.rowCount(), 0, "the interrupted truncate is completed");
+    assert.equal(pendingFile(), null);
+    assert.match(logged.join("\n"), /had finished but not truncated/);
+    assert.equal(args.length, 0, "and nothing was rolled again");
+  });
+
+  it("ignores a pending record it cannot read, or one naming roll id 0", async () => {
+    // `nextRollAt` really can return 0 — for any clock set before the epoch —
+    // and the roll process rejects it, so adopting one wedged every future
+    // roll. A corrupt record must not be able to stop a device rolling.
+    for (const body of [
+      "not json",
+      '{"rollId":0,"maxRowid":1,"phase":"rolling"}',
+      "{}",
+    ]) {
+      writeFileSync(writerPaths(dir).pendingRoll, body);
+      record(sample({ ts: AUG_23 }));
+      const args: string[][] = [];
+      await scheduler({
+        spawnRoll: (a) => {
+          args.push(a);
+          return succeeds()(a);
+        },
+      }).rollOnce(SLOT);
+      assert.equal(store.rowCount(), 0, body);
+      assert.ok(!args[0].includes("--replace"), body);
+    }
+  });
 });
 
 describe("a roll that does not finish", () => {
-  it("leaves the hot store intact when the roll fails", async () => {
+  it("leaves the hot store intact and reports where an operator can see it", async () => {
     record(sample({ ts: AUG_23 }), sample({ ts: AUG_23 + 1 }));
     await scheduler({ spawnRoll: FAILS }).rollOnce(SLOT);
 
     assert.equal(store.rowCount(), 2);
-    assert.match(logged.join("\n"), /did not finish .*code 3.*2 rows stay/s);
+    // The message, not the last frame of the stack under it.
+    assert.match(errors.join("\n"), /boom: the roll could not finish/);
+    assert.match(errors.join("\n"), /2 rows stay in the hot store/);
+    assert.equal(logged.join("\n").includes("did not finish"), false);
+  });
+
+  it("survives a roll that cannot be spawned at all", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({ spawnRoll: UNSPAWNABLE }).rollOnce(SLOT);
+    assert.equal(store.rowCount(), 1);
+    assert.ok(errors.length > 0, "the failure has to be reported");
   });
 
   it("kills a roll that overruns and still does not truncate", async () => {
@@ -166,144 +324,122 @@ describe("a roll that does not finish", () => {
     await scheduler({ spawnRoll: HANGS, timeoutMs: 50 }).rollOnce(SLOT);
 
     assert.equal(store.rowCount(), 1);
-    assert.match(logged.join("\n"), /exceeded its timeout/);
+    assert.match(logged.concat(errors).join("\n"), /exceeded its timeout/);
   });
 
-  it("reuses the roll id after a failure, so the retry replaces the files", async () => {
-    // A roll that wrote its Parquet and then died leaves those rows in the
-    // tree and in the store. Reusing the id makes the retry overwrite what
-    // the first attempt wrote instead of adding a second copy beside it.
+  it("starts no second roll while one is in flight", async () => {
     record(sample({ ts: AUG_23 }));
-    const ids: string[] = [];
-    let clock = NOW;
-    const failing = scheduler({
-      now: () => clock,
-      spawnRoll: (args) => {
-        ids.push(args[args.indexOf("--roll-id") + 1]);
-        return FAILS([]);
-      },
-    });
-    await failing.rollOnce(SLOT);
-    // An hour later, which is a different slot and would be a different name.
-    clock = NOW + 3_600_000;
-    await failing.rollOnce(SLOT + 3_600_000);
-
-    assert.equal(ids.length, 2);
-    assert.equal(ids[0], ids[1]);
-  });
-
-  it("takes a fresh id once a roll has been truncated", async () => {
-    record(sample({ ts: AUG_23 }));
-    const ids: string[] = [];
-    let clock = NOW;
+    let spawned = 0;
     const rolls = scheduler({
+      spawnRoll: () => {
+        spawned += 1;
+        return HANGS();
+      },
+      timeoutMs: 200,
+    });
+    const first = rolls.rollOnce(SLOT);
+    await rolls.rollOnce(SLOT + 3_600_000);
+    assert.equal(spawned, 1, "the second call must not spawn");
+    await rolls.stop();
+    await first;
+    assert.equal(store.rowCount(), 1);
+  });
+});
+
+describe("the timer", () => {
+  /** A slot a few milliseconds away, so an armed timer fires in the test. */
+  const almostDue = (intervalMs: number): number =>
+    Math.floor(Date.now() / intervalMs) * intervalMs + intervalMs - 5;
+
+  it("names the roll after the slot it armed for, not the clock at fire time", async () => {
+    // `setTimeout` may fire a millisecond early. A slot re-read from the clock
+    // then names the PREVIOUS slot — the defect that destroyed 2.5M rows on a
+    // device, and the one every other test bypasses by passing the slot in.
+    record(sample({ ts: AUG_23 }));
+    const ids: number[] = [];
+    const clock = almostDue(60_000);
+    const rolls = scheduler({
+      intervalMinutes: 1,
       now: () => clock,
       spawnRoll: (args) => {
-        ids.push(args[args.indexOf("--roll-id") + 1]);
-        return SUCCEEDS([]);
+        ids.push(Number(argOf(args, "--roll-id")));
+        return succeeds()(args);
       },
     });
-    await rolls.rollOnce(SLOT);
-    record(sample({ ts: AUG_23 + 5 }));
-    clock = NOW + 3_600_000;
-    await rolls.rollOnce(SLOT + 3_600_000);
+    rolls.start();
+    await eventually(() => ids.length > 0, "the armed roll to fire");
+    await rolls.stop();
 
-    assert.equal(ids.length, 2);
-    assert.notEqual(ids[0], ids[1]);
+    assert.equal(ids[0], clock + 5, "the boundary the timer was armed for");
   });
-});
 
-describe("a roll left unfinished by a writer that died", () => {
-  it("is picked up by the next writer, which reuses its name", async () => {
-    // A SIGKILL or an OOM kill leaves the roll process running. If it
-    // finishes, it has written a file the successor knows nothing about, and
-    // a fresh id would put those rows in the tree twice.
-    record(sample({ ts: AUG_23 }));
-    const first = scheduler({ spawnRoll: FAILS });
-    const ids: string[] = [];
-    await first.rollOnce(SLOT);
-
-    // A new scheduler over the same data directory: a new writer process.
-    const successor = scheduler({
+  it("re-arms after a roll, so a device rolls more than once", async () => {
+    const ids: number[] = [];
+    let clock = almostDue(60_000);
+    // Recent, so the start-up backlog roll does not fire and supply the second
+    // id this test is asking the timer for.
+    record(sample({ ts: clock - 1000 }));
+    const rolls = scheduler({
+      intervalMinutes: 1,
+      now: () => clock,
       spawnRoll: (args) => {
-        ids.push(args[args.indexOf("--roll-id") + 1]);
-        return SUCCEEDS([]);
+        ids.push(Number(argOf(args, "--roll-id")));
+        // The summary is built here, from the bound the scheduler took.
+        const spawned = succeeds()(args);
+        // And this row arrives while the roll runs, as one does in production.
+        record(sample({ ts: clock + ids.length }));
+        clock += 60_000;
+        return spawned;
       },
-      now: () => NOW + 3_600_000,
     });
-    await successor.rollOnce(SLOT + 3_600_000);
+    rolls.start();
+    await eventually(() => ids.length >= 2, "a second roll");
+    await rolls.stop();
 
+    // Not asserting `errors` is empty: stop() kills whatever roll the third
+    // slot had already started, and that failure is the correct report.
+    assert.notEqual(ids[0], ids[1], "consecutive slots take different names");
+  });
+
+  it("rolls shortly after start when the store predates this process", async () => {
+    // A boat powered up at 08:10 and shut down at 08:55 crosses no hourly
+    // slot, so without this the store is never truncated on a short trip.
+    record(sample({ ts: NOW - 7_200_000 }));
+    const ids: number[] = [];
+    const rolls = scheduler({
+      startDelayMs: 5,
+      spawnRoll: (args) => {
+        ids.push(Number(argOf(args, "--roll-id")));
+        return succeeds()(args);
+      },
+    });
+    rolls.start();
+    await eventually(
+      () => store.rowCount() === 0,
+      "the backlog roll to finish",
+    );
+    await rolls.stop();
+
+    assert.match(logged.join("\n"), /older than one roll interval/);
     assert.equal(ids.length, 1);
-    assert.equal(Number(ids[0]), SLOT);
-    assert.match(logged.join("\n"), /left unfinished/);
   });
 
-  it("forgets the name once a roll has been truncated", async () => {
-    record(sample({ ts: AUG_23 }));
-    await scheduler().rollOnce(SLOT);
-    assert.ok(!existsSync(writerPaths(dir).pendingRoll));
-
-    record(sample({ ts: AUG_23 + 1 }));
-    const ids: string[] = [];
-    const later = scheduler({
+  it("does not roll at start when the store is within one interval", async () => {
+    record(sample({ ts: NOW - 60_000 }));
+    let spawned = 0;
+    const rolls = scheduler({
+      startDelayMs: 5,
       spawnRoll: (args) => {
-        ids.push(args[args.indexOf("--roll-id") + 1]);
-        return SUCCEEDS([]);
+        spawned += 1;
+        return succeeds()(args);
       },
-      now: () => NOW + 3_600_000,
     });
-    await later.rollOnce(SLOT + 3_600_000);
-    assert.equal(Number(ids[0]), SLOT + 3_600_000);
-  });
-
-  it("ignores a pending file it cannot read", async () => {
-    // A corrupt safeguard must not be able to stop a device rolling.
-    writeFileSync(writerPaths(dir).pendingRoll, "not json");
-    record(sample({ ts: AUG_23 }));
-    await scheduler().rollOnce(SLOT);
-    assert.equal(store.rowCount(), 0);
+    rolls.start();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await rolls.stop();
+    assert.equal(spawned, 0);
   });
 });
-
-describe(
-  "a roll that would land on a name already taken",
-  { skip: NO_BUNDLED_EXTENSION },
-  () => {
-    it("fails rather than replacing it, and truncates nothing", async () => {
-      // Only a retry may replace a file. A fresh roll handed an id that already
-      // has a file has been given the wrong slot, and writing it would replace
-      // that roll's rows with a fraction of them.
-      record(sample({ ts: AUG_23, path: "a.b" }));
-      const first = new RollScheduler({
-        store,
-        dataDir: dir,
-        intervalMinutes: 60,
-        log: (line) => logged.push(line),
-        now: () => NOW,
-      });
-      await first.rollOnce(SLOT);
-      assert.equal(store.rowCount(), 0);
-
-      record(sample({ ts: AUG_23 + 1, path: "c.d" }));
-      const second = new RollScheduler({
-        store,
-        dataDir: dir,
-        intervalMinutes: 60,
-        log: (line) => logged.push(line),
-        now: () => NOW,
-      });
-      // The same slot again: what an early-firing timer used to produce.
-      await second.rollOnce(SLOT);
-
-      assert.equal(store.rowCount(), 1, "nothing may be truncated");
-      assert.match(logged.join("\n"), /did not finish/);
-      assert.equal(
-        readParquetRows(join(dateDirectory(dir, AUG_23), `${SLOT}.parquet`)),
-        1,
-      );
-    });
-  },
-);
 
 describe("a failure inside the roll itself", () => {
   it("costs one roll, not the writer", async () => {
@@ -311,25 +447,25 @@ describe("a failure inside the roll itself", () => {
     // default and ends the process — so a hot store that could not be
     // truncated would stop recording rather than skip a roll.
     const exploding = {
+      oldestTimestamp: () => null,
       rollBound: () => {
         throw new Error("the store is unreadable");
       },
     } as unknown as HotStore;
-    // Five milliseconds before a one-minute slot, so the armed timer fires
-    // inside the test rather than a minute after it.
-    const almostDue = Math.floor(Date.now() / 60_000) * 60_000 + 60_000 - 5;
     const rolls = new RollScheduler({
       store: exploding,
       dataDir: dir,
       intervalMinutes: 1,
       log: (line) => logged.push(line),
-      now: () => almostDue,
+      onError: (line) => errors.push(line),
+      now: () => Math.floor(Date.now() / 60_000) * 60_000 + 60_000 - 5,
     });
     rolls.start();
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    await eventually(
+      () => errors.some((line) => /the store is unreadable/.test(line)),
+      "the failure to be reported",
+    );
     await rolls.stop();
-
-    assert.match(logged.join("\n"), /failed: the store is unreadable/);
   });
 });
 
@@ -338,9 +474,9 @@ describe("stopping", () => {
     record(sample({ ts: AUG_23 }));
     let spawned = 0;
     const rolls = scheduler({
-      spawnRoll: () => {
+      spawnRoll: (args) => {
         spawned += 1;
-        return SUCCEEDS([]);
+        return succeeds()(args);
       },
     });
     await rolls.stop();
@@ -353,8 +489,10 @@ describe("stopping", () => {
     record(sample({ ts: AUG_23 }));
     const rolls = scheduler({ spawnRoll: HANGS });
     const inFlight = rolls.rollOnce(SLOT);
-    // Let the child reach the event loop before stopping it.
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await eventually(
+      () => existsSync(writerPaths(dir).pendingRoll),
+      "the roll to start",
+    );
     await rolls.stop();
     await inFlight;
 
@@ -377,10 +515,12 @@ describe(
         dataDir: dir,
         intervalMinutes: 60,
         log: (line) => logged.push(line),
+        onError: (line) => errors.push(line),
         now: () => NOW,
       });
       await rolls.rollOnce(SLOT);
 
+      assert.deepEqual(errors, []);
       assert.equal(store.rowCount(), 0);
       assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), [
         `${SLOT}.parquet`,
@@ -388,6 +528,40 @@ describe(
       assert.match(
         logged.join("\n"),
         /2 rows to 2026-08-23 and 2 sidecar rows/,
+      );
+    });
+
+    it("survives a retry over its own half-written output", async () => {
+      // The composition the suite was missing: an attempt writes its Parquet,
+      // fails before reporting, and the retry replaces its own file.
+      record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+      await scheduler({
+        spawnRoll: (args) => {
+          // Runs the real roll to completion, then reports a failure anyway.
+          execFileSync(process.execPath, args, { timeout: 120_000 });
+          return FAILS();
+        },
+      }).rollOnce(SLOT);
+
+      assert.equal(store.rowCount(), 1, "nothing truncated");
+      assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), [
+        `${SLOT}.parquet`,
+      ]);
+
+      record(sample({ ts: AUG_23 + 2000, path: "c.d" }));
+      const errorsBefore = errors.length;
+      await scheduler({
+        spawnRoll: (args) =>
+          spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] }),
+        now: () => NOW + 3_600_000,
+      }).rollOnce(SLOT + 3_600_000);
+
+      assert.equal(errors.length, errorsBefore, errors.join("\n"));
+      assert.equal(store.rowCount(), 0);
+      assert.deepEqual(
+        readdirSync(dateDirectory(dir, AUG_23)),
+        [`${SLOT}.parquet`],
+        "one file, replaced rather than joined by a second",
       );
     });
   },

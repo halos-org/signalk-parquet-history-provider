@@ -1,13 +1,19 @@
-import { closeSync, fsyncSync, openSync, renameSync } from "node:fs";
+import {
+  closeSync,
+  fchmodSync,
+  fsyncSync,
+  openSync,
+  renameSync,
+} from "node:fs";
 import { dirname } from "node:path";
 
 /**
  * Making a file appear, completely or not at all.
  *
  * Nothing here imports a storage engine, so both the extension resolver and
- * the roll can use it. It is one primitive with one subtlety — a rename is
- * atomic against a concurrent reader and says nothing about what reached the
- * disk — and two copies of that subtlety is one too many.
+ * the roll can use it. `syncDirectory` is shared by both; `commitFile` is for
+ * callers that do not already hold the write handle — the extension resolver
+ * does, and fsyncs it inline while it still has it.
  */
 
 /**
@@ -24,9 +30,12 @@ export function syncDirectory(directory: string): void {
     } finally {
       closeSync(fd);
     }
-  } catch {
-    // See above: a platform that refuses this is one where there is nothing
-    // to do about it.
+  } catch (err) {
+    // Only the platform's refusal is expected. Anything else — the directory
+    // is gone, or unreadable — means the rename this was meant to make
+    // durable is in doubt, and swallowing that would hide it.
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EINVAL" && code !== "EACCES" && code !== "EPERM") throw err;
   }
 }
 
@@ -41,6 +50,12 @@ export function syncDirectory(directory: string): void {
 export function commitFile(temp: string, final: string): void {
   const fd = openSync(temp, "r");
   try {
+    // 0600, like the pid file and the pending-roll record. DuckDB creates its
+    // output at 0666 & ~umask, which is 0644 by default — and the tree holds
+    // the vessel's position history. The 0700 directory above it is the only
+    // other protection, and that does not survive a copy or a filesystem
+    // without modes.
+    fchmodSync(fd, 0o600);
     fsyncSync(fd);
   } finally {
     closeSync(fd);

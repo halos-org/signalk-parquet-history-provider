@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { DuckDBInstance } from "@duckdb/node-api";
 import type { DuckDBConnection } from "@duckdb/node-api";
@@ -32,6 +39,21 @@ import {
  * timestamp names, so a roll spanning midnight writes two files and both are
  * correct.
  */
+
+/**
+ * The roll's name is already taken by a roll that is not this one.
+ *
+ * Its own class because the scheduler has to tell this failure from every
+ * other: a retry inherits the failed attempt's id so it can replace its own
+ * half-written output, and inheriting it for *this* failure turns the refusal
+ * into permission one slot later.
+ */
+export class NameTakenError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NameTakenError";
+  }
+}
 
 /** Milliseconds in a UTC day. The date directory is cut on these. */
 const DAY_MS = 86_400_000;
@@ -101,10 +123,20 @@ export async function roll(options: RollOptions): Promise<RollResult> {
     throw new Error(`${maxRowid} is not a rowid to roll through`);
   }
 
-  // 0700 like everything else under the data directory: a spill holds the
-  // same rows the hot store does, and mkdir's mode is masked by umask, so the
-  // roll re-creating this after removing it must ask for the mode explicitly.
-  const scratch = join(dataDir, DATA_LAYOUT.scratch);
+  // Per roll, never the shared root. Two rolls can overlap — an orphan left
+  // by a killed writer and its successor — and a `finally` that removed the
+  // root would delete the other's live spill. The root is also a directory an
+  // operator's data directory may already have had: `tmp` is the most
+  // conventional name there is, and removing it recursively on a schedule is
+  // not something this package may do to a path it did not create.
+  //
+  // 0700 like everything else under the data directory: a spill holds the same
+  // rows the hot store does, and mkdir's mode is masked by umask, so the mode
+  // has to be asked for explicitly.
+  const scratchRoot = join(dataDir, DATA_LAYOUT.scratch);
+  mkdirSync(scratchRoot, { recursive: true, mode: DATA_DIR_MODE });
+  sweepStaleScratch(scratchRoot);
+  const scratch = join(scratchRoot, `${rollId}-${process.pid}`);
   mkdirSync(scratch, { recursive: true, mode: DATA_DIR_MODE });
 
   const instance = await DuckDBInstance.create(":memory:", {
@@ -152,8 +184,9 @@ export async function roll(options: RollOptions): Promise<RollResult> {
   } finally {
     connection.closeSync();
     instance.closeSync();
-    // This directory is one roll's alone. Left behind, a device that rolls
-    // every hour accumulates one per roll.
+    // This directory is this roll's alone, which is what makes removing it
+    // safe. A roll killed by a signal never reaches here, so the sweep at the
+    // top is what eventually collects those.
     rmSync(scratch, { recursive: true, force: true });
   }
 }
@@ -193,7 +226,7 @@ async function writeDay(args: {
   const temp = rollTempFile(dataDir, from, rollId);
   const final = rollFile(dataDir, from, rollId);
   if (!replace && existsSync(final)) {
-    throw new Error(
+    throw new NameTakenError(
       `${final} already exists and this roll is not a retry. Overwriting it ` +
         `would replace an earlier roll's rows with a subset of them.`,
     );
@@ -249,15 +282,42 @@ async function writeSidecar(args: {
 
   // `read_parquet` on a missing file is an error rather than an empty
   // relation, so the first roll on a device has to ask for something else.
-  const previous = existsSync(final)
-    ? ` UNION ALL SELECT ${COLUMN_LIST} FROM read_parquet('${sqlLiteral(final)}')`
-    : "";
-  const sources = `SELECT ${COLUMN_LIST} FROM hot.sample WHERE rowid <= ${maxRowid}${previous}`;
-  await connection.run(
-    `COPY (SELECT DISTINCT ON (context, path) ${COLUMN_LIST} FROM (${sources}) ` +
-      `ORDER BY context, path, ts DESC) ` +
-      `TO '${sqlLiteral(temp)}' (FORMAT parquet, COMPRESSION zstd)`,
-  );
+  // `union_by_name` so a sidecar written by a build with a different column
+  // set is folded in rather than failing — the alternative is that adding a
+  // column stops every roll on every device until someone deletes this file.
+  const fold = (): string =>
+    ` UNION ALL BY NAME SELECT ${COLUMN_LIST} FROM read_parquet('${sqlLiteral(final)}', union_by_name = true)`;
+  const write = async (previous: string): Promise<void> => {
+    const sources = `SELECT ${COLUMN_LIST} FROM hot.sample WHERE rowid <= ${maxRowid}${previous}`;
+    await connection.run(
+      `COPY (SELECT DISTINCT ON (context, path) ${COLUMN_LIST} FROM (${sources}) ` +
+        `ORDER BY context, path, ts DESC) ` +
+        `TO '${sqlLiteral(temp)}' (FORMAT parquet, COMPRESSION zstd)`,
+    );
+  };
+
+  if (existsSync(final)) {
+    try {
+      await write(fold());
+    } catch (err) {
+      // A file that exists and cannot be read would otherwise throw here on
+      // every roll for ever, and nothing else regenerates it — so the store
+      // would never be truncated again. Flash media that acknowledges a flush
+      // without writing produces exactly this after a power cut. The bad file
+      // is kept for whoever is diagnosing the device, and the sidecar is
+      // rebuilt from this roll's own window.
+      const quarantine = `${final}.unreadable`;
+      rmSync(quarantine, { force: true });
+      renameSync(final, quarantine);
+      process.stderr.write(
+        `the sidecar at ${final} could not be read (${err instanceof Error ? err.message.split("\n")[0] : String(err)}); ` +
+          `moved to ${quarantine} and rebuilt from this roll\n`,
+      );
+      await write("");
+    }
+  } else {
+    await write("");
+  }
   commitFile(temp, final);
 
   const counted = await connection.runAndReadAll(
@@ -265,6 +325,33 @@ async function writeSidecar(args: {
   );
   return Number(counted.getRowsJS()[0][0]);
 }
+
+/**
+ * Remove scratch directories a killed roll left behind.
+ *
+ * A roll dies at default disposition on SIGTERM, so its `finally` never runs
+ * and its spill — which is backlog-sized — stays. Age is what makes this safe
+ * against a concurrent roll: nothing legitimate is older than the timeout that
+ * would have killed it.
+ */
+function sweepStaleScratch(root: string): void {
+  const cutoff = Date.now() - STALE_SCRATCH_MS;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const path = join(root, entry.name);
+    try {
+      if (statSync(path).mtimeMs > cutoff) continue;
+      rmSync(path, { recursive: true, force: true });
+    } catch {
+      /* another roll swept it, or it is being written right now */
+    }
+  }
+}
+
+/** How long a scratch directory must sit untouched before it counts as an
+ * orphan. Comfortably past the roll timeout that would have killed its
+ * owner. */
+const STALE_SCRATCH_MS = 60 * 60_000;
 
 /**
  * Single-quoted SQL literal. Every path here is composed from the configured
