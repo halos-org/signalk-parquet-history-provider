@@ -300,21 +300,26 @@ one-day column brackets. And nothing here measured aggregation, so Unit 5b's
 resolution ladder — which runs inside a roll process whose peak this document
 reports — is unpriced.
 
-## What this changes in later units
+## What the layout requires of whatever reads and writes it
 
-- **Unit 3b** loses `src/roll/partitioning.ts` and most of
-  `src/roll/path-guard.ts`. No delta-supplied string becomes a directory name,
-  so the guard shrinks to the date segment the roll generates itself. Its
-  "a roll spanning a partition boundary" test becomes a UTC date boundary, and
-  "paths producing no rows create no empty partitions" no longer applies.
-- **Unit 3b** writes the sidecar, and reads the previous one to do it.
-- **Unit 4a** reads a tree of dated directories holding one file per roll, and
-  its file selection is a date-directory glob plus a timestamp filter — not hive
-  partition pruning on `path`.
-- **Unit 3b** moves the one-shot peak measurement into `src/bench/`. The harness
-  measures running subjects over settled windows and has nothing that reads a
-  short-lived process's `VmHWM` at exit, which is the only quantity a roll has.
-- **Unit 5a** expires whole files by their roll window, and can drop a whole
-  date directory when the retention boundary falls on one. Whether retention is
-  a storage bound or a deletion guarantee is still that unit's to state: a roll
-  file holds an hour, so the boundary is an hour wide.
+These are properties of the tree, not a work plan; the unit issues carry the
+task assignments.
+
+- **Nothing untrusted becomes a path.** Contexts and paths are columns. Only the
+  roll's own UTC date is a directory.
+- **The interval must divide 1,440 minutes and align to UTC midnight.** A value
+  that does not — `rollIntervalMinutes` accepts one today, since
+  `src/config/schema.ts` normalizes it with `positive()` alone — puts one roll's
+  rows in two date directories.
+- **Selection is by date directory and timestamp, not by partition pruning.** A
+  reader narrows to files with a directory glob and a `ts` filter; nothing in
+  the tree prunes on `path`.
+- **Expiry drops whole files by their roll window**, and a whole date directory
+  when the retention boundary falls on one. A roll file holds an interval, so
+  the boundary is an interval wide — whether that makes retention a storage
+  bound or a deletion guarantee is for the unit that ships it to state.
+- **The sidecar is read as well as written.** Each roll folds the previous one
+  in, so it is an input to the roll that produces it.
+- **A roll's peak needs a measurement the harness does not have.** `src/bench/`
+  measures running subjects over settled windows; a roll's only quantity is
+  `VmHWM` at exit.
