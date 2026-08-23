@@ -13,3 +13,7 @@ extensions/
 
 # Worktrees live at <repo>/.worktrees/<branch>, per the workspace convention.
 .worktrees/
+
+# Production dependency staging for ./run deploy-halos, one tree per target
+# platform triple. Rebuilt from package.json on every deploy.
+.deploy/
