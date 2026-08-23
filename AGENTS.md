@@ -92,6 +92,11 @@ a check on module evaluation alone.
 
 - `src/bench/` — the measurement harness. Every unit that reports a number
   reports it through this, so figures stay comparable.
+- `docs/layout-decision.md` — what the roll writes, how often, and why: one
+  Parquet file per roll under a dated directory, no path partitioning, no
+  compaction pass, plus a last-value sidecar. Read it before touching the roll
+  or the reader; the measurements behind each choice are in it, and so is what
+  would reopen one.
 
 ## The writer
 
