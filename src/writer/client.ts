@@ -15,7 +15,12 @@ import type { FlushBuffer } from "../flush-buffer.js";
  */
 
 const DEFAULTS = {
-  initialReconnectDelayMs: 1000,
+  // Short, because the writer is a child process the plugin has just spawned
+  // and the first connect routinely beats its listen by a few hundred
+  // milliseconds. A second of backoff there is a second of every start spent
+  // buffering for no reason. It doubles from here, so a writer that is really
+  // gone still backs off to the maximum quickly.
+  initialReconnectDelayMs: 250,
   maxReconnectDelayMs: 30_000,
   /**
    * A connection that closes sooner than this never carried useful data. It is
@@ -174,6 +179,12 @@ export class WriterClient {
 
     socket.on("close", () => {
       const wasStable = this.connected && this.stableTimer === null;
+      // A connect that never succeeded is not a flap: nothing was established
+      // to drop. Both still grow the backoff and both still count towards the
+      // unhealthy report -- a writer that never appears is the case most worth
+      // surfacing -- but calling an unreachable socket a flap sends whoever
+      // reads the log looking for the wrong fault.
+      const everConnected = this.connected;
       const upForMs = this.connectedAt
         ? this.options.now() - this.connectedAt
         : 0;
@@ -191,7 +202,9 @@ export class WriterClient {
           this.options.timing.maxReconnectDelayMs,
         );
         this.options.log(
-          `writer connection dropped after ${upForMs}ms (flap ${this.consecutiveFlaps}), retrying in ${this.reconnectDelay}ms`,
+          everConnected
+            ? `writer connection dropped after ${upForMs}ms (drop ${this.consecutiveFlaps}), retrying in ${this.reconnectDelay}ms`
+            : `writer not reachable at ${this.options.socketPath} (attempt ${this.consecutiveFlaps}), retrying in ${this.reconnectDelay}ms`,
         );
         if (this.consecutiveFlaps >= this.options.timing.unhealthyAfterFlaps) {
           this.markUnhealthy();
@@ -324,7 +337,7 @@ export class WriterClient {
     const dropped = this.options.buffer.dropped;
     this.options.onUnhealthy(
       reason ??
-        `the writer connection has dropped ${this.consecutiveFlaps} times in a row` +
+        `the writer connection has failed ${this.consecutiveFlaps} times in a row` +
           (dropped > 0 ? `; ${dropped} samples dropped so far` : ""),
     );
   }

@@ -187,6 +187,31 @@ describe("when the writer is not there", () => {
     await eventually(() => store.rowCount() === 4, "the backlog to drain");
   });
 
+  it("does not call an unreachable writer a dropped connection", async () => {
+    // Nothing was established, so nothing dropped. Both grow the backoff and
+    // both count towards the unhealthy report, but the log line has to send
+    // whoever reads it after the right fault.
+    const lines: string[] = [];
+    const buffer = newBuffer();
+    client = new WriterClient({
+      socketPath,
+      session: "s1",
+      buffer,
+      log: (line) => lines.push(line),
+      timing: { initialReconnectDelayMs: 5, maxReconnectDelayMs: 20 },
+    });
+    client.start();
+
+    await eventually(
+      () => lines.some((line) => /not reachable at/.test(line)),
+      "an unreachable report",
+    );
+    assert.ok(
+      !lines.some((line) => /connection dropped/.test(line)),
+      `nothing was connected, so nothing dropped: ${JSON.stringify(lines)}`,
+    );
+  });
+
   it("says so after repeated instant drops instead of staying green", async () => {
     const unhealthy: string[] = [];
     const buffer = newBuffer();
@@ -204,7 +229,7 @@ describe("when the writer is not there", () => {
     client.start();
 
     await eventually(() => unhealthy.length > 0, "an unhealthy report");
-    assert.match(unhealthy[0], /dropped \d+ times in a row/);
+    assert.match(unhealthy[0], /failed \d+ times in a row/);
     assert.ok(client.stats.consecutiveFlaps >= 3);
   });
 
