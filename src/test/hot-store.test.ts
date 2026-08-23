@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { HotStore } from "../writer/hot-store.js";
+import { HotStore, LAYOUT_VERSION } from "../writer/hot-store.js";
 import type { Sample } from "../writer/protocol.js";
 
 function sample(over: Partial<Sample> = {}): Sample {
@@ -284,9 +284,23 @@ describe("an abruptly killed writer", () => {
 
     return new Promise<void>((resolve, reject) => {
       let seen = "";
+      let killed = false;
+      // Without this the promise settles only from inside the stdout handler,
+      // so a child that dies before printing -- node:sqlite failing to load,
+      // say -- hangs the suite instead of failing it.
+      victim.on("exit", (code, signal) => {
+        if (!killed) {
+          reject(
+            new Error(
+              `the child exited before committing (${code ?? signal}): ${seen}`,
+            ),
+          );
+        }
+      });
       victim.stdout.on("data", (chunk: Buffer) => {
         seen += chunk.toString();
-        if (!seen.includes("committed")) return;
+        if (killed || !seen.includes("committed")) return;
+        killed = true;
         victim.kill("SIGKILL");
         victim.on("exit", () => {
           try {
@@ -305,6 +319,29 @@ describe("an abruptly killed writer", () => {
       });
       victim.on("error", reject);
     });
+  });
+});
+
+describe("a store this build does not understand", () => {
+  it("is refused rather than adopted", () => {
+    // CREATE TABLE IF NOT EXISTS accepts whatever table already carries the
+    // name, so without a marker a store written by a different build is used:
+    // a dropped column surfaces as "writer exited (code 1)" and a changed
+    // CHECK not until a row hits it.
+    store.close();
+    const db = new DatabaseSync(join(dir, "hot.sqlite"));
+    db.exec("PRAGMA user_version = 99");
+    db.close();
+
+    assert.throws(
+      () => HotStore.open(join(dir, "hot.sqlite")),
+      /layout version 99/,
+    );
+    store = HotStore.open(join(dir, "other.sqlite"));
+  });
+
+  it("stamps a fresh store with the version it writes", () => {
+    assert.strictEqual(store.pragma("user_version"), LAYOUT_VERSION);
   });
 });
 

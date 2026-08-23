@@ -50,8 +50,8 @@ export function routeDeltaValue(path: string, value: unknown): DeltaRoute {
     return Number.isFinite(value) ? "number" : null;
   if (typeof value === "string") return "string";
   // Booleans are everywhere in Signal K — switch and relay states, pump and
-  // valve states, autopilot flags — and used to fall through to null, so a
-  // whole class of history was dropped without a trace. They are recorded as
+  // valve states, autopilot flags — and are a class of history worth keeping
+  // rather than dropping for want of a column. They are recorded as
   // the text "true"/"false" under `value_kind = 'boolean'` rather than as 1
   // and 0: a 1.0 double cannot be told apart from a real numeric channel, and
   // the kind tag is what lets a replayed boolean come back a boolean instead

@@ -28,9 +28,24 @@ export const HEADER_BYTES = 4;
  */
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 
-/** The kinds a recorded value can have. Mirrors `value_kind` in the hot store. */
-export type ValueKind =
-  "number" | "string" | "boolean" | "position" | "identity";
+/**
+ * The kinds a recorded value can have — the single declaration of the set.
+ *
+ * `Sample`'s variants and the hot store's CHECK constraint are both built from
+ * this, so adding a kind is one edit that fails the build wherever it was not
+ * handled. Spelled out separately in each place, the copy carrying the name
+ * was the one nothing consulted, and a new kind would have surfaced as a
+ * constraint failure inside a transaction on a device.
+ */
+export const VALUE_KINDS = [
+  "number",
+  "string",
+  "boolean",
+  "position",
+  "identity",
+] as const;
+
+export type ValueKind = (typeof VALUE_KINDS)[number];
 
 export interface Position {
   latitude: number;
@@ -56,9 +71,12 @@ interface SampleBase {
  * makes them booleans again.
  */
 export type Sample =
-  | (SampleBase & { kind: "number"; value: number })
-  | (SampleBase & { kind: "string" | "boolean" | "identity"; value: string })
-  | (SampleBase & { kind: "position"; value: Position });
+  | (SampleBase & { kind: Extract<ValueKind, "number">; value: number })
+  | (SampleBase & {
+      kind: Extract<ValueKind, "string" | "boolean" | "identity">;
+      value: string;
+    })
+  | (SampleBase & { kind: Extract<ValueKind, "position">; value: Position });
 
 /**
  * Identifies one run of the plugin, so the writer knows whose sequence

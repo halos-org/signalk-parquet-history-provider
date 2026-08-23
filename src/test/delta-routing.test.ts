@@ -66,8 +66,7 @@ describe("routeDeltaValue", () => {
   });
 
   it("flattens objects that are not a usable position", () => {
-    // These used to return null and be dropped without a trace
-    // (dirkwa/signalk-questdb#128).
+    // A boolean is a recordable value, not an absence.
     // A half-position is not a track point, but its scalar leaves are still
     // real readings, so they are recorded as dotted paths like anything else.
     assert.strictEqual(
@@ -91,8 +90,8 @@ describe("routeDeltaValue", () => {
       { latitude: 52.5, longitude: Infinity },
     ]) {
       // Asserts "flatten", not merely "not position": the weaker form would
-      // also pass if these regressed to being dropped entirely, which is the
-      // bug this whole change exists to fix.
+      // also pass if these were dropped entirely, which is the outcome that
+      // matters.
       assert.strictEqual(
         routeDeltaValue("navigation.position", value),
         "flatten",

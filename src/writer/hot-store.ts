@@ -1,5 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import type { StatementSync } from "node:sqlite";
+import { VALUE_KINDS } from "./protocol.js";
 import type { Sample } from "./protocol.js";
 
 /**
@@ -20,6 +21,18 @@ import type { Sample } from "./protocol.js";
  * the reader. The process writing this store is reading a socket, and a CHECK
  * is the last place a kind nobody planned for can be stopped.
  */
+/**
+ * What this build writes. Bumped when the shape of `sample` changes.
+ *
+ * `CREATE TABLE IF NOT EXISTS` adopts whatever table already carries the name,
+ * so without a marker a store written by a different build is used rather than
+ * refused — a dropped column surfaces as "writer exited (code 1)" and a
+ * changed CHECK not until a row hits it.
+ */
+export const LAYOUT_VERSION = 1;
+
+const KIND_CHECK = VALUE_KINDS.map((kind) => `'${kind}'`).join(",");
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS sample (
   ts         INTEGER NOT NULL,
@@ -27,7 +40,7 @@ CREATE TABLE IF NOT EXISTS sample (
   path       TEXT    NOT NULL,
   source     TEXT,
   value_kind TEXT    NOT NULL
-             CHECK (value_kind IN ('number','string','boolean','position','identity')),
+             CHECK (value_kind IN (${KIND_CHECK})),
   value_num  REAL,
   value_str  TEXT,
   value_lat  REAL,
@@ -76,7 +89,22 @@ export class HotStore {
     // signalk-parquet 35 KB of writes per 337-byte row.
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA synchronous = NORMAL");
+
+    // Refuse a store this build does not understand, rather than adopting it.
+    // A fresh file reports 0 and is stamped; anything else must match.
+    const row = db.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    const existing = row.user_version;
+    if (existing !== 0 && existing !== LAYOUT_VERSION) {
+      db.close();
+      throw new Error(
+        `the hot store at ${path} has layout version ${existing}; this build writes ${LAYOUT_VERSION}`,
+      );
+    }
+
     db.exec(SCHEMA);
+    if (existing === 0) db.exec(`PRAGMA user_version = ${LAYOUT_VERSION}`);
     return new HotStore(db);
   }
 

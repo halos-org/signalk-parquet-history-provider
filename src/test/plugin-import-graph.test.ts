@@ -107,7 +107,7 @@ describe("the plugin's import graph", () => {
     );
   });
 
-  it("loads no DuckDB native library when a real process starts it", () => {
+  it("loads no DuckDB library when a real process starts and runs it", () => {
     // The static walk covers this package's own files. This covers everything
     // else — a dependency that pulls the addon in transitively would map it
     // just the same.
@@ -117,23 +117,36 @@ describe("the plugin's import graph", () => {
     // directory, exactly as the server would.
     const work = mkdtempSync(join(tmpdir(), "sk-parquet-probe-"));
     const probe = [
-      `import { mkdtempSync } from "node:fs";`,
       `const factory = (await import(${JSON.stringify(pathToFileURL(ENTRY).href)})).default;`,
+      `const failures = [];`,
+      `let handler = null;`,
       `const app = {`,
-      `  debug() {}, error() {},`,
-      `  setPluginStatus() {}, setPluginError() {},`,
+      `  debug() {}, error(...a) { failures.push(String(a[0])); },`,
+      `  setPluginStatus() {}, setPluginError(m) { failures.push(m); },`,
       `  getDataDirPath: () => ${JSON.stringify(work)},`,
       `  selfContext: "vessels.self",`,
+      // The stub the plugin actually needs. Without it start() threw at
+      // app.streambundle.getBus(), index.ts swallowed the throw into these
+      // no-op reporters, and the probe then measured a plugin that had bailed
+      // before doing anything -- passing for the wrong reason.
+      `  streambundle: { getBus: () => ({ onValue: (fn) => { handler = fn; return () => {}; } }) },`,
       `};`,
       `const plugin = factory(app);`,
       // Awaited: if start() ever becomes async and loads the engine lazily --
       // the case this test exists for -- an un-awaited call leaves the import
       // pending when the report is taken, and the probe reports nothing.
-      `await plugin.start({});`,
+      `await plugin.start({ defaultSamplingRate: 0 });`,
+      // Drive a delta through the real handler, so a lazy load on the
+      // per-sample path is reached too.
+      `handler?.({ context: "vessels.self", path: "a.b", value: 1, $source: "x" });`,
       `await plugin.stop?.();`,
+      // DuckDB only. node:sqlite is compiled into the Node binary rather than
+      // loaded as a shared object, and the host's own libsqlite3 is mapped by
+      // every process on macOS -- so this report cannot tell our use from the
+      // operating system's. The static walk above is what covers node:sqlite.
       `const loaded = process.report.getReport().sharedObjects`,
       `  .filter((p) => /duckdb/i.test(p));`,
-      `console.log(JSON.stringify(loaded));`,
+      `console.log(JSON.stringify({ loaded, failures, subscribed: handler !== null }));`,
     ].join("\n");
     try {
       const output = execFileSync(
@@ -144,7 +157,24 @@ describe("the plugin's import graph", () => {
         // cost a CI run.
         { encoding: "utf8", timeout: 30_000 },
       );
-      assert.deepEqual(JSON.parse(output.trim()), []);
+      const result = JSON.parse(output.trim()) as {
+        loaded: string[];
+        failures: string[];
+        subscribed: boolean;
+      };
+      // Assert the plugin got far enough to be worth measuring, before
+      // measuring. Without this the whole check passes on a start that threw.
+      assert.deepEqual(
+        result.failures,
+        [],
+        "the plugin reported a failure, so the probe measured an aborted start",
+      );
+      assert.equal(
+        result.subscribed,
+        true,
+        "the plugin never subscribed, so nothing after that line ran",
+      );
+      assert.deepEqual(result.loaded, []);
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
