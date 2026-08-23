@@ -91,11 +91,17 @@ a check on module evaluation alone.
   the resolver only finds and expands its binary.
 - `src/roll/` — the roll. `main.ts` is the process the writer spawns, `roll.ts`
   the work it does, `schedule.ts` the every-N-minutes-from-UTC-midnight grid,
-  `tree-path.ts` the tree's paths. **`roll.ts` is the only file in the package
-  that imports `@duckdb/node-api`**, and it may because everything importing it
-  runs in a process that exits. The rule is not "one directory owns the
-  engine"; it is that the engine may never be reachable from `src/index.ts` or
-  from `src/writer/`, both of which run for as long as recording does.
+  `tree-path.ts` the tree's paths. **`roll.ts` and `query/reader.ts` are the
+  only two files in the package that import `@duckdb/node-api`**, and they may
+  because everything importing either runs in a process that exits. The rule is
+  not "one directory owns the engine"; it is that the engine may never be
+  reachable from `src/index.ts` or from `src/writer/`, both of which run for as
+  long as recording does.
+- `src/query/` — reading. `duck.ts` is the side that runs inside the Signal K
+  process: it spawns, caps concurrency and enforces the deadline, and it
+  imports no engine. `main.ts` is the spawned process, `reader.ts` the work it
+  does — file selection, the seam, and one statement. Like the roll, the
+  engine may be here because the process exits.
 - `src/durable-write.ts` — fsync, rename, fsync the directory. Shared so the
   order exists once.
 
@@ -106,6 +112,10 @@ a check on module evaluation alone.
   compaction pass, plus a last-value sidecar. Read it before touching the roll
   or the reader; the measurements behind each choice are in it, and so is what
   would reopen one.
+- `docs/query-layer.md` — what a query costs, measured through the shipped
+  reader: the ~345 ms floor a spawned process pays before reading a row, the
+  layout decision re-checked against it, and what may overlap with what. Read
+  it before changing anything about how a query is executed.
 
 ## The writer
 
@@ -181,6 +191,30 @@ this package's path cardinality, while a sort costs three times the memory of
 the whole rest of the roll. Each file is fsynced under a `.tmp` name and
 renamed; the suffix is the whole mechanism that keeps a killed roll from
 leaving something a `*.parquet` glob reads as finished.
+
+## The query
+
+One process per request, spawned by the plugin, and it exits with the answer.
+**One request compiles to one statement**: the sibling provider issues a query
+per pathSpec, which is free against a running server and costs a whole process
+start here — measured at ~265 ms before a row is read, and ~345 ms when the
+hot store has to be attached.
+
+Two may run at once and eight may wait; past that a request is refused rather
+than queued behind requests that will not be served in time either. The
+deadline covers the wait as well as the work.
+
+A query subtracts the rows a completed roll has put in the tree and the writer
+has not yet deleted, rather than deduplicating the answer. It lists the tree's
+files first and the pending-roll record second, and excludes only the days
+whose file for that roll is on disk — the order is what keeps the race from
+turning a duplicate into a gap. `docs/query-layer.md` has the reasoning and
+the numbers.
+
+The engine is confined before the statement runs: `lockDownFileAccess` sets
+`allowed_directories` to the data directory, turns external access off — which
+is what makes the allowlist mean anything, and was not obvious — and locks the
+configuration. Everything legitimate must be loaded and attached first.
 
 ## Conventions
 

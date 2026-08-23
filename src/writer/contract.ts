@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_LAYOUT } from "../data-dir.js";
 
@@ -73,4 +74,47 @@ export function writerPaths(dataDir: string): {
     // pid some unrelated live process.
     rollSocket: join(hot, "roll.sock"),
   };
+}
+
+/**
+ * What one roll attempt was doing, durable across a writer's death.
+ *
+ * `rolling`: files may exist under this id and nothing is truncated — a retry
+ * owns them. `written`: the roll finished and only the truncate is
+ * outstanding.
+ *
+ * Two processes read this and only the writer writes it. The scheduler decides
+ * whether a retry may replace a file; a query decides which of the store's
+ * rows the tree already holds, and so must not be counted twice.
+ */
+export interface PendingRoll {
+  rollId: number;
+  maxRowid: number;
+  phase: "rolling" | "written";
+}
+
+export function readPendingRoll(dataDir: string): PendingRoll | null {
+  try {
+    const raw = JSON.parse(
+      readFileSync(writerPaths(dataDir).pendingRoll, "utf8"),
+    ) as Partial<PendingRoll>;
+    // `>= 1`, matching what the roll process accepts. Accepting 0 here made a
+    // `{"rollId":0}` file wedge every future roll: the scheduler adopted it
+    // and the roll refused it, for ever. `nextRollAt` really can return 0 —
+    // for any clock set before the epoch.
+    if (
+      !Number.isSafeInteger(raw.rollId) ||
+      (raw.rollId as number) < 1 ||
+      !Number.isSafeInteger(raw.maxRowid) ||
+      (raw.maxRowid as number) < 1 ||
+      (raw.phase !== "rolling" && raw.phase !== "written")
+    ) {
+      return null;
+    }
+    return raw as PendingRoll;
+  } catch {
+    // Absent is the normal case. Unreadable is treated the same way on
+    // purpose: a corrupt file must not be able to stop a device rolling.
+    return null;
+  }
 }
