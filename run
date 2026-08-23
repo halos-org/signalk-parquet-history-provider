@@ -1,0 +1,494 @@
+#!/usr/bin/env bash
+#
+# usage: ./run command [argument ...]
+#
+# Commands for signalk-parquet-history-provider development.
+#
+
+set -o nounset
+set -o pipefail
+set -o errexit
+
+PROJECT_ROOT=${0%/*}
+if [[ $0 != $PROJECT_ROOT && $PROJECT_ROOT != "" ]]; then
+  cd "$PROJECT_ROOT"
+fi
+readonly PROJECT_ROOT=$(pwd)
+
+################################################################################
+# Development Commands
+
+function build {
+  #@ Compile to dist/ and check the bundled extensions match
+  #@ Category: Build
+  npm run build
+}
+
+function test {
+  #@ Build, then run the test suites
+  #@ Category: Testing
+  npm run build:all
+}
+
+function lint {
+  #@ Check formatting and lint, without fixing
+  #@ Category: Testing
+  npm run ci-lint
+}
+
+function format {
+  #@ Apply prettier and eslint fixes
+  #@ Category: Testing
+  npm run format
+}
+
+function ci {
+  #@ Everything CI runs, in CI's order
+  #@ Category: Testing
+  if [ -f package-lock.json ]; then npm ci; else npm install; fi
+  npm run ci-lint
+  npm run build:all
+}
+
+################################################################################
+# DuckDB extensions
+
+function fetch-extensions {
+  #@ Download the bundled DuckDB extensions (default: the published set)
+  #@ Category: DuckDB
+  # Compiles with tsc directly rather than `npm run build`, which also runs the
+  # bundled-extension gate. That gate fails on a stale or mismatched
+  # extensions/ directory -- exactly the state this command exists to repair --
+  # so going through it would refuse to run the fix and name itself as the fix.
+  npx tsc
+  node tools/fetch-extensions.mjs "$@"
+}
+
+function check-extension {
+  #@ Prove this machine reads a SQLite hot store with DuckDB, offline
+  #@ Category: DuckDB
+  npm run build
+  node dist/duckdb/check-extension.js "$@"
+}
+
+################################################################################
+# Measurement
+
+function bench {
+  #@ Run the measurement harness (run|compare|selftest)
+  #@ Category: Measurement
+  npm run build
+  node dist/bench/cli.js "$@"
+}
+
+################################################################################
+# Deploy
+
+function deploy-halos {
+  #@ Build locally and install onto a HaLOS device's Signal K
+  #@ Category: Deploy
+  local target=${1:-}
+  if [[ -z "$target" ]]; then
+    cat <<'USAGE'
+Usage: ./run deploy-halos <target_host|local>
+
+Builds dist/, stages the package's production dependencies for the target's
+own platform, and installs the result into the device's Signal K data volume
+as a declared file: dependency. Declaring it is what stops a later
+`npm install` -- adding some other plugin, say -- from pruning it as
+extraneous, which is what happens to a bare copy into node_modules.
+
+The build and the dependency install both run on the machine you invoke this
+from, so keep that a dev host. Nothing is compiled or downloaded on the device.
+
+Examples:
+  ./run deploy-halos halpi.hurma
+  ./run deploy-halos local          # on the device itself
+USAGE
+    return 1
+  fi
+
+  local pkg slug data sysdir dest unit
+  pkg=$(node -p "require('./package.json').name")
+  slug="${pkg##*/}"
+  data="/var/lib/container-apps/marine-signalk-server-container/data/data"
+  sysdir="${data}/system-plugins/${slug}"
+  unit="marine-signalk-server-container.service"
+
+  # 'local'/'localhost' runs every remote step on this box; any other target
+  # goes over ssh. `runner` executes a bash script fed through stdin in either
+  # place.
+  local -a runner
+  if [[ "$target" == local || "$target" == localhost ]]; then
+    dest=""
+    runner=(bash -s --)
+  else
+    dest="${target}:"
+    runner=(ssh "$target" bash -s --)
+  fi
+
+  echo "==> Building (locally)..."
+  build
+
+  # The target's platform decides both which @duckdb/node-bindings-* package
+  # npm installs and which extension binary has to be in the bundle. Read it
+  # from the target rather than assuming the device matches this machine --
+  # this repo is developed on osx_arm64 and deployed to linux_arm64.
+  echo "==> Reading the target's platform..."
+  local uname_s uname_m target_musl
+  read -r uname_s uname_m target_musl < <("${runner[@]}" <<'PROBE'
+set -o errexit -o nounset -o pipefail
+musl=false
+# `ldd --version` writes its provenance to stderr and exits non-zero on musl,
+# so the exit status says nothing; the string is what separates the two.
+if (ldd --version 2>&1 || true) | head -1 | grep -qi musl; then musl=true; fi
+printf '%s %s %s\n' "$(uname -s)" "$(uname -m)" "$musl"
+PROBE
+  )
+
+  # Process substitution keeps errexit out of it, so an unreachable target
+  # leaves these empty rather than stopping the run.
+  if [[ -z "${uname_s:-}" || -z "${uname_m:-}" ]]; then
+    echo "Could not read the platform of ${target}." >&2
+    return 1
+  fi
+
+  local npm_os npm_cpu
+  case "$uname_s" in
+    Linux) npm_os=linux ;;
+    Darwin) npm_os=darwin ;;
+    *) echo "Unsupported target OS: $uname_s" >&2; return 1 ;;
+  esac
+  case "$uname_m" in
+    aarch64 | arm64) npm_cpu=arm64 ;;
+    x86_64 | amd64) npm_cpu=x64 ;;
+    *) echo "Unsupported target architecture: $uname_m" >&2; return 1 ;;
+  esac
+
+  # Triple, extension path and storage layout all come out of dist/, so the
+  # deploy and the runtime cannot spell them differently.
+  local triple ext_rel layout
+  read -r triple ext_rel < <(
+    TARGET_OS="$npm_os" TARGET_CPU="$npm_cpu" TARGET_MUSL="$target_musl" \
+      node --input-type=module -e '
+    import { readFileSync } from "node:fs";
+    import {
+      bundledExtensionRelPath,
+      duckdbPlatform,
+      duckdbVersionFromPackageVersion,
+    } from "./dist/duckdb/duckdb-version.js";
+    const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+    const version = duckdbVersionFromPackageVersion(
+      pkg.dependencies["@duckdb/node-api"],
+    );
+    const triple = duckdbPlatform({
+      platform: process.env.TARGET_OS,
+      arch: process.env.TARGET_CPU,
+      musl: process.env.TARGET_MUSL === "true",
+    });
+    console.log(triple, bundledExtensionRelPath(version, triple));
+  '
+  )
+  layout=$(node --input-type=module -e '
+    import { DATA_LAYOUT } from "./dist/data-dir.js";
+    console.log(Object.values(DATA_LAYOUT).join(" "));
+  ')
+
+  if [[ -z "${triple:-}" || -z "${ext_rel:-}" || -z "${layout:-}" ]]; then
+    echo "Could not read the platform naming out of dist/; is the build current?" >&2
+    return 1
+  fi
+
+  echo "    ${uname_s} ${uname_m} -> ${triple}"
+
+  if [[ ! -f "$ext_rel" ]]; then
+    echo "No bundled DuckDB extension for the target: $ext_rel is missing." >&2
+    echo "Run: ./run fetch-extensions $triple" >&2
+    return 1
+  fi
+
+  # Production dependencies for the *target's* platform, installed here. npm's
+  # --os/--cpu/--libc pick the right optional @duckdb/node-bindings-* package
+  # without this machine having to be that platform. --libc matters on its own:
+  # those packages carry a libc field, and with no --libc npm cannot evaluate
+  # it from macOS and silently drops the binding, leaving an install that looks
+  # fine until DuckDB is first opened on the device.
+  local stage="${PROJECT_ROOT}/.deploy/${triple}"
+  echo "==> Staging production dependencies for ${npm_os}/${npm_cpu}..."
+  mkdir -p "$stage"
+  cp package.json "$stage/"
+  local -a npmflags=(--omit=dev "--os=$npm_os" "--cpu=$npm_cpu" --ignore-scripts)
+  if [[ "$npm_os" == linux ]]; then
+    if [[ "$target_musl" == true ]]; then npmflags+=(--libc=musl); else npmflags+=(--libc=glibc); fi
+  fi
+  if [[ -f package-lock.json ]]; then
+    cp package-lock.json "$stage/"
+    (cd "$stage" && npm ci "${npmflags[@]}")
+  else
+    (cd "$stage" && npm install "${npmflags[@]}")
+  fi
+
+  local binding="@duckdb/node-bindings-${npm_os}-${npm_cpu}"
+  if [[ "$npm_os" == linux && "$target_musl" == true ]]; then
+    binding="${binding}-musl"
+  fi
+  if [[ ! -d "${stage}/node_modules/${binding}" ]]; then
+    echo "npm installed no ${binding}; the device would have no DuckDB." >&2
+    return 1
+  fi
+
+  echo "==> Preparing ${dest}${sysdir} (backing up any existing install)..."
+  "${runner[@]}" "$sysdir" "$data" <<'PREP'
+set -o errexit -o nounset -o pipefail
+sysdir="$1"; data="$2"
+# Refuse a host with no Signal K container app rather than creating the
+# hierarchy under it. The sudo below would otherwise turn a mistyped hostname
+# into a root-owned tree holding a full copy of the build.
+if [ ! -d "$data" ]; then
+  echo "No Signal K container-app data directory at $data." >&2
+  echo "Is this a HaLOS device with the Signal K app installed?" >&2
+  exit 1
+fi
+# system-plugins/ belongs to the container-app framework, which creates it as
+# root on a device that ships plugins there (signalk-halpi), and our leaf under
+# it may be root-owned too. `mkdir -p` returns 0 for a directory that already
+# exists whatever its ownership, so writability is the thing to test.
+if ! mkdir -p "$sysdir" 2>/dev/null || [ ! -w "$sysdir" ]; then
+  sudo mkdir -p "$sysdir"
+  sudo chown -R "$(id -u):$(id -g)" "$sysdir"
+fi
+if [ -n "$(ls -A "$sysdir" 2>/dev/null)" ]; then
+  tar -czf "$HOME/$(basename "$sysdir")-predeploy-$(date +%F-%H%M%S).tar.gz" \
+    -C "$(dirname "$sysdir")" "$(basename "$sysdir")"
+fi
+PREP
+
+  echo "==> Syncing to ${target}..."
+  rsync -rlpt --delete dist/ "${dest}${sysdir}/dist/"
+  rsync -rlpt --delete extensions/ "${dest}${sysdir}/extensions/"
+  rsync -rlpt --delete "${stage}/node_modules/" "${dest}${sysdir}/node_modules/"
+  rsync -lpt package.json "${dest}${sysdir}/package.json"
+
+  # Names this exact build. Every weaker check -- the package registered, the
+  # directory present, the server up -- is equally true of the build it
+  # replaced.
+  local want_sha
+  want_sha=$(_sha256 dist/index.js)
+
+  echo "==> Linking, registering, restarting, verifying..."
+  local rc=0
+  "${runner[@]}" "$pkg" "$slug" "$data" "$unit" "$want_sha" "$layout" <<'REMOTE' || rc=$?
+set -o errexit -o nounset -o pipefail
+pkg="$1"; slug="$2"; data="$3"; unit="$4"; want_sha="$5"; layout="$6"
+sysdir="${data}/system-plugins/${slug}"
+pdd="${data}/plugin-config-data/${slug}"
+
+sha256() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+got=$(sha256 "${sysdir}/dist/index.js")
+if [ "$got" != "$want_sha" ]; then
+  echo "dist/index.js on the device is not the build that was just synced." >&2
+  exit 1
+fi
+
+# node_modules/<pkg> is a symlink to the system-plugins copy, and the data
+# directory's package.json declares it. Both halves matter: the link is how
+# Signal K finds the plugin, the declaration is what stops npm pruning it.
+link="${data}/node_modules/${pkg}"
+up=".."
+case "$pkg" in */*) up="../.." ;; esac
+mkdir -p "$(dirname "$link")"
+rm -rf "$link"
+ln -s "${up}/system-plugins/${slug}" "$link"
+
+python3 - "$data" "$pkg" "$slug" <<'PY'
+import json, os, sys
+
+data, pkg, slug = sys.argv[1:4]
+path = os.path.join(data, "package.json")
+with open(path) as handle:
+    doc = json.load(handle)
+deps = doc.setdefault("dependencies", {})
+spec = "file:system-plugins/%s" % slug
+if deps.get(pkg) == spec:
+    print("    %s already declared as %s" % (pkg, spec))
+else:
+    deps[pkg] = spec
+    doc["dependencies"] = dict(sorted(deps.items()))
+    tmp = path + ".deploy-tmp"
+    with open(tmp, "w") as handle:
+        json.dump(doc, handle, indent=2)
+        handle.write("\n")
+    os.replace(tmp, path)
+    print("    declared %s as %s" % (pkg, spec))
+PY
+
+cfg="${data}/plugin-config-data/${slug}.json"
+if [ -f "$cfg" ]; then
+  echo "    left the existing $cfg alone"
+else
+  # A plugin Signal K has never seen is disabled, so a first deploy would
+  # install something that never starts. Only ever written when absent: an
+  # operator's later settings are theirs.
+  printf '%s\n' '{' '  "enabled": true,' '  "enableLogging": false,' \
+    '  "enableDebug": true,' '  "configuration": {}' '}' > "$cfg"
+  echo "    created $cfg (enabled, debug on)"
+fi
+
+# Positive evidence that *this* start() ran, not that some earlier one did.
+# Safe because it only fires on an empty layout: from the writer onwards these
+# directories hold data, and then the check below degrades to existence alone.
+if [ -d "$pdd" ] && [ -z "$(find "$pdd" -mindepth 1 -type f -print -quit)" ]; then
+  rm -rf "$pdd"
+fi
+
+# Container apps are systemd units named after their directory. Restarting the
+# container directly would bypass the unit's provision and prestart steps and
+# leave systemd's view of it stale.
+sudo systemctl restart "$unit"
+
+printf '    waiting for Signal K'
+ready=false
+for _ in $(seq 1 120); do
+  if curl -sf --max-time 5 -o /dev/null http://localhost:3000/signalk; then
+    ready=true
+    break
+  fi
+  printf '.'
+  sleep 2
+done
+printf '\n'
+if [ "$ready" != true ]; then
+  echo "Signal K did not answer on :3000 within 240s after the restart." >&2
+  exit 1
+fi
+
+for sub in $layout; do
+  if [ ! -d "${pdd}/${sub}" ]; then
+    echo "Missing ${pdd}/${sub}: the plugin did not get through start()." >&2
+    echo "Check: journalctl -u ${unit} -o cat | grep ${slug}" >&2
+    exit 1
+  fi
+done
+echo "    storage layout present under $pdd"
+
+# The rule the whole design rests on: this package's engine must not be mapped
+# into the server. Scoped to our own copy on purpose -- another plugin loading
+# its own DuckDB is that plugin's business, and matching it here would report
+# their choice as our regression.
+pid=$(pgrep -f 'node .*signalk-server' | head -1 || true)
+if [ -z "$pid" ]; then
+  echo "    could not find the Signal K process; skipped the DuckDB map check" >&2
+elif sudo grep -q "system-plugins/${slug}/node_modules/@duckdb" "/proc/${pid}/maps" 2>/dev/null; then
+  echo "This package's DuckDB is mapped into the Signal K process (pid $pid)." >&2
+  exit 1
+else
+  echo "    no DuckDB from this package in the Signal K process (pid $pid)"
+fi
+REMOTE
+
+  if [[ $rc -ne 0 ]]; then
+    echo "" >&2
+    echo "Deploy FAILED on ${target} (see the error above)." >&2
+    return "$rc"
+  fi
+
+  echo ""
+  echo "Deployed ${pkg} to ${target} (${triple}), verified running."
+}
+
+# sha256 of one file, on whichever of the two spellings this machine has.
+function _sha256 {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+################################################################################
+# Version
+
+function bumpversion {
+  #@ Bump VERSION and package.json together (patch|minor|major)
+  #@ Category: Version
+  local BUMP_TYPE=${1:-}
+  if [[ -z "$BUMP_TYPE" ]]; then
+    echo "Usage: ./run bumpversion [patch|minor|major]"
+    exit 1
+  fi
+
+  if ! command -v bumpversion &> /dev/null; then
+    echo "Error: bumpversion not installed"
+    echo "Install with: uv tool install bump2version"
+    exit 1
+  fi
+
+  # Both files move together or CI's check-versions fails the PR. That check is
+  # the point: npm publishes package.json's version while the release workflow
+  # reads VERSION, so a drift publishes one number under another's release.
+  echo "Bumping $BUMP_TYPE version..."
+  command bumpversion "$BUMP_TYPE"
+  echo "Version bumped and committed successfully"
+  echo "New version: $(cat VERSION)"
+  echo "Push with: git push"
+}
+
+################################################################################
+# Help System
+
+function help {
+  #@ Show this help message
+  #@ Category: Core
+  echo "signalk-parquet-history-provider - Development Commands"
+  echo "======================================================"
+  echo ""
+  echo "Available commands:"
+  echo ""
+
+  # Extract function definitions and their help comments
+  awk '/^function / {
+    fname = $2
+    sub(/[({].*/, "", fname)
+    getline
+    if ($0 ~ /#@/) {
+      desc = $0
+      sub(/.*#@ /, "", desc)
+      sub(/ *$/, "", desc)
+      getline
+      if ($0 ~ /#@ Category:/) {
+        cat = $0
+        sub(/.*Category: /, "", cat)
+        sub(/ *$/, "", cat)
+        if (!seen[cat]++) categories[++cat_count] = cat
+        commands[cat, ++cmd_count[cat]] = fname
+        descriptions[cat, cmd_count[cat]] = desc
+      }
+    }
+  }
+  END {
+    for (i = 1; i <= cat_count; i++) {
+      cat = categories[i]
+      print "\n" cat ":"
+      for (j = 1; j <= cmd_count[cat]; j++) {
+        printf "  %-25s %s\n", commands[cat, j], descriptions[cat, j]
+      }
+    }
+  }' "$0"
+
+  echo ""
+  echo "Usage: ./run <command> [arguments...]"
+  echo ""
+}
+
+################################################################################
+# Commands end.
+
+TIMEFORMAT=$'\nTask completed in %3lR'
+time "${@:-help}"

@@ -1,0 +1,117 @@
+# Proves the bundled sqlite_scanner loads on the platform HaLOS devices run,
+# with no network available.
+#
+# Nothing else covers this. The unit suites use a fixture instead of a real
+# 27 MB binary, and a check on an x86 developer machine with working DNS
+# proves neither the architecture nor the offline part -- DuckDB will happily
+# download an extension when it can reach the internet, which is exactly the
+# behaviour the plugin disables and this job verifies is disabled.
+
+name: DuckDB extension
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-load:
+    name: sqlite_scanner loads offline on ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            platform: linux_arm64
+          - runner: ubuntu-latest
+            platform: linux_amd64
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # None of these jobs runs an authenticated git operation, and each
+          # one then packs this workspace or mounts it into a container. The
+          # default leaves the job token in .git/config for every later step.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - name: Build and fetch the extension
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run build
+          node tools/fetch-extensions.mjs ${{ matrix.platform }}
+
+      - name: Load it with no network at all
+        # A container with --network none is the only honest way to assert
+        # this on a runner: the check would otherwise pass on a machine that
+        # could have downloaded what it needed.
+        run: |
+          docker run --rm --network none \
+            -v "$PWD":/w -w /w node:24 \
+            node dist/duckdb/check-extension.js
+
+      - name: Install the packed tarball and load from inside it
+        # The composition that actually ships: pack, install, resolve out of
+        # node_modules, LOAD. Each half is covered separately and the join was
+        # not -- so a published tarball missing the binary, or carrying one the
+        # manifest does not describe, would first be discovered on a boat.
+        run: |
+          TGZ=$(npm pack --pack-destination /tmp | tail -1)
+          mkdir -p /tmp/installed && cd /tmp/installed
+          npm init -y > /dev/null
+          npm install "/tmp/$(basename "$TGZ")"
+          cd /tmp/installed
+          docker run --rm --network none \
+            -v /tmp/installed:/w -w /w node:24 \
+            node node_modules/signalk-parquet-history-provider/dist/duckdb/check-extension.js
+
+      - name: Refuse a build whose extension does not match the engine
+        # The gate itself, exercised. Asserting on the message, not just on a
+        # non-zero exit: a syntax error, a missing dist/ or a renamed export
+        # all exit non-zero too, so exit code alone cannot tell a correct
+        # rejection from a crash, and this step would go green either way.
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = "extensions/manifest.json";
+            const m = JSON.parse(fs.readFileSync(p, "utf8"));
+            m.duckdbVersion = "0.0.1";
+            fs.writeFileSync(p, JSON.stringify(m));
+          '
+          if out=$(node tools/check-bundled-extensions.mjs 2>&1); then
+            echo "::error::the version gate accepted a mismatched manifest"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q "holds DuckDB 0.0.1 binaries" || {
+            echo "::error::the gate failed, but not for the reason under test"
+            exit 1; }
+          echo "the gate rejected it, and said why"
+
+      - name: Refuse a binary the manifest does not describe
+        # The other direction: walking only the manifest means a stray file is
+        # never examined, and the runtime used to skip its checksum for the
+        # same reason. An interrupted fetch leaves exactly this state.
+        run: |
+          node tools/fetch-extensions.mjs ${{ matrix.platform }}
+          mkdir -p "extensions/v$(node -p "require('./extensions/manifest.json').duckdbVersion")/osx_arm64"
+          echo unlisted > "extensions/v$(node -p "require('./extensions/manifest.json').duckdbVersion")/osx_arm64/sqlite_scanner.duckdb_extension.gz"
+          if out=$(node tools/check-bundled-extensions.mjs 2>&1); then
+            echo "::error::the gate accepted an unlisted binary"
+            exit 1
+          fi
+          echo "$out" | grep -q "the manifest does" || {
+            echo "::error::the gate failed, but not for the reason under test"
+            exit 1; }
+          echo "the gate rejected it, and said why"

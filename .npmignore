@@ -1,0 +1,23 @@
+src/
+tools/
+.github/
+*.tsbuildinfo
+.DS_Store
+eslint.config.ts
+tsconfig.json
+
+# Repo scaffolding, not package contents. VERSION duplicates package.json's
+# version for the release workflow; the other two only drive it. The rest
+# configure tools that only ever run against a clone.
+VERSION
+.bumpversion.cfg
+run
+.prettierignore
+.gitattributes
+
+# extensions/ is deliberately absent from this list. It is gitignored but MUST
+# ship: a device may have no network, and DuckDB cannot read the SQLite hot
+# store without sqlite_scanner. npm consults this file instead of .gitignore
+# whenever it exists, which is what makes that combination work — remove this
+# file and every published tarball silently loses the binaries.
+# src/test/package-e2e.test.ts pins it.

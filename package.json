@@ -1,0 +1,57 @@
+{
+  "name": "signalk-parquet-history-provider",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Parquet history provider for Signal K: a SQLite hot store rolled into a Parquet tree, queried with DuckDB — no database server",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-category-database"
+  ],
+  "signalk": {
+    "displayName": "Parquet History"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc && node tools/check-bundled-extensions.mjs",
+    "watch": "tsc --watch",
+    "prettier": "prettier --write .",
+    "lint": "eslint --fix",
+    "format": "npm run prettier && npm run lint",
+    "ci-lint": "eslint && prettier --check .",
+    "test": "node --test 'dist/test/**/*.test.js'",
+    "build:all": "npm run build && npm test",
+    "fetch-extensions": "node tools/fetch-extensions.mjs",
+    "prepublishOnly": "npm run build && npm run fetch-extensions && node tools/check-bundled-extensions.mjs --strict"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "author": "Matti Airas <matti.airas@hatlabs.fi>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/halos-org/signalk-parquet-history-provider"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.4",
+    "@js-temporal/polyfill": "^0.5.0",
+    "minimatch": "^10.2.3",
+    "typebox": "^1.3.11"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@signalk/server-api": "latest",
+    "@types/node": "^22.0.0",
+    "eslint": "^10.2.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.4.0",
+    "jiti": "^2.7.0",
+    "prettier": "^3.9.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.58.0"
+  },
+  "bugs": {
+    "url": "https://github.com/halos-org/signalk-parquet-history-provider/issues"
+  },
+  "homepage": "https://github.com/halos-org/signalk-parquet-history-provider#readme"
+}
