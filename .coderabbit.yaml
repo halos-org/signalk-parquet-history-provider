@@ -28,13 +28,6 @@ reviews:
     Write summaries in present tense. Describe what the code does, not what
     it did. Skip filler like "This PR" — go straight to the change.
 
-  tools:
-    github-checks:
-      # The Signal K integration and the two offline extension-load jobs each
-      # boot a real server or a container; the 90s default expires long before
-      # they report, so the review would never see the result.
-      timeout_ms: 600000
-
   path_instructions:
     - path: "**/*"
       instructions: |
@@ -123,10 +116,16 @@ reviews:
 
         ## Privacy
 
-        Flag any device hostname, boat name, vessel MMSI or other identifier
-        belonging to a real installation, anywhere in the repository —
-        including test fixtures, usage examples and comments. This repository is
-        public. Generic placeholders only.
+        This repository is public. Flag anything that discloses our local IT
+        infrastructure, anywhere in the tree — hostnames, domain names, IP
+        addresses, internal URLs, port assignments, account names — including
+        test fixtures, usage examples and comments. Placeholders only
+        (`my-boat.local`); naming the hardware is fine, since HALPI2 is a
+        product rather than an installation.
+
+        Do not flag marine-domain data. Vessel names, MMSIs, AIS targets,
+        navigational-aid names and place names are ordinary test data here and
+        need no redaction.
 
         Flag any log or error message that could carry a recorded *value*. Those
         lines reach the Signal K log and ship in support bundles; counts, path
