@@ -56,6 +56,11 @@ a check on module evaluation alone.
   mismatches fails at build time.
 - `src/data-dir.ts` — resolves the configured directory once, in the plugin,
   because the spawned processes do not share the server's working directory.
+- `src/delta-routing.ts` — copied from `signalk-questdb-history-provider` with
+  its suite. Routing behaviour is identical and must stay that way: it decides
+  what a position query returns, and Unit 4c reproduces that provider's history
+  contract. Only the comments were retargeted, from its three QuestDB tables to
+  this store's `value_kind` column. Fix bugs in both.
 - `src/path-matcher.ts`, `src/time-range.ts` — copied from
   `signalk-questdb-history-provider` with their suites. Fix bugs in both.
   They currently **differ** from the sibling by two fixes: `resolveTimeRange`
