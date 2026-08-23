@@ -97,10 +97,19 @@ the kernel's own high-water mark (`VmHWM`, or cgroup `memory.peak`) rather than
 from the samples, because the roll process is short-lived by design and its
 peak is exactly what a sampling interval misses.
 
+That method needs a subject that is still running, which a roll is not: it
+lives seconds, has no steady state, and is gone before a window closes. `roll`
+measures one instead, by asking the roll process for the high-water mark the
+kernel kept for it and polling `/proc` from outside as a cross-check. **Point
+it at a copy of a data directory** — a roll writes into the tree and does not
+truncate the hot store, so one run beside a live writer puts those rows in the
+tree twice. It refuses if anything answers on the writer's socket.
+
 ```bash
 ./run bench run --label sqhp --subject signalk:pid=1234 -o sqhp.json
 ./run bench compare control.json sqhp.json parquet.json
 ./run bench selftest
+./run bench roll --data-dir /path/to/a/copy --max-rowid 1267241
 ```
 
 `selftest` measures a load generator with a known duty cycle and compares the

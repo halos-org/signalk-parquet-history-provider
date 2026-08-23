@@ -1,3 +1,4 @@
+import { ownPeakBytes } from "../bench/one-shot.js";
 import { roll } from "./roll.js";
 
 /**
@@ -10,7 +11,10 @@ import { roll } from "./roll.js";
  *
  *   node dist/roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms>
  *
- * On success it prints one JSON line describing what it wrote and exits 0.
+ * On success it prints one JSON line describing what it wrote — including
+ * this process's own peak resident size, which is the figure the design is
+ * judged on and which nothing outside the process can read exactly — and
+ * exits 0.
  * The writer treats that exit as "the Parquet is durable" and only then
  * deletes those rows from the hot store — nothing else may truncate it,
  * because nothing else knows the write reached the disk.
@@ -49,7 +53,11 @@ async function main(): Promise<void> {
     rollId: requireNumber("--roll-id"),
     memoryLimit: argValue("--memory-limit"),
   });
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  // The peak belongs to the process, not to the roll, and only the process
+  // can read its own high-water mark before it is gone.
+  process.stdout.write(
+    `${JSON.stringify({ ...result, peakRssBytes: ownPeakBytes() })}\n`,
+  );
 }
 
 main().catch((err: unknown) => {

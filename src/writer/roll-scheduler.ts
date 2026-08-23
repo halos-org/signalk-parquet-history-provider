@@ -223,9 +223,14 @@ function summarize(stdout: string): string {
       rows: number;
       files: { date: string }[];
       sidecarRows: number;
+      peakRssBytes: number | null;
     };
     const dates = result.files.map((file) => file.date).join(", ") || "nothing";
-    return `${result.rows} rows to ${dates} and ${result.sidecarRows} sidecar rows`;
+    const peak =
+      result.peakRssBytes === null
+        ? ""
+        : `, peaking at ${Math.round(result.peakRssBytes / 1048576)} MB`;
+    return `${result.rows} rows to ${dates} and ${result.sidecarRows} sidecar rows${peak}`;
   } catch {
     return "an unreadable summary";
   }
