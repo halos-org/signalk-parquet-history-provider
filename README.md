@@ -46,7 +46,7 @@ Every option is rendered in the Signal K Admin UI from the plugin's own schema
 | Buffer ceiling while the writer is unreachable (MB) | `8`                   | Memory held for samples that could not be sent. When full the oldest are dropped and the count is reported in the plugin status.                                                                                              |
 | Data directory                                      | plugin data directory | Where the hot store and the Parquet tree live. A relative value resolves against the plugin's own directory.                                                                                                                  |
 | Retention (days, 0 = keep forever)                  | `0`                   | How long data is kept.                                                                                                                                                                                                        |
-| Roll interval (minutes)                             | `60`                  | How often the hot store becomes Parquet and is truncated. Shorter keeps the hot store small at the cost of more Parquet files.                                                                                                |
+| Roll interval (minutes)                             | `60`                  | How often the hot store becomes Parquet and is truncated. Shorter keeps the hot store small at the cost of more Parquet files. Must divide 1440; the schedule runs every N minutes from UTC midnight.                         |
 
 ## The bundled DuckDB extension
 
