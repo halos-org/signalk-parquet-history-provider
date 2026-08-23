@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import { sample } from "./fixtures.js";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,18 +8,6 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { HotStore, LAYOUT_VERSION } from "../writer/hot-store.js";
 import type { Sample } from "../writer/protocol.js";
-
-function sample(over: Partial<Sample> = {}): Sample {
-  return {
-    ts: 1_700_000_000_000,
-    context: "vessels.self",
-    path: "environment.depth.belowKeel",
-    source: "n2k.0",
-    kind: "number",
-    value: 4.2,
-    ...over,
-  } as Sample;
-}
 
 let dir: string;
 let store: HotStore;

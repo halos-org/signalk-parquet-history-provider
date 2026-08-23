@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
+import { sample } from "./fixtures.js";
 import {
   FrameDecoder,
   HEADER_BYTES,
@@ -8,19 +9,7 @@ import {
   ProtocolError,
   encodeFrame,
 } from "../writer/protocol.js";
-import type { Message, Sample } from "../writer/protocol.js";
-
-function sample(over: Partial<Sample> = {}): Sample {
-  return {
-    ts: 1_700_000_000_000,
-    context: "vessels.self",
-    path: "environment.depth.belowKeel",
-    source: "n2k.0",
-    kind: "number",
-    value: 4.2,
-    ...over,
-  } as Sample;
-}
+import type { Message } from "../writer/protocol.js";
 
 function decodeAll(bytes: Buffer): Message[] {
   return new FrameDecoder().push(bytes);

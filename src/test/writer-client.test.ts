@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import { sample } from "./fixtures.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,19 +11,6 @@ import { FlushBuffer } from "../flush-buffer.js";
 import { HotStore } from "../writer/hot-store.js";
 import { WriterServer } from "../writer/server.js";
 import { WriterClient } from "../writer/client.js";
-import type { Sample } from "../writer/protocol.js";
-
-function sample(over: Partial<Sample> = {}): Sample {
-  return {
-    ts: 1_700_000_000_000,
-    context: "self",
-    path: "environment.depth.belowKeel",
-    source: "n2k.0",
-    kind: "number",
-    value: 4.2,
-    ...over,
-  } as Sample;
-}
 
 /** Polls until `check` holds, so tests never depend on a fixed sleep. */
 async function eventually(

@@ -1,30 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
+import { fat, sample } from "./fixtures.js";
 import { FlushBuffer, sampleBytes } from "../flush-buffer.js";
 import type { FlushBufferOptions } from "../flush-buffer.js";
 import { MAX_FRAME_BYTES } from "../writer/protocol.js";
-import type { Sample } from "../writer/protocol.js";
-
-function sample(over: Partial<Sample> = {}): Sample {
-  return {
-    ts: 1_700_000_000_000,
-    context: "vessels.self",
-    path: "environment.depth.belowKeel",
-    source: "n2k.0",
-    kind: "number",
-    value: 4.2,
-    ...over,
-  } as Sample;
-}
-
-/** A string sample whose JSON is at least `bytes` long, for filling the ceiling. */
-function fat(bytes: number, over: Partial<Sample> = {}): Sample {
-  return sample({
-    kind: "string",
-    value: "x".repeat(bytes),
-    ...over,
-  } as Partial<Sample>);
-}
 
 function buffer(over: Partial<FlushBufferOptions> = {}) {
   return new FlushBuffer({

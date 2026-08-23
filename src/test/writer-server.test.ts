@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import { sample } from "./fixtures.js";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { connect } from "node:net";
@@ -13,19 +14,7 @@ import {
   probeLiveWriter,
 } from "../writer/server.js";
 import { FrameDecoder, encodeFrame } from "../writer/protocol.js";
-import type { Message, Sample } from "../writer/protocol.js";
-
-function sample(over: Partial<Sample> = {}): Sample {
-  return {
-    ts: 1_700_000_000_000,
-    context: "self",
-    path: "environment.depth.belowKeel",
-    source: "n2k.0",
-    kind: "number",
-    value: 4.2,
-    ...over,
-  } as Sample;
-}
+import type { Message } from "../writer/protocol.js";
 
 let dir: string;
 let store: HotStore;
