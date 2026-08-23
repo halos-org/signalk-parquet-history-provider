@@ -24,6 +24,17 @@ export function resolveDataDir(
 
 /** Sub-directory names under the resolved data directory. Named here so the
  * writer, the roll and the query layer cannot spell them differently. */
+/**
+ * Mode for the data directory and everything under it.
+ *
+ * `mkdir`'s mode is masked by umask, so creating at 0700 is not enough on its
+ * own — the explicit chmod is the enforcement. Before both, the directories
+ * were created at 0755 and only the socket's parent was ever tightened, so the
+ * hot store sat world-readable for the few hundred milliseconds it took the
+ * writer to boot, and the Parquet tree stayed readable permanently.
+ */
+export const DATA_DIR_MODE = 0o700;
+
 export const DATA_LAYOUT = {
   /** The SQLite hot store the writer owns. */
   hotStore: "hot",

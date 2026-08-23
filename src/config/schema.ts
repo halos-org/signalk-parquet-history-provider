@@ -56,6 +56,25 @@ export const ConfigSchema = Type.Object({
       "The same bound for vessel contexts. Only relevant when other vessels are recorded.",
   }),
 
+  flushIntervalMs: Type.Number({
+    default: 5000,
+    title: "Flush interval (ms)",
+    description:
+      "No sample waits longer than this before being sent to the writer. This is also the crash-loss window: a hard power cut loses at most this much.",
+  }),
+  flushBatchSize: Type.Number({
+    default: 1000,
+    title: "Flush batch size (samples)",
+    description:
+      "Samples per write. Reaching it flushes early, whatever the interval says. Each batch is one SQLite transaction.",
+  }),
+  maxBufferMB: Type.Number({
+    default: 8,
+    title: "Buffer ceiling while the writer is unreachable (MB)",
+    description:
+      "Memory held for samples that could not be sent. When it is full the oldest are dropped, and the count is reported in the plugin status.",
+  }),
+
   dataDir: Type.String({
     default: "",
     title: "Data directory",
@@ -88,6 +107,9 @@ export const CONFIG_DEFAULTS = {
   recordOthers: false,
   maxRecordedPaths: 2000,
   maxRecordedContexts: 100,
+  flushIntervalMs: 5000,
+  flushBatchSize: 1000,
+  maxBufferMB: 8,
   dataDir: "",
   retentionDays: 0,
   rollIntervalMinutes: 60,
@@ -141,14 +163,23 @@ export function normalizeConfig(config: StoredConfig): Config {
     // A missing toggle takes the schema default; an explicit false is honoured.
     recordSelf: config.recordSelf ?? CONFIG_DEFAULTS.recordSelf,
     recordOthers: config.recordOthers ?? CONFIG_DEFAULTS.recordOthers,
-    maxRecordedPaths: positive(
+    maxRecordedPaths: positiveInteger(
       config.maxRecordedPaths,
       CONFIG_DEFAULTS.maxRecordedPaths,
     ),
-    maxRecordedContexts: positive(
+    maxRecordedContexts: positiveInteger(
       config.maxRecordedContexts,
       CONFIG_DEFAULTS.maxRecordedContexts,
     ),
+    flushIntervalMs: positive(
+      config.flushIntervalMs,
+      CONFIG_DEFAULTS.flushIntervalMs,
+    ),
+    flushBatchSize: positiveInteger(
+      config.flushBatchSize,
+      CONFIG_DEFAULTS.flushBatchSize,
+    ),
+    maxBufferMB: positive(config.maxBufferMB, CONFIG_DEFAULTS.maxBufferMB),
     dataDir:
       typeof config.dataDir === "string"
         ? config.dataDir
@@ -185,6 +216,20 @@ function numberRecord(value: unknown): Record<string, number> {
         entry[1] > 0,
     ),
   );
+}
+
+/**
+ * A count, rounded down, never below one.
+ *
+ * `Array.prototype.splice` applies ToIntegerOrInfinity to its delete count, so
+ * a batch size of 0.5 removes nothing while `isDue` still reports a full
+ * batch: the buffer never drains, grows to its ceiling and starts evicting,
+ * with the plugin reporting "Recording" throughout. A number field in the
+ * Admin UI accepts 0.5 quite happily.
+ */
+function positiveInteger(value: number | undefined, fallback: number): number {
+  const positiveValue = positive(value, fallback);
+  return Math.max(1, Math.floor(positiveValue));
 }
 
 function positive(value: number | undefined, fallback: number): number {

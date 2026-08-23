@@ -7,6 +7,7 @@ import createPlugin from "../index.js";
 import { ConfigSchema } from "../config/schema.js";
 import { DATA_LAYOUT } from "../data-dir.js";
 import { PLUGIN_ID } from "../plugin-id.js";
+import type { BusValue } from "../recorder.js";
 
 /**
  * The plugin is the only runtime behaviour this build ships, and its catch
@@ -18,6 +19,8 @@ function stubApp(dataDirPath: string) {
     status: [] as string[],
     errors: [] as string[],
     logged: [] as unknown[],
+    busValues: [] as ((value: BusValue) => void)[],
+    unsubscribed: 0,
   };
   return {
     calls,
@@ -28,6 +31,16 @@ function stubApp(dataDirPath: string) {
       setPluginError: (message: string) => calls.errors.push(message),
       getDataDirPath: () => dataDirPath,
       selfContext: "vessels.self",
+      streambundle: {
+        getBus: () => ({
+          onValue: (fn: (value: BusValue) => void) => {
+            calls.busValues.push(fn);
+            return () => {
+              calls.unsubscribed++;
+            };
+          },
+        }),
+      },
     },
   };
 }
@@ -48,12 +61,31 @@ describe("the plugin", () => {
     const base = mkdtempSync(join(tmpdir(), "sk-parquet-plugin-"));
     try {
       const { app, calls } = stubApp(base);
-      createPlugin(app).start({});
+      const plugin = createPlugin(app);
+      plugin.start({});
       for (const sub of Object.values(DATA_LAYOUT)) {
         assert.ok(existsSync(join(base, sub)), `${sub} was not created`);
       }
       assert.equal(calls.errors.length, 0);
-      assert.match(calls.status[0], /Not recording/);
+      assert.match(calls.status[0], /paths across/);
+      plugin.stop();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("subscribes to the delta bus and unsubscribes on stop", () => {
+    // A subscription that outlives the plugin keeps recording into a client
+    // that has stopped, and Signal K reuses the bus across enable/disable.
+    const base = mkdtempSync(join(tmpdir(), "sk-parquet-plugin-"));
+    try {
+      const { app, calls } = stubApp(base);
+      const plugin = createPlugin(app);
+      plugin.start({});
+      assert.equal(calls.busValues.length, 1, "never subscribed");
+
+      plugin.stop();
+      assert.equal(calls.unsubscribed, 1, "left the bus subscribed");
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
@@ -63,9 +95,11 @@ describe("the plugin", () => {
     const base = mkdtempSync(join(tmpdir(), "sk-parquet-plugin-"));
     try {
       const { app } = stubApp(join(base, "plugin"));
-      createPlugin(app).start({ dataDir: join(base, "elsewhere") });
+      const plugin = createPlugin(app);
+      plugin.start({ dataDir: join(base, "elsewhere") });
       assert.ok(existsSync(join(base, "elsewhere", DATA_LAYOUT.hotStore)));
       assert.ok(!existsSync(join(base, "plugin", DATA_LAYOUT.hotStore)));
+      plugin.stop();
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

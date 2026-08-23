@@ -16,6 +16,9 @@ const complete: Config = {
   recordOthers: true,
   maxRecordedPaths: 50,
   maxRecordedContexts: 5,
+  flushIntervalMs: 2000,
+  flushBatchSize: 500,
+  maxBufferMB: 4,
   dataDir: "/var/lib/history",
   retentionDays: 30,
   rollIntervalMinutes: 15,
@@ -29,6 +32,9 @@ describe("ConfigSchema", () => {
     assert.deepEqual(properties.sort(), [
       "dataDir",
       "defaultSamplingRate",
+      "flushBatchSize",
+      "flushIntervalMs",
+      "maxBufferMB",
       "maxRecordedContexts",
       "maxRecordedPaths",
       "pathFilter",
@@ -76,6 +82,9 @@ describe("ConfigSchema", () => {
       samplingRates: (ConfigSchema.properties.samplingRates as any).default,
       recordSelf: (ConfigSchema.properties.recordSelf as any).default,
       recordOthers: (ConfigSchema.properties.recordOthers as any).default,
+      flushIntervalMs: (ConfigSchema.properties.flushIntervalMs as any).default,
+      flushBatchSize: (ConfigSchema.properties.flushBatchSize as any).default,
+      maxBufferMB: (ConfigSchema.properties.maxBufferMB as any).default,
       maxRecordedPaths: (ConfigSchema.properties.maxRecordedPaths as any)
         .default,
       maxRecordedContexts: (ConfigSchema.properties.maxRecordedContexts as any)
@@ -222,5 +231,33 @@ describe("normalizeConfig", () => {
       CONFIG_DEFAULTS.defaultSamplingRate,
     );
     assert.equal(normalized.retentionDays, CONFIG_DEFAULTS.retentionDays);
+  });
+});
+
+describe("count-shaped options are whole numbers", () => {
+  it("floors a fractional batch size instead of stalling the buffer", () => {
+    // splice() applies ToIntegerOrInfinity to its delete count, so a batch
+    // size of 0.5 removes nothing while isDue still reports a full batch: the
+    // buffer never drains, grows to its ceiling and starts evicting, with the
+    // plugin reporting "Recording" throughout. A number field accepts 0.5.
+    assert.equal(normalizeConfig({ flushBatchSize: 0.5 }).flushBatchSize, 1);
+    assert.equal(normalizeConfig({ flushBatchSize: 7.9 }).flushBatchSize, 7);
+    assert.equal(
+      normalizeConfig({ maxRecordedPaths: 2.5 }).maxRecordedPaths,
+      2,
+    );
+    assert.equal(
+      normalizeConfig({ maxRecordedContexts: 0.2 }).maxRecordedContexts,
+      1,
+    );
+  });
+
+  it("leaves the interval and the buffer size fractional, where it is harmless", () => {
+    // These are milliseconds and megabytes, compared rather than counted.
+    assert.equal(
+      normalizeConfig({ flushIntervalMs: 1500.5 }).flushIntervalMs,
+      1500.5,
+    );
+    assert.equal(normalizeConfig({ maxBufferMB: 0.5 }).maxBufferMB, 0.5);
   });
 });
