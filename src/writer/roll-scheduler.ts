@@ -95,11 +95,21 @@ export class RollScheduler {
 
   private arm(): void {
     if (this.stopped) return;
-    const delay = delayToNextRoll(this.now(), this.options.intervalMinutes);
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      void this.rollOnce().finally(() => this.arm());
-    }, delay);
+    const now = this.now();
+    // The slot is decided here and carried into the roll, never re-derived
+    // from the clock when the timer fires. setTimeout may fire a millisecond
+    // early, and a clock read on the wrong side of the boundary names the
+    // PREVIOUS slot — whose file already exists and would be overwritten with
+    // a fraction of its rows. That destroyed 2.5M rows on a device before this
+    // was a parameter.
+    const slot = nextRollAt(now, this.options.intervalMinutes);
+    this.timer = setTimeout(
+      () => {
+        this.timer = null;
+        void this.rollOnce(slot).finally(() => this.arm());
+      },
+      delayToNextRoll(now, this.options.intervalMinutes),
+    );
     // The writer must not be held open by a pending roll: the plugin stops it
     // with SIGTERM and waits, and an armed timer would not delay that anyway.
     this.timer.unref();
@@ -108,10 +118,11 @@ export class RollScheduler {
   /**
    * One roll: choose the set, write it, and delete exactly that set.
    *
-   * Exported for the tests, which drive the schedule rather than waiting for
-   * it.
+   * `slot` names the roll, and the caller supplies it — the schedule knows
+   * which instant it armed for, and nothing here should have to guess it back
+   * out of a clock reading.
    */
-  async rollOnce(): Promise<void> {
+  async rollOnce(slot: number): Promise<void> {
     if (this.stopped || this.running !== null) return;
     const bound = this.options.store.rollBound();
     if (bound === null) {
@@ -121,16 +132,16 @@ export class RollScheduler {
       return;
     }
 
-    const rollId =
-      this.pendingRollId ??
-      nextRollAt(this.now(), this.options.intervalMinutes) -
-        this.options.intervalMinutes * 60_000;
+    // A retry keeps the failed attempt's name, and only a retry may replace a
+    // file that is already there.
+    const retry = this.pendingRollId !== null;
+    const rollId = this.pendingRollId ?? slot;
     this.pendingRollId = rollId;
     // Before the spawn, so a writer that dies during the roll still leaves the
     // name behind for its successor.
     writePendingRoll(this.options.dataDir, rollId);
 
-    const outcome = await this.runRoll(rollId, bound.maxRowid);
+    const outcome = await this.runRoll(rollId, bound.maxRowid, retry);
     if (!outcome.ok) {
       this.options.log(
         `roll ${rollId} did not finish (${outcome.why}); ${bound.rows} rows stay in the hot store`,
@@ -151,6 +162,7 @@ export class RollScheduler {
   private runRoll(
     rollId: number,
     maxRowid: number,
+    retry: boolean,
   ): Promise<{ ok: true; summary: string } | { ok: false; why: string }> {
     const args = [
       ROLL_ENTRY,
@@ -160,6 +172,10 @@ export class RollScheduler {
       String(maxRowid),
       "--roll-id",
       String(rollId),
+      // Only a retry is allowed to replace a file. Otherwise a roll that
+      // arrives at a name already taken fails loudly instead of overwriting
+      // history with a fraction of it.
+      ...(retry ? ["--replace"] : []),
     ];
     const child = (this.options.spawnRoll ?? defaultSpawn)(args);
     this.running = child;

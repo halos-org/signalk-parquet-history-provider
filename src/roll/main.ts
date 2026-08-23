@@ -9,7 +9,7 @@ import { roll } from "./roll.js";
  * back in-process, so a long-lived engine would turn a two-second transient
  * into a standing cost on a device chosen for not having one.
  *
- *   node dist/roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms>
+ *   node dist/roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms> [--replace]
  *
  * On success it prints one JSON line describing what it wrote — including
  * this process's own peak resident size, which is the figure the design is
@@ -52,6 +52,8 @@ async function main(): Promise<void> {
     maxRowid: requireNumber("--max-rowid"),
     rollId: requireNumber("--roll-id"),
     memoryLimit: argValue("--memory-limit"),
+    // Only a retry of a roll that already wrote something may replace it.
+    replace: process.argv.includes("--replace"),
   });
   // The peak belongs to the process, not to the roll, and only the process
   // can read its own high-water mark before it is gone.

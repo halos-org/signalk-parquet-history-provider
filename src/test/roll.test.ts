@@ -152,11 +152,32 @@ describe("a roll", () => {
       dataDir: dir,
       maxRowid: store.rollBound()!.maxRowid,
       rollId: 42,
+      replace: true,
     });
 
     assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), ["42.parquet"]);
     assert.equal(second.rows, 2);
     assert.equal(readParquet(second.files[0].path).length, 2);
+  });
+
+  it("refuses to replace a file when it is not a retry", async () => {
+    // The failure this exists for: a schedule that read the clock a
+    // millisecond early named the slot before it, whose file was already
+    // written, and replaced 2.5M rows with the two minutes since. Measured on
+    // a device. A roll arriving at a name already taken now fails instead.
+    record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+    await roll({ dataDir: dir, maxRowid: 1, rollId: 42 });
+    const before = readParquet(join(dateDirectory(dir, AUG_23), "42.parquet"));
+
+    record(sample({ ts: AUG_23 + 2000, path: "c.d" }));
+    await assert.rejects(
+      () => roll({ dataDir: dir, maxRowid: 2, rollId: 42 }),
+      /already exists/,
+    );
+    assert.deepEqual(
+      readParquet(join(dateDirectory(dir, AUG_23), "42.parquet")),
+      before,
+    );
   });
 
   it("refuses a bound that is not a rowid", async () => {

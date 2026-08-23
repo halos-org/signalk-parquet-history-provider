@@ -69,6 +69,15 @@ export interface RollOptions {
    */
   rollId: number;
   memoryLimit?: string;
+  /**
+   * Whether this roll may replace a file that already carries its name.
+   *
+   * Only a retry may. A fresh roll that finds its name taken has been handed
+   * an id that belongs to an earlier roll, and overwriting would replace that
+   * roll's rows with a fraction of them — which is exactly what a schedule
+   * reading the clock a millisecond early once did on a device.
+   */
+  replace?: boolean;
 }
 
 export interface RolledFile {
@@ -121,7 +130,14 @@ export async function roll(options: RollOptions): Promise<RollResult> {
     const files: RolledFile[] = [];
     for (const day of await coveredDays(connection, maxRowid)) {
       files.push(
-        await writeDay({ connection, dataDir, rollId, maxRowid, day }),
+        await writeDay({
+          connection,
+          dataDir,
+          rollId,
+          maxRowid,
+          day,
+          replace: options.replace === true,
+        }),
       );
     }
     const sidecarRows = await writeSidecar({ connection, dataDir, maxRowid });
@@ -166,8 +182,9 @@ async function writeDay(args: {
   rollId: number;
   maxRowid: number;
   day: number;
+  replace: boolean;
 }): Promise<RolledFile> {
-  const { connection, dataDir, rollId, maxRowid, day } = args;
+  const { connection, dataDir, rollId, maxRowid, day, replace } = args;
   const from = day * DAY_MS;
   mkdirSync(dateDirectory(dataDir, from), {
     recursive: true,
@@ -175,6 +192,12 @@ async function writeDay(args: {
   });
   const temp = rollTempFile(dataDir, from, rollId);
   const final = rollFile(dataDir, from, rollId);
+  if (!replace && existsSync(final)) {
+    throw new Error(
+      `${final} already exists and this roll is not a retry. Overwriting it ` +
+        `would replace an earlier roll's rows with a subset of them.`,
+    );
+  }
 
   // No ORDER BY. The scan follows rowid, which is insertion order, which is
   // arrival order — so rows come out in timestamp order already and the row

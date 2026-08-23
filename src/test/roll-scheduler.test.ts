@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import {
   existsSync,
@@ -23,6 +23,8 @@ import type { Sample } from "../writer/protocol.js";
 const AUG_23 = Date.UTC(2026, 7, 23);
 /** 14:37 on the 23rd: mid-slot for every interval under test. */
 const NOW = Date.UTC(2026, 7, 23, 14, 37, 12);
+/** The slot the schedule would have armed for at NOW. */
+const SLOT = Date.UTC(2026, 7, 23, 15, 0, 0);
 
 let dir: string;
 let store: HotStore;
@@ -46,6 +48,24 @@ afterEach(() => {
   }
   rmSync(dir, { recursive: true, force: true });
 });
+
+/** How many rows a Parquet file holds, read the way a reader would. */
+function readParquetRows(path: string): number {
+  const probe = [
+    `const { DuckDBInstance } = await import("@duckdb/node-api");`,
+    `const c = await (await DuckDBInstance.create(":memory:")).connect();`,
+    `const r = await c.runAndReadAll(${JSON.stringify(
+      `SELECT count(*) FROM read_parquet('${path}')`,
+    )});`,
+    `console.log(String(r.getRowsJS()[0][0]));`,
+  ].join("\n");
+  return Number(
+    execFileSync(process.execPath, ["--input-type=module", "-e", probe], {
+      encoding: "utf8",
+      timeout: 60_000,
+    }).trim(),
+  );
+}
 
 function record(...samples: Sample[]): void {
   seq += 1;
@@ -94,7 +114,7 @@ describe("a scheduled roll", () => {
       },
     });
 
-    await rolls.rollOnce();
+    await rolls.rollOnce(SLOT);
 
     assert.equal(seenRowid, "2");
     assert.equal(store.rowCount(), 1);
@@ -110,10 +130,10 @@ describe("a scheduled roll", () => {
         return SUCCEEDS([]);
       },
     });
-    await rolls.rollOnce();
+    await rolls.rollOnce(SLOT);
     assert.equal(
       new Date(Number(rollId)).toISOString(),
-      "2026-08-23T14:00:00.000Z",
+      "2026-08-23T15:00:00.000Z",
     );
   });
 
@@ -125,7 +145,7 @@ describe("a scheduled roll", () => {
         return SUCCEEDS([]);
       },
     });
-    await rolls.rollOnce();
+    await rolls.rollOnce(SLOT);
     assert.equal(spawned, 0);
     // Not even a directory: an empty roll leaves no trace in the tree.
     assert.ok(!existsSync(join(dir, DATA_LAYOUT.tree)));
@@ -135,7 +155,7 @@ describe("a scheduled roll", () => {
 describe("a roll that does not finish", () => {
   it("leaves the hot store intact when the roll fails", async () => {
     record(sample({ ts: AUG_23 }), sample({ ts: AUG_23 + 1 }));
-    await scheduler({ spawnRoll: FAILS }).rollOnce();
+    await scheduler({ spawnRoll: FAILS }).rollOnce(SLOT);
 
     assert.equal(store.rowCount(), 2);
     assert.match(logged.join("\n"), /did not finish .*code 3.*2 rows stay/s);
@@ -143,7 +163,7 @@ describe("a roll that does not finish", () => {
 
   it("kills a roll that overruns and still does not truncate", async () => {
     record(sample({ ts: AUG_23 }));
-    await scheduler({ spawnRoll: HANGS, timeoutMs: 50 }).rollOnce();
+    await scheduler({ spawnRoll: HANGS, timeoutMs: 50 }).rollOnce(SLOT);
 
     assert.equal(store.rowCount(), 1);
     assert.match(logged.join("\n"), /exceeded its timeout/);
@@ -163,10 +183,10 @@ describe("a roll that does not finish", () => {
         return FAILS([]);
       },
     });
-    await failing.rollOnce();
+    await failing.rollOnce(SLOT);
     // An hour later, which is a different slot and would be a different name.
     clock = NOW + 3_600_000;
-    await failing.rollOnce();
+    await failing.rollOnce(SLOT + 3_600_000);
 
     assert.equal(ids.length, 2);
     assert.equal(ids[0], ids[1]);
@@ -183,10 +203,10 @@ describe("a roll that does not finish", () => {
         return SUCCEEDS([]);
       },
     });
-    await rolls.rollOnce();
+    await rolls.rollOnce(SLOT);
     record(sample({ ts: AUG_23 + 5 }));
     clock = NOW + 3_600_000;
-    await rolls.rollOnce();
+    await rolls.rollOnce(SLOT + 3_600_000);
 
     assert.equal(ids.length, 2);
     assert.notEqual(ids[0], ids[1]);
@@ -201,7 +221,7 @@ describe("a roll left unfinished by a writer that died", () => {
     record(sample({ ts: AUG_23 }));
     const first = scheduler({ spawnRoll: FAILS });
     const ids: string[] = [];
-    await first.rollOnce();
+    await first.rollOnce(SLOT);
 
     // A new scheduler over the same data directory: a new writer process.
     const successor = scheduler({
@@ -211,16 +231,16 @@ describe("a roll left unfinished by a writer that died", () => {
       },
       now: () => NOW + 3_600_000,
     });
-    await successor.rollOnce();
+    await successor.rollOnce(SLOT + 3_600_000);
 
     assert.equal(ids.length, 1);
-    assert.equal(Number(ids[0]), Date.UTC(2026, 7, 23, 14, 0, 0));
+    assert.equal(Number(ids[0]), SLOT);
     assert.match(logged.join("\n"), /left unfinished/);
   });
 
   it("forgets the name once a roll has been truncated", async () => {
     record(sample({ ts: AUG_23 }));
-    await scheduler().rollOnce();
+    await scheduler().rollOnce(SLOT);
     assert.ok(!existsSync(writerPaths(dir).pendingRoll));
 
     record(sample({ ts: AUG_23 + 1 }));
@@ -232,16 +252,52 @@ describe("a roll left unfinished by a writer that died", () => {
       },
       now: () => NOW + 3_600_000,
     });
-    await later.rollOnce();
-    assert.equal(Number(ids[0]), Date.UTC(2026, 7, 23, 15, 0, 0));
+    await later.rollOnce(SLOT + 3_600_000);
+    assert.equal(Number(ids[0]), SLOT + 3_600_000);
   });
 
   it("ignores a pending file it cannot read", async () => {
     // A corrupt safeguard must not be able to stop a device rolling.
     writeFileSync(writerPaths(dir).pendingRoll, "not json");
     record(sample({ ts: AUG_23 }));
-    await scheduler().rollOnce();
+    await scheduler().rollOnce(SLOT);
     assert.equal(store.rowCount(), 0);
+  });
+});
+
+describe("a roll that would land on a name already taken", () => {
+  it("fails rather than replacing it, and truncates nothing", async () => {
+    // Only a retry may replace a file. A fresh roll handed an id that already
+    // has a file has been given the wrong slot, and writing it would replace
+    // that roll's rows with a fraction of them.
+    record(sample({ ts: AUG_23, path: "a.b" }));
+    const first = new RollScheduler({
+      store,
+      dataDir: dir,
+      intervalMinutes: 60,
+      log: (line) => logged.push(line),
+      now: () => NOW,
+    });
+    await first.rollOnce(SLOT);
+    assert.equal(store.rowCount(), 0);
+
+    record(sample({ ts: AUG_23 + 1, path: "c.d" }));
+    const second = new RollScheduler({
+      store,
+      dataDir: dir,
+      intervalMinutes: 60,
+      log: (line) => logged.push(line),
+      now: () => NOW,
+    });
+    // The same slot again: what an early-firing timer used to produce.
+    await second.rollOnce(SLOT);
+
+    assert.equal(store.rowCount(), 1, "nothing may be truncated");
+    assert.match(logged.join("\n"), /did not finish/);
+    assert.equal(
+      readParquetRows(join(dateDirectory(dir, AUG_23), `${SLOT}.parquet`)),
+      1,
+    );
   });
 });
 
@@ -256,7 +312,7 @@ describe("stopping", () => {
       },
     });
     await rolls.stop();
-    await rolls.rollOnce();
+    await rolls.rollOnce(SLOT);
     assert.equal(spawned, 0);
     assert.equal(store.rowCount(), 1);
   });
@@ -264,7 +320,7 @@ describe("stopping", () => {
   it("kills a roll in flight and truncates nothing", async () => {
     record(sample({ ts: AUG_23 }));
     const rolls = scheduler({ spawnRoll: HANGS });
-    const inFlight = rolls.rollOnce();
+    const inFlight = rolls.rollOnce(SLOT);
     // Let the child reach the event loop before stopping it.
     await new Promise((resolve) => setTimeout(resolve, 50));
     await rolls.stop();
@@ -288,11 +344,11 @@ describe("the real roll process, driven by the scheduler", () => {
       log: (line) => logged.push(line),
       now: () => NOW,
     });
-    await rolls.rollOnce();
+    await rolls.rollOnce(SLOT);
 
     assert.equal(store.rowCount(), 0);
     assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), [
-      `${Date.UTC(2026, 7, 23, 14, 0, 0)}.parquet`,
+      `${SLOT}.parquet`,
     ]);
     assert.match(logged.join("\n"), /2 rows to 2026-08-23 and 2 sidecar rows/);
   });
