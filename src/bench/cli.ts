@@ -36,6 +36,8 @@ import {
 const SELFTEST_WRITE_INTERVAL_MS = 250;
 import { createProcSampler, parseSubjectSpec } from "./subjects.js";
 import { measureOneShot } from "./one-shot.js";
+import { QueryRunner } from "../query/duck.js";
+import type { QueryRequest } from "../query/duck.js";
 import { writerPaths } from "../writer/contract.js";
 import { probeLiveWriter } from "../writer/server.js";
 
@@ -202,13 +204,16 @@ async function doRoll(argv: string[]): Promise<void> {
 }
 
 /**
- * One query, measured from the outside.
+ * A series of queries against one query service, measured through the client
+ * the plugin uses.
  *
- * **Wall clock is from spawn, not from the engine.** Process start, extension
- * load and the tree's Parquet footers are paid before a row is read, and they
- * outweigh a well-shaped query over a day of data — so an in-engine figure
- * describes something no request can buy. The query's own `queryMs` is
- * reported beside this one so the difference stays visible.
+ * **Every run is reported, and the first one is not an outlier to discard.**
+ * It pays to start the engine — ~345 ms on the device — and every run after it
+ * does not, which is the whole shape of this design. A mean across them would
+ * describe neither.
+ *
+ * The service's own resident size comes back with each answer, because a
+ * process that stays is judged on what it holds as well as on what it takes.
  *
  * Safe against a live writer, unlike `roll`: a query only reads.
  */
@@ -233,6 +238,9 @@ async function doQuery(argv: string[]): Promise<void> {
   if (!values.from || !values.to) {
     throw new Error("--from and --to are required, in epoch milliseconds");
   }
+  if (!["range", "paths", "contexts"].includes(values.kind)) {
+    throw new Error(`--kind "${values.kind}" is not range, paths or contexts`);
+  }
   requireLinux();
 
   // Through `numberOr`, which names the offending text. `Number("noon")` is
@@ -245,43 +253,30 @@ async function doQuery(argv: string[]): Promise<void> {
     context: values.context,
     ...(values.path.length > 0 ? { paths: values.path } : {}),
     ...(values.limit ? { limit: numberOr(values.limit, 0) } : {}),
-  };
+  } as QueryRequest;
   const repeat = numberOr(values.repeat, 3);
   if (repeat < 1) throw new Error(`--repeat ${repeat} measures nothing`);
 
-  // Repeated, and every run reported. One figure from one run says nothing
-  // about a query whose first call pays for a page cache the second one finds
-  // warm — which is the difference this harness exists to keep visible.
+  const runner = new QueryRunner({
+    dataDir,
+    memoryLimit: values["memory-limit"],
+    onError: (line) => console.error(line),
+  });
   const runs = [];
-  for (let attempt = 0; attempt < repeat; attempt += 1) {
-    const result = await measureOneShot({
-      command: process.execPath,
-      args: [
-        join(HERE, "..", "query", "main.js"),
-        "--data-dir",
-        dataDir,
-        ...(values["memory-limit"]
-          ? ["--memory-limit", values["memory-limit"]]
-          : []),
-      ],
-      stdin: `${JSON.stringify(request)}\n`,
-      selfReportedPeak: (stdout) => summaryOf(stdout)?.peakRssBytes ?? null,
-    });
-    if (result.exitCode !== 0) {
-      throw new Error(
-        `the query exited ${result.exitCode}: ${result.stderr.trim()}`,
-      );
+  try {
+    for (let attempt = 0; attempt < repeat; attempt += 1) {
+      const result = await runner.run(request);
+      runs.push({
+        wallMs: Math.round(result.wallMs),
+        rows: result.rows.length,
+        truncated: result.truncated,
+        treeFiles: result.treeFiles,
+        serviceMb: mb(result.rssBytes),
+        servicePeakMb: mb(result.peakRssBytes),
+      });
     }
-    const summary = summaryOf(result.stdout);
-    runs.push({
-      wallMs: Math.round(result.wallMs),
-      queryMs: summary?.queryMs ?? null,
-      rows: summary?.rows ?? null,
-      truncated: summary?.truncated ?? null,
-      treeFiles: summary?.treeFiles ?? null,
-      peakMb: +(result.peakBytes / 1048576).toFixed(1),
-      peakSource: result.peakSource,
-    });
+  } finally {
+    runner.stop();
   }
 
   const json = `${JSON.stringify({ request, runs }, null, 2)}\n`;
@@ -293,24 +288,8 @@ async function doQuery(argv: string[]): Promise<void> {
   }
 }
 
-interface QuerySummary {
-  rows?: number;
-  truncated?: boolean;
-  treeFiles?: number;
-  queryMs?: number;
-  peakRssBytes?: number | null;
-}
-
-/** The query's last line, which is its summary. Rows are arrays; this is not. */
-function summaryOf(stdout: string): QuerySummary | null {
-  try {
-    const parsed = JSON.parse(
-      stdout.trim().split("\n").pop() ?? "",
-    ) as QuerySummary;
-    return Array.isArray(parsed) ? null : parsed;
-  } catch {
-    return null;
-  }
+function mb(bytes: number | null): number | null {
+  return bytes === null ? null : +(bytes / 1048576).toFixed(1);
 }
 
 /**

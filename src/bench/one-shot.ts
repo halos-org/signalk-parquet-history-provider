@@ -48,14 +48,6 @@ export interface OneShotOptions {
    * stdout; returns bytes, or null when the output carries no such figure.
    */
   selfReportedPeak?: (stdout: string) => number | null;
-  /**
-   * Written to the subject's stdin, which is then closed.
-   *
-   * The query process takes its request this way, and a subject that reads
-   * stdin never finishes if nothing closes it — so the absence of this is
-   * `stdin: "ignore"` rather than an open pipe.
-   */
-  stdin?: string;
 }
 
 const DEFAULT_SAMPLE_INTERVAL_MS = 10;
@@ -65,13 +57,8 @@ export async function measureOneShot(
 ): Promise<OneShotResult> {
   const started = performance.now();
   const child = spawn(options.command, options.args, {
-    stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
   });
-  if (options.stdin !== undefined) {
-    // EPIPE, when the subject exits before reading it.
-    child.stdin?.on("error", () => {});
-    child.stdin?.end(options.stdin);
-  }
 
   let stdout = "";
   let stderr = "";
@@ -134,6 +121,23 @@ export function ownPeakBytes(): number | null {
   try {
     return parseProcStatusMemory(readFileSync("/proc/self/status", "utf8"))
       .peakBytes;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * This process's resident size now.
+ *
+ * The peak is what a process that exits is judged on; a process that stays
+ * needs the current figure beside it, because the two diverge — DuckDB does
+ * not return what a large query allocated, so a query service settles near its
+ * own high-water mark rather than back at its idle cost.
+ */
+export function ownResidentBytes(): number | null {
+  try {
+    return parseProcStatusMemory(readFileSync("/proc/self/status", "utf8"))
+      .rssBytes;
   } catch {
     return null;
   }

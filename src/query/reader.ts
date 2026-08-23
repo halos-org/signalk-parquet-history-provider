@@ -88,36 +88,35 @@ interface Plan {
   storeExists: boolean;
 }
 
-export async function read(
-  request: QueryRequest,
-  options: ReaderOptions,
-): Promise<ReadResult> {
-  validate(request);
-  const { dataDir } = options;
-  const plan = planSources(dataDir, request);
-  const sql = compile(request, plan);
-  if (sql === null) {
-    // Neither a tree file nor a hot store: a device that has recorded nothing,
-    // or a range that predates the oldest date directory. An empty answer, not
-    // an error — the history API's own answer for a range with no data.
-    return { rows: [], truncated: false, treeFiles: 0 };
-  }
+/** An engine held open, and the queries it answers. */
+export interface Reader {
+  read(request: QueryRequest): Promise<ReadResult>;
+  close(): void;
+}
 
-  // Per query, never the shared root, and removed in `finally`. A query can
-  // spill while a roll is spilling beside it, and DuckDB's default temp
-  // directory for an in-memory database is the current working directory —
-  // which for a process the plugin spawned is the Signal K server's.
-  const scratch = join(
-    dataDir,
-    DATA_LAYOUT.scratch,
-    `query-${process.pid}-${process.hrtime.bigint()}`,
-  );
+/**
+ * Start the engine.
+ *
+ * Everything expensive happens here and once: mapping the addon, creating the
+ * instance, expanding and loading `sqlite_scanner`, and locking the engine to
+ * the data directory. Measured on the device, that is ~345 ms of a cold
+ * query's ~600 ms, and it is why a query answers in 39–141 ms once this has
+ * run.
+ *
+ * The extension is loaded even though no store is attached yet, because the
+ * lockdown that follows would refuse it later. A device whose bundle cannot be
+ * loaded still gets a reader — the tree needs no SQLite — and the reason is
+ * kept for the first query that does need the store.
+ */
+export async function openReader(options: ReaderOptions): Promise<Reader> {
+  const { dataDir } = options;
+  // One directory for this process, not one per query. A query can spill while
+  // a roll is spilling beside it, and DuckDB's default temp directory for an
+  // in-memory database is the current working directory — which for a process
+  // the plugin spawned is the Signal K server's.
+  const scratch = join(dataDir, DATA_LAYOUT.scratch, `query-${process.pid}`);
   mkdirSync(scratch, { recursive: true, mode: DATA_DIR_MODE });
 
-  // Opened inside the scope that removes them. An engine that fails to start —
-  // a memory limit the device cannot honour, a temp directory it cannot write
-  // — would otherwise leave its scratch directory behind on every attempt, and
-  // only the next roll's hourly sweep would collect them.
   let instance: DuckDBInstance | null = null;
   let connection: DuckDBConnection | null = null;
   try {
@@ -127,26 +126,90 @@ export async function read(
       temp_directory: scratch,
     });
     connection = await instance.connect();
+  } catch (err) {
+    connection?.closeSync();
+    instance?.closeSync();
+    rmSync(scratch, { recursive: true, force: true });
+    throw err;
+  }
+
+  let scannerFailure: string | null = null;
+  try {
+    await loadSqliteScanner(connection, {
+      cacheDir: join(dataDir, DATA_LAYOUT.extensionCache),
+    });
+  } catch (err) {
+    // Not fatal, and not silent either. Without the extension the hot store
+    // cannot be read, but the tree can — an old range still answers, and a
+    // recent one says why it cannot.
+    scannerFailure = err instanceof Error ? err.message : String(err);
+  }
+
+  // Everything legitimate is open, so nothing else may be. After this the
+  // engine cannot read a path outside the data directory, cannot install an
+  // extension and cannot have its configuration changed — which is what stops
+  // a crafted path or an unknown function from turning a query into a
+  // download. Attaching a database inside the allowed directory still works,
+  // which is what the per-query attach below relies on.
+  await lockDownFileAccess(connection, [dataDir]);
+
+  const live = connection;
+  return {
+    read: (request) =>
+      runOne(request, { dataDir, connection: live, scannerFailure }),
+    close: () => {
+      live.closeSync();
+      instance.closeSync();
+      rmSync(scratch, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * One query on an already-open engine.
+ *
+ * The hot store is attached per query and detached afterwards, for about a
+ * millisecond. Holding it would work — measured across processes, a held
+ * attachment still sees rows written after it and still lets the writer
+ * truncate its WAL — but attaching here also picks up a store that did not
+ * exist when the engine started, which on a fresh device is the first minute
+ * of its life.
+ */
+async function runOne(
+  request: QueryRequest,
+  context: {
+    dataDir: string;
+    connection: DuckDBConnection;
+    scannerFailure: string | null;
+  },
+): Promise<ReadResult> {
+  validate(request);
+  const { dataDir, connection } = context;
+  const plan = planSources(dataDir, request);
+  const sql = compile(request, plan);
+  if (sql === null) {
+    // Neither a tree file nor a hot store: a device that has recorded nothing,
+    // or a range that predates the oldest date directory. An empty answer, not
+    // an error — the history API's own answer for a range with no data.
+    return { rows: [], truncated: false, treeFiles: 0 };
+  }
+  if (plan.storeExists && context.scannerFailure !== null) {
+    throw new Error(
+      `this range needs the hot store and sqlite_scanner could not be loaded: ${context.scannerFailure}`,
+    );
+  }
+
+  let attached = false;
+  try {
     if (plan.storeExists) {
-      // Only when there is a store to attach. Loading the extension is 80 ms
-      // of a query's ~350 ms floor on the device, and a range old enough to
-      // sit entirely in the tree needs no SQLite at all.
-      await loadSqliteScanner(connection, {
-        cacheDir: join(dataDir, DATA_LAYOUT.extensionCache),
-      });
       // READ_ONLY: the writer owns this file and keeps ingesting throughout.
       // SQLite in WAL mode takes concurrent readers, which is why the hot
       // store is SQLite at all.
       await connection.run(
         `ATTACH '${sqlLiteral(writerPaths(dataDir).store)}' AS hot (TYPE SQLITE, READ_ONLY)`,
       );
+      attached = true;
     }
-    // Everything legitimate is now open, so nothing else may be. After this
-    // the engine cannot read a path outside the data directory, cannot install
-    // an extension and cannot have its configuration changed — which is what
-    // stops a crafted path or an unknown function from turning a query into a
-    // download.
-    await lockDownFileAccess(connection, [dataDir]);
 
     const limit = rowLimit(request);
     const result = await connection.runAndReadAll(sql.text, sql.params);
@@ -170,9 +233,9 @@ export async function read(
       treeFiles: plan.files.length,
     };
   } finally {
-    connection?.closeSync();
-    instance?.closeSync();
-    rmSync(scratch, { recursive: true, force: true });
+    // A left-over attachment would make the next query's `ATTACH` fail on the
+    // name, so every one of them would fail after the first that threw.
+    if (attached) await connection.run("DETACH hot").catch(() => {});
   }
 }
 

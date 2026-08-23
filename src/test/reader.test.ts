@@ -206,6 +206,50 @@ describe("what a query reads", { skip: NO_BUNDLED_EXTENSION }, () => {
     }
   });
 
+  it("picks up a hot store that appeared after the engine started", async () => {
+    // The first minute of a device's life: the plugin starts, the first query
+    // arrives, and the writer has not created the store yet. The engine is
+    // held open across both, so the store is attached per query rather than at
+    // startup — which is what makes this answer rather than stay empty.
+    const later = mkdtempSync(join(tmpdir(), "reader-later-"));
+    const fresh = new QueryRunner({ dataDir: later });
+    try {
+      const before = await fresh.run(range(AUG_23, AUG_23 + DAY));
+      assert.deepEqual(before.rows, [], "nothing has been recorded yet");
+
+      mkdirSync(join(later, DATA_LAYOUT.hotStore), { recursive: true });
+      const appeared = HotStore.open(writerPaths(later).store);
+      appeared.beginSession("later");
+      appeared.insertBatch(1, [sample({ ts: AUG_23 + 1000, path: "a.b" })]);
+      appeared.close();
+
+      const after = await fresh.run(range(AUG_23, AUG_23 + DAY));
+
+      assert.equal(after.rows.length, 1);
+      assert.equal(fresh.running, true, "and on the same engine");
+    } finally {
+      fresh.stop();
+      rmSync(later, { recursive: true, force: true });
+    }
+  });
+
+  it("answers a second query from the same engine", async () => {
+    series(AUG_23 + 1000, 2);
+    store.deleteThrough(await rollAll(1));
+    series(AUG_23 + 60_000, 2);
+
+    const first = await runner.run(range(AUG_23, AUG_23 + DAY));
+    const second = await runner.run(range(AUG_23, AUG_23 + DAY));
+
+    assert.equal(first.rows.length, 4);
+    assert.deepEqual(second.rows, first.rows);
+    assert.equal(runner.running, true);
+    // The engine that answered both is the same one, so the second query paid
+    // no startup — the only figure this side can see of that is that it was
+    // quicker, and a timing assertion in CI is not worth having. `duck.test.ts`
+    // asserts the process count instead.
+  });
+
   it("refuses a request whose shape reached it from JSON", async () => {
     // The type the request is cast to on arrival is a claim, not a check. An
     // unrecognised `kind` used to compile to the contexts query and answer it,
