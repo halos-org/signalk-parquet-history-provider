@@ -5,6 +5,16 @@ import type { Sample } from "./writer/protocol.js";
 const FRAME_ENVELOPE_BYTES = 128;
 
 /**
+ * The comma between two samples in the `samples` array.
+ *
+ * Charged to every entry rather than to every entry but the first, so one
+ * accounting model serves both limits: the memory budget over-counts by a
+ * single byte per batch, and the frame budget can never under-count, which is
+ * the direction that matters against a hard protocol limit.
+ */
+const SEPARATOR_BYTES = 1;
+
+/**
  * What the plugin holds between flushes.
  *
  * This is the whole of the Signal K process's storage involvement: append,
@@ -86,7 +96,7 @@ export class FlushBuffer {
   }
 
   add(sample: Sample, now: number): void {
-    const bytes = sampleBytes(sample);
+    const bytes = sampleBytes(sample) + SEPARATOR_BYTES;
     // Refused rather than admitted, against whichever ceiling is lower.
     //
     // The buffer's own ceiling is the obvious one: admitting a sample bigger
@@ -130,11 +140,11 @@ export class FlushBuffer {
     let count = 0;
     let bytes = 0;
     while (count < this.entries.length && count < this.options.batchSize) {
-      // The comma between array elements is a byte per sample beyond the
-      // first, and at these batch sizes that is not a rounding error: a batch
-      // of ~54,000 small samples summed to 4,194,138 bytes and framed to
+      // Every entry already carries its separator, so this is a plain sum.
+      // Ignoring separators is not a rounding error at these batch sizes: a
+      // batch of ~54,000 small samples summed to 4,194,138 bytes and framed to
       // 4,247,945, so encodeFrame refused the batch this method produced.
-      const next = bytes + this.entries[count].bytes + (count === 0 ? 0 : 1);
+      const next = bytes + this.entries[count].bytes;
       if (count > 0 && next > budget) break;
       bytes = next;
       count++;
@@ -161,7 +171,7 @@ export class FlushBuffer {
   requeue(samples: Sample[]): void {
     const restored = samples.map((sample) => ({
       sample,
-      bytes: sampleBytes(sample),
+      bytes: sampleBytes(sample) + SEPARATOR_BYTES,
     }));
     this.entries.unshift(...restored);
     for (const entry of restored) this.bytes += entry.bytes;

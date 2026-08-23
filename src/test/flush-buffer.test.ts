@@ -140,7 +140,9 @@ describe("the ceiling is a byte budget", () => {
     buf.add(one, 0);
     buf.add(two, 0);
 
-    assert.strictEqual(buf.byteSize, sampleBytes(one) + sampleBytes(two));
+    // Each entry carries its own separator, so the buffer accounts for what a
+    // frame would cost rather than for the samples alone.
+    assert.strictEqual(buf.byteSize, sampleBytes(one) + sampleBytes(two) + 2);
     buf.take(0);
     assert.strictEqual(buf.byteSize, 0);
   });
