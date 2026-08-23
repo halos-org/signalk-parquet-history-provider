@@ -107,13 +107,23 @@ export class Recorder {
     const context = isSelf ? SELF_CONTEXT : item.context;
 
     // Static vessel identity arrives as an empty-path object delta, which the
-    // path guard below would drop. Deliberately ahead of the filter and the
-    // rate cap: this is identity, not a data stream, so an include-mode filter
-    // would silently disable it and the shared throttle would drop most of the
-    // opening burst when many vessels appear at once. The per-context dedupe
-    // is what bounds it instead.
+    // path guard below would drop. Deliberately ahead of the path filter and
+    // the rate cap: this is identity, not a data stream, so an include-mode
+    // filter would silently disable it and the shared throttle would drop most
+    // of the opening burst when many vessels appear at once. The per-context
+    // dedupe is what bounds it instead.
+    //
+    // It is NOT ahead of the record-self and record-others gates, which is
+    // where this differs from the sibling. Measured on a device with the
+    // default `recordOthers: false`: 16 contexts existed holding nothing but
+    // an identity row each -- AIS vessels, meteo stations, navigation aids --
+    // and each one becomes a partition in the roll for one or two rows. A name
+    // for a vessel whose data is not recorded answers no query and costs a
+    // partition, and recording it contradicts the setting the operator chose.
     const name = extractVesselName(item.path, item.value);
     if (name !== null) {
+      if (isSelf && !this.config.recordSelf) return;
+      if (!isSelf && !this.config.recordOthers) return;
       if (this.lastNameByContext.get(context) === name) return;
       if (!this.admitContext(context)) return;
       this.lastNameByContext.set(context, name);

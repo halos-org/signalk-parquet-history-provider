@@ -124,7 +124,7 @@ describe("what reaches the writer", () => {
 
 describe("vessel identity", () => {
   it("records an empty-path name delta under the identity kind", () => {
-    const t = build();
+    const t = build({ recordOthers: true });
     t.recorder.handle({
       context: OTHER,
       path: "",
@@ -147,7 +147,7 @@ describe("vessel identity", () => {
   it("records a name once per context until it changes", () => {
     // AIS static data repeats every few minutes for every target in range.
     // Without the dedupe that is a row per target per repeat, forever.
-    const t = build();
+    const t = build({ recordOthers: true });
     const identity = (name: string) => ({
       context: OTHER,
       path: "",
@@ -165,11 +165,42 @@ describe("vessel identity", () => {
     );
   });
 
+  it("skips a name for a vessel whose data is not recorded", () => {
+    // Measured on a device: with the default recordOthers off, 16 contexts
+    // held nothing but an identity row each -- AIS vessels, meteo stations,
+    // navigation aids -- and every one becomes a partition in the roll for one
+    // or two rows. A name for a vessel nothing else is recorded for answers no
+    // query, and recording it contradicts the setting the operator chose.
+    const t = build({ recordOthers: false });
+    t.recorder.handle({
+      context: OTHER,
+      path: "",
+      value: { name: "SEA BREEZE" },
+    });
+    t.recorder.handle({
+      context: "atons.urn:mrn:imo:mmsi:992306506",
+      path: "",
+      value: { name: "KUSTAANMIEKKA" },
+    });
+
+    assert.deepStrictEqual(t.samples, []);
+    assert.strictEqual(t.recorder.stats.contexts, 0, "no partition was opened");
+  });
+
+  it("records the own vessel's name whatever recordOthers says", () => {
+    const t = build({ recordOthers: false });
+    t.recorder.handle({ context: SELF, path: "", value: { name: "HURMA" } });
+
+    assert.strictEqual(t.samples.length, 1);
+    assert.strictEqual(t.samples[0].context, SELF_CONTEXT);
+  });
+
   it("records identity even when an include filter names other paths", () => {
     // Identity is not a data stream. An include-mode filter listing only data
     // paths would otherwise silently disable vessel names, and Freeboard reads
     // names from nowhere else.
     const t = build({
+      recordOthers: true,
       pathFilter: { mode: "include", paths: ["navigation.*"] },
     });
     t.recorder.handle({
@@ -351,7 +382,7 @@ describe("the cardinality cap", () => {
   it("bounds identity rows by the context cap too", () => {
     // Otherwise a flood of AIS names walks straight past the bound the cap
     // exists to enforce, since identity skips the filter and the rate cap.
-    const t = build({ maxRecordedContexts: 1 });
+    const t = build({ recordOthers: true, maxRecordedContexts: 1 });
     t.feed();
     for (let i = 0; i < 10; i++) {
       t.recorder.handle({
