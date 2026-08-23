@@ -14,11 +14,24 @@ anyone queries it.
 
 ## Status
 
-Recording works: the plugin filters, rate-caps and buffers, and a separate
-writer process owns a SQLite hot store. The roll into Parquet, the query layer
-and the two history API surfaces are not implemented yet, so nothing reads this
+Recording and rolling work: the plugin filters, rate-caps and buffers, a
+separate writer process owns a SQLite hot store, and the writer rolls that
+store into a Parquet tree on a schedule and truncates it. The query layer and
+the two history API surfaces are not implemented yet, so nothing reads this
 data back yet. Progress is tracked in
 [halos-org/halos#152](https://github.com/halos-org/halos/issues/152).
+
+## The tree
+
+    <data directory>/
+      hot/hot.sqlite            the writer's store, truncated after each roll
+      parquet/date=YYYY-MM-DD/  one file per roll, named for the slot it ran in
+      latest/latest.parquet     every path's last value, cumulative
+
+`context` and `path` are columns, never directories, and each row lands under
+the date its own timestamp names — so a roll spanning midnight writes two
+files. Why it is shaped this way, with the measurements behind it, is
+`docs/layout-decision.md`.
 
 ## Installation
 
