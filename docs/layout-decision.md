@@ -281,6 +281,32 @@ the sidecar's does not.
 It bounds the tree half of that query only. The hot-store half is still a full
 scan — 94 ms at 13 MB, 441 ms at 130 MB — which is the roll interval again.
 
+## What the shipped roll measures, on the device
+
+Unit 3b's roll, running on a HALPI2 against a copy of a live hot store —
+2,493,029 rows, 552 `(context, path)` pairs — through `./run bench roll`. The
+figure is the roll process's own `VmHWM`, with an external poll of `/proc`
+beside it as a cross-check; the two agreed to within 1% on every run.
+
+| rows      | peak     | wall  |
+| --------- | -------- | ----- |
+| 156,000   | 146.1 MB | 4.2 s |
+| 623,000   | 161.0 MB | 4.3 s |
+| 1,246,000 | 159.6 MB | 4.8 s |
+| 2,493,029 | 163.0 MB | 6.1 s |
+
+Sixteen times the rows for 12% more memory. That is the streaming claim this
+layout rests on, now measured through the shipped code rather than a scratch
+script, and it is better than this document's own scale test (204–246 MB at
+11.4M rows) because that test unioned one store with itself nine times and
+widened every scan.
+
+**The first roll after a DuckDB version change costs 40–50 MB more**, twice
+reproduced: 194–204 MB cold against 152–154 MB warm, at the same row count. It
+is the bundled `sqlite_scanner` being gunzipped from 8 MB to 27 MB into the
+roll's own heap before any query runs. One roll per device per version pays it,
+and nothing was added to avoid it.
+
 ## Provisional
 
 **Every query figure here is provisional, including the ordering between
