@@ -1,5 +1,5 @@
 import { createServer } from "node:net";
-import { chmodSync, rmSync } from "node:fs";
+import { chmodSync, rmSync, writeSync } from "node:fs";
 import { ownPeakBytes } from "../bench/one-shot.js";
 import {
   EXIT_LOCKED,
@@ -38,6 +38,18 @@ import { NameTakenError, roll } from "./roll.js";
  * one failure a retry under the same id must not inherit.
  */
 
+/**
+ * Write to stderr and be sure it arrives.
+ *
+ * `process.stderr.write` is asynchronous when stderr is a pipe — which it
+ * always is here, since the parent spawns this with piped stdio — and
+ * `process.exit` right after it truncates whatever is still queued. The
+ * message this loses is the one the parent logs as the reason.
+ */
+function writeStderr(line: string): void {
+  writeSync(2, line);
+}
+
 function argValue(flag: string): string | undefined {
   const index = process.argv.indexOf(flag);
   return index >= 0 ? process.argv[index + 1] : undefined;
@@ -55,7 +67,7 @@ function requireNumber(flag: string): number {
 async function main(): Promise<void> {
   const dataDir = argValue("--data-dir");
   if (dataDir === undefined || dataDir === "") {
-    process.stderr.write(
+    writeStderr(
       "usage: roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms>\n",
     );
     process.exit(1);
@@ -68,7 +80,7 @@ async function main(): Promise<void> {
   // file — that lesson is already written down in writer/server.ts.
   const paths = writerPaths(dataDir);
   if (await probeLiveWriter(paths.rollSocket)) {
-    process.stderr.write(
+    writeStderr(
       `a roll is already running against ${dataDir}; refusing to start a second one\n`,
     );
     process.exit(EXIT_LOCKED);
@@ -100,7 +112,7 @@ async function main(): Promise<void> {
 main().catch((err: unknown) => {
   // The message first, then the stack. The scheduler reports the first line,
   // and a stack frame tells an operator nothing about why the roll stopped.
-  process.stderr.write(
+  writeStderr(
     `${err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err)}\n`,
   );
   process.exit(err instanceof NameTakenError ? EXIT_NAME_TAKEN : 1);

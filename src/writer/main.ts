@@ -1,4 +1,10 @@
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR_MODE, DATA_LAYOUT } from "../data-dir.js";
 import { dividesTheDay } from "../roll/schedule.js";
@@ -24,6 +30,18 @@ import { EXIT_LOCKED, writerPaths } from "./contract.js";
  *   1  anything else
  */
 
+/**
+ * Write to stderr and be sure it arrives.
+ *
+ * `process.stderr.write` is asynchronous when stderr is a pipe — which it
+ * always is here, since the parent spawns this with piped stdio — and
+ * `process.exit` right after it truncates whatever is still queued. The
+ * message this loses is the one the parent logs as the reason.
+ */
+function writeStderr(line: string): void {
+  writeSync(2, line);
+}
+
 function argValue(flag: string): string | undefined {
   const index = process.argv.indexOf(flag);
   return index >= 0 ? process.argv[index + 1] : undefined;
@@ -32,7 +50,7 @@ function argValue(flag: string): string | undefined {
 async function main(): Promise<void> {
   const dataDir = argValue("--data-dir");
   if (dataDir === undefined || dataDir === "") {
-    process.stderr.write(
+    writeStderr(
       "usage: writer/main.js --data-dir <path> --roll-interval-minutes <n>\n",
     );
     process.exit(1);
@@ -43,7 +61,7 @@ async function main(): Promise<void> {
   // fatal — recording stopped for a missing argument.
   const rollIntervalMinutes = Number(argValue("--roll-interval-minutes"));
   if (!dividesTheDay(rollIntervalMinutes)) {
-    process.stderr.write(
+    writeStderr(
       `--roll-interval-minutes must be a whole number of minutes dividing 1440, ` +
         `not ${argValue("--roll-interval-minutes") ?? "(missing)"}\n`,
     );
@@ -70,7 +88,7 @@ async function main(): Promise<void> {
     if (err instanceof StoreLockedError) {
       // Named separately from any other failure because the plugin's remedy is
       // different: a second writer is a problem to resolve, not to retry.
-      process.stderr.write(`${err.message}\n`);
+      writeStderr(`${err.message}\n`);
       process.exit(EXIT_LOCKED);
     }
     throw err;
@@ -90,7 +108,7 @@ async function main(): Promise<void> {
     // stderr, because the plugin routes it to app.error while stdout goes to
     // app.debug. A roll failure nobody sees is the shape this whole design
     // exists to make impossible.
-    onError: (line) => process.stderr.write(`${line}\n`),
+    onError: (line) => writeStderr(`${line}\n`),
   });
   rolls.start();
 
@@ -110,7 +128,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  process.stderr.write(
+  writeStderr(
     `${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
   );
   process.exit(1);
