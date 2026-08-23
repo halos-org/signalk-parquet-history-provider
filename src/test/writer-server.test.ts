@@ -239,6 +239,136 @@ describe("batches", () => {
   });
 });
 
+describe("one client at a time", () => {
+  async function greet(session: string) {
+    const c = client();
+    c.socket.write(encodeFrame({ type: "hello", session }));
+    await until(c.messages, 1);
+    return c;
+  }
+
+  it("does not let a second connection move the first one's sequence counter", async () => {
+    // Reproduced before this guard existed: the store's session and counter are
+    // process-global, so one hello plus one batch at a huge sequence number
+    // from a second connection made every later legitimate batch skip as a
+    // duplicate -- acknowledged, never written, for as long as the writer ran,
+    // with the plugin reporting "Recording" throughout.
+    const legit = await greet("legit-run");
+    legit.socket.write(
+      encodeFrame({ type: "batch", seq: 1, samples: [sample()] }),
+    );
+    await until(legit.messages, 2);
+    assert.strictEqual(store.rowCount(), 1);
+
+    const intruder = await greet("second-connection");
+    intruder.socket.write(
+      encodeFrame({
+        type: "batch",
+        seq: 9_007_199_254_740_000,
+        samples: [sample()],
+      }),
+    );
+    await until(intruder.messages, 2);
+
+    // The incumbent was closed rather than left to write under a counter it
+    // does not know about.
+    await new Promise<void>((resolve) =>
+      legit.socket.destroyed
+        ? resolve()
+        : legit.socket.on("close", () => resolve()),
+    );
+
+    // A fresh session behaves normally, which is what a reconnecting plugin does.
+    const rejoined = await greet("legit-run");
+    rejoined.socket.write(
+      encodeFrame({ type: "batch", seq: 1, samples: [sample()] }),
+    );
+    const [, ack] = await until(rejoined.messages, 2);
+    assert.strictEqual(ack.type, "ack");
+    assert.strictEqual(
+      (ack as { stored: number }).stored,
+      1,
+      "the rejoining client's batch was skipped as a duplicate",
+    );
+  });
+
+  it("refuses a second hello on a connection that already has a session", async () => {
+    const c = await greet("s1");
+    c.socket.write(encodeFrame({ type: "hello", session: "s2" }));
+
+    const [, reply] = await until(c.messages, 2);
+    assert.strictEqual(reply.type, "error");
+    assert.match(
+      (reply as { message: string }).message,
+      /already has a session/,
+    );
+  });
+});
+
+describe("a store failure during the handshake", () => {
+  it("is answered, not thrown out of the socket handler", async () => {
+    // beginSession runs SELECT, INSERT and UPDATE. Unguarded, a throw here
+    // escapes the data handler, is not covered by main()'s catch, and kills
+    // the writer -- which nothing respawns.
+    const lines: string[] = [];
+    await server?.close();
+    store.close();
+    server = await WriterServer.listen({
+      socketPath,
+      store,
+      log: (line) => lines.push(line),
+    });
+
+    const c = client();
+    c.socket.write(encodeFrame({ type: "hello", session: "s1" }));
+
+    const [reply] = await until(c.messages, 1);
+    assert.strictEqual(reply.type, "error");
+    assert.match(
+      (reply as { message: string }).message,
+      /starting the session failed/,
+    );
+    // The writer is still serving, which is the point.
+    assert.strictEqual(server!.connectionCount >= 1, true);
+
+    store = HotStore.open(join(dir, "hot.sqlite"));
+  });
+
+  it('names the SQLite cause rather than the constant "Error"', async () => {
+    // Every node:sqlite failure is a plain Error, so the name alone makes a
+    // full disk and a corrupt store indistinguishable to an operator.
+    const lines: string[] = [];
+    await server?.close();
+    store.close();
+    store = HotStore.open(join(dir, "hot.sqlite"));
+    server = await WriterServer.listen({
+      socketPath,
+      store,
+      log: (line) => lines.push(line),
+    });
+
+    const c = client();
+    c.socket.write(encodeFrame({ type: "hello", session: "s1" }));
+    await until(c.messages, 1);
+    store.close();
+    c.socket.write(encodeFrame({ type: "batch", seq: 1, samples: [sample()] }));
+
+    const [, reply] = await until(c.messages, 2);
+    assert.strictEqual(reply.type, "error");
+    assert.match(
+      (reply as { message: string }).message,
+      /ERR_/,
+      "the reply names no SQLite code",
+    );
+    assert.ok(
+      lines.some((line) => /ERR_/.test(line)),
+      `the log names no SQLite code: ${JSON.stringify(lines)}`,
+    );
+
+    store = HotStore.open(join(dir, "hot.sqlite"));
+  });
+});
+
 describe("a frame it cannot trust ends the connection", () => {
   it("drops the connection on a malformed frame and stays up for the next one", async () => {
     const lines: string[] = [];

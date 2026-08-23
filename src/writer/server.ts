@@ -68,6 +68,29 @@ export function probeLiveWriter(socketPath: string): Promise<boolean> {
   });
 }
 
+/** The `code` node:sqlite actually sets, when there is one. */
+function errorCode(err: unknown): string | null {
+  const code = (err as { code?: unknown })?.code;
+  return typeof code === "string" ? code : null;
+}
+
+/**
+ * What went wrong, in terms an operator can act on.
+ *
+ * node:sqlite throws plain `Error`, so the name is always "Error" and says
+ * nothing. `code` separates a SQLite failure from a misused handle, and
+ * `errstr` names the condition -- "disk is full", "attempt to write a readonly
+ * database", "database disk image is malformed". Neither can contain a
+ * recorded value.
+ */
+function describeError(err: unknown): string {
+  const name = err instanceof Error ? err.name : "Error";
+  const code = errorCode(err);
+  const errstr = (err as { errstr?: unknown })?.errstr;
+  const detail = typeof errstr === "string" ? `: ${errstr}` : "";
+  return `${code ?? name}${detail}`;
+}
+
 export interface WriterServerOptions {
   socketPath: string;
   store: HotStore;
@@ -168,7 +191,54 @@ export class WriterServer {
   ): string | null {
     switch (message.type) {
       case "hello": {
-        const lastSeq = this.store.beginSession(message.session);
+        if (session !== null) {
+          // A connection gets one session. Without this a second hello on an
+          // established connection re-points the store's counter underneath
+          // the batches already in flight on it.
+          this.send(socket, {
+            type: "error",
+            seq: null,
+            message: "this connection already has a session",
+          });
+          return session;
+        }
+        // The store's session and sequence counter are process-global, so a
+        // second connection moving them is enough to make every batch on the
+        // first one skip as a duplicate: acknowledged, never written, for as
+        // long as the writer runs. Reproduced before this guard existed --
+        // one hello and one batch at seq 9007199254740000 from a second
+        // connection, and every later legitimate batch came back
+        // {"stored":0} while the plugin reported "Recording".
+        //
+        // The design says there is exactly one client, so enforce it: the
+        // newcomer wins and the incumbent is closed. Refusing the newcomer
+        // instead would let a stuck connection lock out the live plugin.
+        for (const other of this.sockets) {
+          if (other !== socket) {
+            this.log("closing an earlier connection: a new session arrived");
+            other.destroy();
+          }
+        }
+        let lastSeq: number;
+        try {
+          lastSeq = this.store.beginSession(message.session);
+        } catch (err) {
+          // beginSession runs SELECT, INSERT and UPDATE, any of which can fail
+          // on a full disk or a busy store. Unguarded, the throw escapes the
+          // socket's data handler, is not covered by main()'s catch, and kills
+          // the writer -- which nothing respawns.
+          const name = err instanceof Error ? err.name : "Error";
+          const code = errorCode(err);
+          this.log(
+            `session ${message.session} could not start: ${code ?? name}`,
+          );
+          this.send(socket, {
+            type: "error",
+            seq: null,
+            message: `starting the session failed: ${code ?? name}`,
+          });
+          return session;
+        }
         this.send(socket, {
           type: "welcome",
           session: message.session,
@@ -194,16 +264,22 @@ export class WriterServer {
             stored: result.stored,
           });
         } catch (err) {
-          // The error class and the batch's size, never a sample's value: this
-          // line goes to the Signal K log, which ships in support bundles.
-          const name = err instanceof Error ? err.name : "Error";
+          // The cause and the batch's size, never a sample's value: this line
+          // goes to the Signal K log, which ships in support bundles.
+          //
+          // `err.name` alone is useless here: every node:sqlite failure is a
+          // plain Error, so a full disk and a corrupt store both read as
+          // "Error". Measured, the cause is in `code` (ERR_SQLITE_ERROR,
+          // ERR_INVALID_STATE) and `errstr` ("attempt to write a readonly
+          // database"). Neither carries a recorded value.
+          const cause = describeError(err);
           this.log(
-            `batch ${message.seq} of ${message.samples.length} samples failed: ${name}`,
+            `batch ${message.seq} of ${message.samples.length} samples failed: ${cause}`,
           );
           this.send(socket, {
             type: "error",
             seq: message.seq,
-            message: `writing the batch failed: ${name}`,
+            message: `writing the batch failed: ${cause}`,
           });
         }
         return session;
