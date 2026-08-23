@@ -1,0 +1,252 @@
+import { describe, it, beforeEach, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { DATA_LAYOUT } from "../data-dir.js";
+import { roll } from "../roll/roll.js";
+import { dateDirectory, sidecarFile } from "../roll/tree-path.js";
+import { writerPaths } from "../writer/contract.js";
+import { HotStore } from "../writer/hot-store.js";
+import { sample } from "./fixtures.js";
+import type { Sample } from "../writer/protocol.js";
+
+const DIST = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const ROLL_ENTRY = join(DIST, "roll", "main.js");
+
+let dir: string;
+let store: HotStore;
+let seq = 0;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "roll-"));
+  mkdirSync(join(dir, DATA_LAYOUT.hotStore), { recursive: true });
+  store = HotStore.open(writerPaths(dir).store);
+  store.beginSession("test");
+  seq = 0;
+});
+
+afterEach(() => {
+  try {
+    store.close();
+  } catch {
+    // Already closed by the test.
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
+function record(...samples: Sample[]): void {
+  seq += 1;
+  store.insertBatch(seq, samples);
+}
+
+/** Reads a Parquet file back through a throwaway DuckDB, as a reader would. */
+function readParquet(pattern: string): Record<string, unknown>[] {
+  const probe = [
+    `const { DuckDBInstance } = await import(${JSON.stringify("@duckdb/node-api")});`,
+    `const instance = await DuckDBInstance.create(":memory:");`,
+    `const c = await instance.connect();`,
+    `const r = await c.runAndReadAll(${JSON.stringify(
+      `SELECT ts, context, path, value_kind, value_num, value_str FROM read_parquet('${pattern}', union_by_name = true) ORDER BY ts, path`,
+    )});`,
+    `console.log(JSON.stringify(r.getRowsJS(), (k, v) => (typeof v === "bigint" ? Number(v) : v)));`,
+  ].join("\n");
+  const output = execFileSync(
+    process.execPath,
+    ["--input-type=module", "-e", probe],
+    { encoding: "utf8", timeout: 60_000, cwd: process.cwd() },
+  );
+  return (JSON.parse(output.trim()) as unknown[][]).map((row) => ({
+    ts: row[0],
+    context: row[1],
+    path: row[2],
+    value_kind: row[3],
+    value_num: row[4],
+    value_str: row[5],
+  }));
+}
+
+const DAY = 86_400_000;
+const AUG_23 = Date.UTC(2026, 7, 23);
+
+describe("a roll", () => {
+  it("writes every covered row and no more", async () => {
+    record(
+      sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }),
+      sample({ ts: AUG_23 + 2000, path: "c.d", value: 2 }),
+    );
+    const bound = store.rollBound();
+    assert.ok(bound !== null);
+    // Arrives after the bound was read, exactly as it does in production.
+    record(sample({ ts: AUG_23 + 3000, path: "e.f", value: 3 }));
+
+    const result = await roll({
+      dataDir: dir,
+      maxRowid: bound.maxRowid,
+      rollId: 1,
+    });
+
+    assert.equal(result.rows, 2);
+    assert.equal(result.files.length, 1);
+    const rows = readParquet(result.files[0].path);
+    assert.deepEqual(
+      rows.map((row) => row.path),
+      ["a.b", "c.d"],
+    );
+  });
+
+  it("places rows by their own date, so a roll may span midnight", async () => {
+    record(
+      sample({ ts: AUG_23 + DAY - 1000, path: "before.midnight" }),
+      sample({ ts: AUG_23 + DAY + 1000, path: "after.midnight" }),
+    );
+    const result = await roll({
+      dataDir: dir,
+      maxRowid: store.rollBound()!.maxRowid,
+      rollId: 7,
+    });
+
+    assert.deepEqual(
+      result.files.map((file) => file.date),
+      ["2026-08-23", "2026-08-24"],
+    );
+    // One roll, one name, two directories.
+    for (const file of result.files) {
+      assert.ok(file.path.endsWith(join("", "7.parquet")), file.path);
+      assert.equal(file.rows, 1);
+    }
+  });
+
+  it("writes no file for a date with no rows", async () => {
+    record(sample({ ts: AUG_23 + 1000 }));
+    await roll({ dataDir: dir, maxRowid: 1, rollId: 1 });
+    assert.deepEqual(readdirSync(join(dir, DATA_LAYOUT.tree)), [
+      "date=2026-08-23",
+    ]);
+  });
+
+  it("leaves nothing a reader would mistake for a finished file", async () => {
+    record(sample({ ts: AUG_23 + 1000 }));
+    await roll({ dataDir: dir, maxRowid: 1, rollId: 1 });
+    const written = readdirSync(dateDirectory(dir, AUG_23));
+    assert.deepEqual(written, ["1.parquet"]);
+  });
+
+  it("overwrites its own files when a retry reuses the roll id", async () => {
+    // What the writer does after a roll that died before it could report:
+    // the id is kept, so the second attempt replaces the first attempt's
+    // files instead of leaving them beside its own as duplicates.
+    record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+    await roll({ dataDir: dir, maxRowid: 1, rollId: 42 });
+    record(sample({ ts: AUG_23 + 2000, path: "c.d" }));
+    const second = await roll({
+      dataDir: dir,
+      maxRowid: store.rollBound()!.maxRowid,
+      rollId: 42,
+    });
+
+    assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), ["42.parquet"]);
+    assert.equal(second.rows, 2);
+    assert.equal(readParquet(second.files[0].path).length, 2);
+  });
+
+  it("refuses a bound that is not a rowid", async () => {
+    record(sample({ ts: AUG_23 }));
+    await assert.rejects(
+      () => roll({ dataDir: dir, maxRowid: 0, rollId: 1 }),
+      /rowid/,
+    );
+  });
+});
+
+describe("the sidecar", () => {
+  it("keeps a path that stopped reporting before this roll", async () => {
+    record(
+      sample({ ts: AUG_23 + 1000, path: "gone.away", value: 11 }),
+      sample({ ts: AUG_23 + 1000, path: "still.here", value: 22 }),
+    );
+    await roll({ dataDir: dir, maxRowid: 2, rollId: 1 });
+    store.deleteThrough(2);
+
+    record(sample({ ts: AUG_23 + 5000, path: "still.here", value: 33 }));
+    const second = await roll({
+      dataDir: dir,
+      maxRowid: store.rollBound()!.maxRowid,
+      rollId: 2,
+    });
+
+    assert.equal(second.sidecarRows, 2);
+    const rows = readParquet(sidecarFile(dir));
+    assert.deepEqual(
+      rows.map((row) => [row.path, row.value_num]),
+      [
+        ["gone.away", 11],
+        ["still.here", 33],
+      ],
+    );
+  });
+
+  it("stays out of a glob over the tree", async () => {
+    record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+    await roll({ dataDir: dir, maxRowid: 1, rollId: 1 });
+    // The rows in the sidecar are copies of rows in the tree. A reader that
+    // found it here would count every path's last value twice.
+    const tree = readParquet(join(dir, DATA_LAYOUT.tree, "**", "*.parquet"));
+    assert.equal(tree.length, 1);
+  });
+});
+
+describe("the roll process", () => {
+  it("prints what it wrote and exits 0", () => {
+    record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+    const output = execFileSync(
+      process.execPath,
+      [ROLL_ENTRY, "--data-dir", dir, "--max-rowid", "1", "--roll-id", "123"],
+      { encoding: "utf8", timeout: 60_000 },
+    );
+    const result = JSON.parse(output.trim()) as {
+      rows: number;
+      files: { date: string }[];
+    };
+    assert.equal(result.rows, 1);
+    assert.deepEqual(
+      result.files.map((file) => file.date),
+      ["2026-08-23"],
+    );
+  });
+
+  it("exits non-zero and leaves the store alone when it cannot roll", () => {
+    record(sample({ ts: AUG_23 + 1000 }));
+    assert.throws(() =>
+      execFileSync(
+        process.execPath,
+        [ROLL_ENTRY, "--data-dir", dir, "--max-rowid", "0", "--roll-id", "1"],
+        { encoding: "utf8", timeout: 60_000, stdio: "pipe" },
+      ),
+    );
+    assert.equal(store.rowCount(), 1);
+    assert.ok(!existsSync(join(dir, DATA_LAYOUT.tree, "date=2026-08-23")));
+  });
+});
+
+describe("a tree the roll did not finish", () => {
+  it("is not read as complete", () => {
+    // What a killed roll leaves: a temporary that a *.parquet glob skips.
+    // Nothing else marks it, and nothing has to.
+    mkdirSync(dateDirectory(dir, AUG_23), { recursive: true });
+    writeFileSync(join(dateDirectory(dir, AUG_23), "1.parquet.tmp"), "garbage");
+    const found = readdirSync(dateDirectory(dir, AUG_23)).filter((name) =>
+      name.endsWith(".parquet"),
+    );
+    assert.deepEqual(found, []);
+  });
+});

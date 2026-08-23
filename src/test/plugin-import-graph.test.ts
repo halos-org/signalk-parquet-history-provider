@@ -107,6 +107,23 @@ describe("the plugin's import graph", () => {
     );
   });
 
+  it("keeps the engine out of the writer as well", () => {
+    // The writer is long-lived, so an import here would make the ~100 MB
+    // addon resident for as long as recording runs — the same cost as
+    // mapping it into the server, one process over. It reaches the roll by
+    // spawning it, which is the only reason the roll's memory is transient.
+    const writer = join(DIST, "writer", "main.js");
+    assert.ok(
+      existsSync(writer),
+      "build first: dist/writer/main.js is missing",
+    );
+    const { bare } = walk(writer);
+    assert.deepEqual(
+      [...bare].filter((specifier) => FORBIDDEN.test(specifier)),
+      [],
+    );
+  });
+
   it("loads no DuckDB library when a real process starts and runs it", () => {
     // The static walk covers this package's own files. This covers everything
     // else — a dependency that pulls the addon in transitively would map it

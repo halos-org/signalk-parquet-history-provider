@@ -50,4 +50,10 @@ export const DATA_LAYOUT = {
    * twice.
    */
   sidecar: "latest",
+  /**
+   * Where a roll lets DuckDB spill. Explicit because the engine's default for
+   * an in-memory database is relative to the current working directory, which
+   * for a spawned process is the Signal K server's.
+   */
+  scratch: "tmp",
 } as const;
