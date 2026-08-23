@@ -1,4 +1,8 @@
+import { MAX_FRAME_BYTES } from "./writer/protocol.js";
 import type { Sample } from "./writer/protocol.js";
+
+/** Room for `{"type":"batch","seq":N,"samples":[…]}` around the samples. */
+const FRAME_ENVELOPE_BYTES = 128;
 
 /**
  * What the plugin holds between flushes.
@@ -55,8 +59,17 @@ export class FlushBuffer {
   private retryPending = false;
   private droppedSamples = 0;
 
+  /** The largest sample that could ever be sent, whichever limit binds first. */
+  private readonly admissionCeiling: number;
+
   constructor(options: FlushBufferOptions) {
     this.options = options;
+    // The envelope leaves room for the batch's own JSON scaffolding, so a
+    // single admitted sample always leaves a frame that fits.
+    this.admissionCeiling = Math.min(
+      options.maxBytes,
+      MAX_FRAME_BYTES - FRAME_ENVELOPE_BYTES,
+    );
   }
 
   get length(): number {
@@ -74,11 +87,18 @@ export class FlushBuffer {
 
   add(sample: Sample, now: number): void {
     const bytes = sampleBytes(sample);
-    // A sample that cannot fit even in an empty buffer is refused rather than
-    // admitted. Admitting it would leave the buffer permanently over budget
-    // holding one element, and "drop the oldest" would then evict every later
-    // sample forever to make room for something that never fits.
-    if (bytes > this.options.maxBytes) {
+    // Refused rather than admitted, against whichever ceiling is lower.
+    //
+    // The buffer's own ceiling is the obvious one: admitting a sample bigger
+    // than the whole budget would leave it permanently over, and "drop the
+    // oldest" would then evict every later sample forever to make room for
+    // something that never fits.
+    //
+    // The frame ceiling is the one that was missing. maxBytes defaults to 8 MB
+    // and MAX_FRAME_BYTES is 4 MiB, so the buffer used to admit samples that
+    // could never be sent -- they reached the socket, encodeFrame refused
+    // them, and the whole batch around them was discarded.
+    if (bytes > this.admissionCeiling) {
       this.droppedSamples++;
       return;
     }
@@ -98,9 +118,24 @@ export class FlushBuffer {
     );
   }
 
-  /** Removes and returns up to one batch, oldest first. */
+  /**
+   * Removes and returns up to one batch, oldest first.
+   *
+   * Bounded by bytes as well as by count: `batchSize` is operator-editable, so
+   * count alone lets a batch grow past what a frame can carry, and the whole
+   * batch is then refused at the socket.
+   */
   take(now: number): Sample[] {
-    const taken = this.entries.splice(0, this.options.batchSize);
+    const budget = MAX_FRAME_BYTES - FRAME_ENVELOPE_BYTES;
+    let count = 0;
+    let bytes = 0;
+    while (count < this.entries.length && count < this.options.batchSize) {
+      const next = bytes + this.entries[count].bytes;
+      if (count > 0 && next > budget) break;
+      bytes = next;
+      count++;
+    }
+    const taken = this.entries.splice(0, count);
     for (const entry of taken) this.bytes -= entry.bytes;
     this.retryPending = false;
     // Whatever is left starts waiting again from here. Measuring its wait from

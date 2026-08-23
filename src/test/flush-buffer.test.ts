@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert";
 import { FlushBuffer, sampleBytes } from "../flush-buffer.js";
 import type { FlushBufferOptions } from "../flush-buffer.js";
+import { MAX_FRAME_BYTES } from "../writer/protocol.js";
 import type { Sample } from "../writer/protocol.js";
 
 function sample(over: Partial<Sample> = {}): Sample {
@@ -163,6 +164,51 @@ describe("the ceiling is a byte budget", () => {
     assert.strictEqual(buf.byteSize, sampleBytes(one) + sampleBytes(two));
     buf.take(0);
     assert.strictEqual(buf.byteSize, 0);
+  });
+});
+
+describe("the frame limit binds as well as the budget", () => {
+  it("refuses a sample no frame could ever carry, whatever the budget says", () => {
+    // maxBytes defaults to 8 MB and MAX_FRAME_BYTES is 4 MiB, so a budget
+    // larger than the frame limit used to admit samples that could never be
+    // sent: they reached the socket, encodeFrame refused them, and the whole
+    // batch around them was discarded.
+    const buf = buffer({ maxBytes: 8 * 1024 * 1024 });
+    buf.add(fat(5 * 1024 * 1024), 0);
+
+    assert.strictEqual(buf.length, 0);
+    assert.strictEqual(buf.dropped, 1);
+  });
+
+  it("stops a batch at the frame budget rather than at the element count", () => {
+    // batchSize is operator-editable with no upper bound, so count alone lets
+    // a batch grow past what a frame can carry.
+    const buf = buffer({ maxBytes: 64 * 1024 * 1024, batchSize: 1000 });
+    for (let i = 0; i < 8; i++) buf.add(fat(1024 * 1024, { ts: i }), 0);
+
+    const taken = buf.take(0);
+    assert.ok(taken.length < 8, "the whole backlog was handed over at once");
+    const bytes = taken.reduce((sum, s) => sum + sampleBytes(s), 0);
+    assert.ok(
+      bytes <= MAX_FRAME_BYTES,
+      `a batch of ${bytes} bytes exceeds the ${MAX_FRAME_BYTES}-byte frame limit`,
+    );
+    assert.strictEqual(
+      buf.length,
+      8 - taken.length,
+      "the rest stayed buffered",
+    );
+  });
+
+  it("still hands over a single sample that fills the budget on its own", () => {
+    // The byte bound must not stall: one sample at the ceiling has to go, or
+    // nothing ever drains.
+    const buf = buffer({ maxBytes: 8 * 1024 * 1024, batchSize: 1000 });
+    buf.add(fat(3 * 1024 * 1024), 0);
+    buf.add(fat(3 * 1024 * 1024), 0);
+
+    assert.strictEqual(buf.take(0).length, 1);
+    assert.strictEqual(buf.length, 1);
   });
 });
 

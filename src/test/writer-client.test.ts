@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, createServer } from "node:net";
+import { mkdirSync } from "node:fs";
 import { FrameDecoder, encodeFrame } from "../writer/protocol.js";
 import { FlushBuffer } from "../flush-buffer.js";
 import { HotStore } from "../writer/hot-store.js";
@@ -256,6 +257,149 @@ describe("when the writer is not there", () => {
     await startServer();
     await eventually(() => healthy > 0, "recovery to be reported");
     assert.strictEqual(client.stats.consecutiveFlaps, 0);
+  });
+});
+
+describe("a batch that cannot be framed", () => {
+  it("is counted as dropped and reported, not lost in silence", async () => {
+    // take() now bounds a batch by bytes, so this is a backstop rather than a
+    // path normal operation reaches -- driven here through a stubbed take so
+    // the backstop is not left unexercised. pump() has already spliced the
+    // samples out of the buffer, so doing nothing loses them with no drop
+    // count while the status line still says "Recording". Requeueing would
+    // retry the same refusal forever: encodeFrame is deterministic, and a
+    // batch that did not fit never will.
+    await startServer();
+    const unhealthy: string[] = [];
+    const buffer = newBuffer({ flushIntervalMs: 60_000, batchSize: 1 });
+    const oversized = Array.from({ length: 5 }, (_, i) =>
+      sample({ ts: i, kind: "string", value: "x".repeat(1024 * 1024) }),
+    );
+    let handedOut = false;
+    const realTake = buffer.take.bind(buffer);
+    buffer.take = (now: number) => {
+      if (handedOut) return realTake(now);
+      handedOut = true;
+      return oversized;
+    };
+
+    client = new WriterClient({
+      socketPath,
+      session: "s1",
+      buffer,
+      onUnhealthy: (message) => unhealthy.push(message),
+      timing: { pumpIntervalMs: 5 },
+    });
+    client.start();
+    await eventually(() => client!.stats.connected, "the handshake");
+    client.add(sample());
+
+    await eventually(() => unhealthy.length > 0, "an unhealthy report");
+    assert.match(unhealthy[0], /could not be framed/);
+    assert.strictEqual(client.stats.dropped, 5, "the loss was not counted");
+    assert.strictEqual(store.rowCount(), 0);
+  });
+});
+
+describe("a writer that stops answering", () => {
+  it("is noticed rather than left holding the connection open", async () => {
+    // A connected writer that has stopped reading holds the socket open
+    // forever: close never fires, the batch is never settled, no flap is
+    // counted, and connected stays true while the buffer fills.
+    const unhealthy: string[] = [];
+    const silent = createServer((socket) => {
+      const decoder = new FrameDecoder();
+      socket.on("data", (chunk: Buffer) => {
+        for (const message of decoder.push(chunk)) {
+          // Welcome it, then never acknowledge anything.
+          if (message.type === "hello") {
+            socket.write(
+              encodeFrame({
+                type: "welcome",
+                session: message.session,
+                lastSeq: 0,
+              }),
+            );
+          }
+        }
+      });
+      socket.on("error", () => {});
+    });
+    const silentPath = join(dir, "run", "silent.sock");
+    mkdirSync(join(dir, "run"), { recursive: true });
+    await new Promise<void>((resolve) => silent.listen(silentPath, resolve));
+
+    try {
+      const buffer = newBuffer({ flushIntervalMs: 20, batchSize: 1 });
+      client = new WriterClient({
+        socketPath: silentPath,
+        session: "s1",
+        buffer,
+        onUnhealthy: (message) => unhealthy.push(message),
+        timing: {
+          pumpIntervalMs: 5,
+          ackTimeoutMs: 150,
+          initialReconnectDelayMs: 5,
+          maxReconnectDelayMs: 20,
+        },
+      });
+      client.start();
+      await eventually(() => client!.stats.connected, "the handshake");
+      client.add(sample());
+
+      await eventually(
+        () => unhealthy.some((m) => /has not acknowledged/.test(m)),
+        `the silence to be reported (saw ${JSON.stringify(unhealthy)})`,
+      );
+    } finally {
+      await new Promise<void>((resolve) => silent.close(() => resolve()));
+    }
+  });
+});
+
+describe("recovery", () => {
+  it("clears the unhealthy latch on an acknowledgement, not on uptime", async () => {
+    // The stability timer fires once, five seconds after connect. A fault
+    // later in a long-lived connection used to latch the plugin red for the
+    // rest of that connection and suppress every later, different fault.
+    await startServer();
+    const unhealthy: string[] = [];
+    let healthy = 0;
+    const buffer = newBuffer({ flushIntervalMs: 20, batchSize: 1 });
+    client = new WriterClient({
+      socketPath,
+      session: "s1",
+      buffer,
+      onUnhealthy: (message) => unhealthy.push(message),
+      onHealthy: () => healthy++,
+      timing: { pumpIntervalMs: 5, stableConnectionMs: 60_000 },
+    });
+    client.start();
+    await eventually(() => client!.stats.connected, "the handshake");
+
+    // A framing failure marks it unhealthy without touching the connection.
+    const realTake = buffer.take.bind(buffer);
+    let handedOut = false;
+    buffer.take = (now: number) => {
+      if (handedOut) return realTake(now);
+      handedOut = true;
+      return Array.from({ length: 5 }, (_, i) =>
+        sample({ ts: i, kind: "string", value: "x".repeat(1024 * 1024) }),
+      );
+    };
+    client.add(sample());
+    await eventually(() => unhealthy.length > 0, "an unhealthy report");
+    buffer.take = realTake;
+
+    // The stability timer will not fire for another minute, so only an ack
+    // can clear this.
+    client.add(sample({ ts: 2 }));
+    await eventually(() => healthy > 0, "recovery on the next acknowledgement");
+    // The count is not the claim here -- the sample buffered alongside the
+    // stubbed batch rides along on the same flush. What matters is that an
+    // acknowledgement cleared the latch while the stability timer was still a
+    // minute away.
+    assert.ok(store.rowCount() > 0, "nothing was stored, so nothing was acked");
   });
 });
 

@@ -36,6 +36,13 @@ const DEFAULTS = {
    * carries a partial batch that has 5000 ms of slack.
    */
   pumpIntervalMs: 1000,
+  /**
+   * How long a batch may sit unacknowledged before the connection is treated
+   * as dead. Generous against the writer's real work -- a 1000-row transaction
+   * plus a WAL checkpoint on a slow card -- and far short of the operator
+   * noticing by hand.
+   */
+  ackTimeoutMs: 30_000,
 };
 
 export interface WriterClientOptions {
@@ -84,6 +91,10 @@ export class WriterClient {
   private inFlight: { seq: number; samples: Sample[] } | null = null;
   private acked = 0;
   private stored = 0;
+  /** Samples thrown away because they could not be framed. Counted, not silent. */
+  private discarded = 0;
+  private unhealthyReason: string | undefined;
+  private ackTimer: NodeJS.Timeout | null = null;
 
   constructor(options: WriterClientOptions) {
     this.options = {
@@ -105,7 +116,7 @@ export class WriterClient {
       connected: this.connected && this.welcomed,
       acked: this.acked,
       stored: this.stored,
-      dropped: this.options.buffer.dropped,
+      dropped: this.options.buffer.dropped + this.discarded,
       consecutiveFlaps: this.consecutiveFlaps,
     };
   }
@@ -133,6 +144,7 @@ export class WriterClient {
     this.clearTimer("pumpTimer");
     this.clearTimer("reconnectTimer");
     this.clearTimer("stableTimer");
+    this.clearAckTimer();
     const socket = this.socket;
     this.socket = null;
     if (socket === null) return;
@@ -192,6 +204,7 @@ export class WriterClient {
       this.welcomed = false;
       this.connectedAt = 0;
       this.clearTimer("stableTimer");
+      this.clearAckTimer();
       this.socket = null;
       if (this.stopped) return;
 
@@ -236,6 +249,15 @@ export class WriterClient {
           this.acked++;
           this.stored += message.stored;
           this.inFlight = null;
+          this.clearAckTimer();
+          // Recovery is an ack, not a connection that stayed up. The stability
+          // timer fires once, five seconds after connect, so a fault later in
+          // a long-lived connection used to latch the plugin red for the rest
+          // of that connection and suppress every later, different fault.
+          if (this.unhealthy) {
+            this.unhealthy = false;
+            this.options.onHealthy();
+          }
         }
         this.pump();
         return;
@@ -288,6 +310,7 @@ export class WriterClient {
     this.seq++;
     this.inFlight = { seq: this.seq, samples };
     this.send({ type: "batch", seq: this.seq, samples });
+    this.armAckTimer();
   }
 
   private send(message: Message): void {
@@ -296,16 +319,55 @@ export class WriterClient {
     try {
       socket.write(encodeFrame(message));
     } catch (err) {
-      // Encoding refuses an oversized frame. Dropping the connection would not
-      // help, since the same batch would be retried; the batch goes back to
-      // the buffer and the plugin is told.
-      this.options.log(
-        `could not send to the writer: ${err instanceof Error ? err.message : String(err)}`,
+      const reason = err instanceof Error ? err.message : String(err);
+      this.options.log(`could not send to the writer: ${reason}`);
+      if (message.type !== "batch" || this.inFlight?.seq !== message.seq)
+        return;
+      // These samples are already out of the buffer -- pump() spliced them --
+      // so doing nothing here loses them with no drop count and no change to
+      // the status line, which keeps saying "Recording".
+      //
+      // Requeueing would retry the same refusal forever, because encodeFrame
+      // is deterministic: the batch that did not fit will never fit. So they
+      // are discarded and counted, which is the honest half of the trade, and
+      // the plugin is told.
+      const lost = this.inFlight.samples.length;
+      this.inFlight = null;
+      this.discarded += lost;
+      this.markUnhealthy(
+        `${lost} samples could not be framed and were dropped: ${reason}`,
       );
-      if (message.type === "batch" && this.inFlight?.seq === message.seq) {
-        this.inFlight = null;
-      }
     }
+  }
+
+  /**
+   * Gives an unacknowledged batch a deadline.
+   *
+   * Without one, a writer that is connected but has stopped reading -- blocked
+   * in a long synchronous SQLite call, or stalled on the card -- holds the
+   * socket open forever. `close` never fires, so the batch is never settled, no
+   * flap is counted, and `connected` stays true while the status line says
+   * "Recording" and the buffer quietly fills. Destroying the socket routes the
+   * failure into the path that already handles it.
+   */
+  private armAckTimer(): void {
+    this.clearAckTimer();
+    this.ackTimer = setTimeout(() => {
+      this.ackTimer = null;
+      if (this.inFlight === null) return;
+      const waited = this.options.timing.ackTimeoutMs;
+      this.markUnhealthy(
+        `the writer has not acknowledged batch ${this.inFlight.seq} in ${waited}ms`,
+      );
+      this.socket?.destroy();
+    }, this.options.timing.ackTimeoutMs);
+    this.ackTimer.unref();
+  }
+
+  private clearAckTimer(): void {
+    if (this.ackTimer === null) return;
+    clearTimeout(this.ackTimer);
+    this.ackTimer = null;
   }
 
   private startStabilityTimer(): void {
@@ -332,8 +394,11 @@ export class WriterClient {
   }
 
   private markUnhealthy(reason?: string): void {
-    if (this.unhealthy) return;
+    // Suppress a repeat of the same reason, not a new one: a second, different
+    // fault is information the operator does not otherwise get.
+    if (this.unhealthy && reason === this.unhealthyReason) return;
     this.unhealthy = true;
+    this.unhealthyReason = reason;
     const dropped = this.options.buffer.dropped;
     this.options.onUnhealthy(
       reason ??
