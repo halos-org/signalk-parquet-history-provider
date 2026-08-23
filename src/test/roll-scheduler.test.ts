@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readdirSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -189,6 +190,58 @@ describe("a roll that does not finish", () => {
 
     assert.equal(ids.length, 2);
     assert.notEqual(ids[0], ids[1]);
+  });
+});
+
+describe("a roll left unfinished by a writer that died", () => {
+  it("is picked up by the next writer, which reuses its name", async () => {
+    // A SIGKILL or an OOM kill leaves the roll process running. If it
+    // finishes, it has written a file the successor knows nothing about, and
+    // a fresh id would put those rows in the tree twice.
+    record(sample({ ts: AUG_23 }));
+    const first = scheduler({ spawnRoll: FAILS });
+    const ids: string[] = [];
+    await first.rollOnce();
+
+    // A new scheduler over the same data directory: a new writer process.
+    const successor = scheduler({
+      spawnRoll: (args) => {
+        ids.push(args[args.indexOf("--roll-id") + 1]);
+        return SUCCEEDS([]);
+      },
+      now: () => NOW + 3_600_000,
+    });
+    await successor.rollOnce();
+
+    assert.equal(ids.length, 1);
+    assert.equal(Number(ids[0]), Date.UTC(2026, 7, 23, 14, 0, 0));
+    assert.match(logged.join("\n"), /left unfinished/);
+  });
+
+  it("forgets the name once a roll has been truncated", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler().rollOnce();
+    assert.ok(!existsSync(writerPaths(dir).pendingRoll));
+
+    record(sample({ ts: AUG_23 + 1 }));
+    const ids: string[] = [];
+    const later = scheduler({
+      spawnRoll: (args) => {
+        ids.push(args[args.indexOf("--roll-id") + 1]);
+        return SUCCEEDS([]);
+      },
+      now: () => NOW + 3_600_000,
+    });
+    await later.rollOnce();
+    assert.equal(Number(ids[0]), Date.UTC(2026, 7, 23, 15, 0, 0));
+  });
+
+  it("ignores a pending file it cannot read", async () => {
+    // A corrupt safeguard must not be able to stop a device rolling.
+    writeFileSync(writerPaths(dir).pendingRoll, "not json");
+    record(sample({ ts: AUG_23 }));
+    await scheduler().rollOnce();
+    assert.equal(store.rowCount(), 0);
   });
 });
 

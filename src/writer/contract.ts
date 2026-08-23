@@ -30,11 +30,16 @@ export function writerPaths(dataDir: string): {
   store: string;
   pidFile: string;
   socket: string;
+  pendingRoll: string;
 } {
   const hot = join(dataDir, DATA_LAYOUT.hotStore);
   return {
     store: join(hot, "hot.sqlite"),
     pidFile: join(hot, "writer.pid"),
     socket: join(hot, "writer.sock"),
+    // The id of a roll that has been started and not yet truncated. Unlike
+    // the pid file, something does decide from this one — see
+    // roll-scheduler.ts.
+    pendingRoll: join(hot, "roll-pending.json"),
   };
 }

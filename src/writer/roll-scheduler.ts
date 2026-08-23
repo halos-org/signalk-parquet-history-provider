@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { delayToNextRoll, nextRollAt } from "../roll/schedule.js";
+import { writerPaths } from "./contract.js";
 import type { HotStore } from "./hot-store.js";
 
 /**
@@ -55,19 +57,34 @@ export class RollScheduler {
   private running: ChildProcess | null = null;
   private stopped = false;
   /**
-   * The id of a roll that has not been truncated yet.
+   * The id of a roll that has been started and not yet truncated.
    *
    * Kept across a failure so the retry writes the same filenames and replaces
    * the failed attempt's files. Without it, a roll that wrote its Parquet and
    * then died would leave those rows in the tree AND in the store, and the
    * next roll would write them again under a new name — the same rows twice,
-   * permanently.
+   * silently and for good.
+   *
+   * It outlives the writer as well, in a file, because the writer is not the
+   * only thing that can die: a SIGKILL or an OOM kill leaves the roll process
+   * running, and an orphan that finishes has written a file this scheduler
+   * would otherwise know nothing about. The successor reads the id and its
+   * next roll overwrites that file.
+   *
+   * The two cannot collide over one filename. The successor rolls at the next
+   * slot, minutes or an hour away, and an orphan roll is seconds long.
    */
-  private pendingRollId: number | null = null;
+  private pendingRollId: number | null;
 
   constructor(options: RollSchedulerOptions) {
     this.options = options;
     this.now = options.now ?? (() => Date.now());
+    this.pendingRollId = readPendingRoll(options.dataDir);
+    if (this.pendingRollId !== null) {
+      options.log(
+        `roll ${this.pendingRollId} was left unfinished; the next roll reuses its name`,
+      );
+    }
   }
 
   /** Arm the timer for the next slot. Nothing rolls at start. */
@@ -100,6 +117,7 @@ export class RollScheduler {
     if (bound === null) {
       // Nothing recorded since the last roll. No file, no empty directory.
       this.pendingRollId = null;
+      clearPendingRoll(this.options.dataDir);
       return;
     }
 
@@ -108,6 +126,9 @@ export class RollScheduler {
       nextRollAt(this.now(), this.options.intervalMinutes) -
         this.options.intervalMinutes * 60_000;
     this.pendingRollId = rollId;
+    // Before the spawn, so a writer that dies during the roll still leaves the
+    // name behind for its successor.
+    writePendingRoll(this.options.dataDir, rollId);
 
     const outcome = await this.runRoll(rollId, bound.maxRowid);
     if (!outcome.ok) {
@@ -121,6 +142,7 @@ export class RollScheduler {
     // kept ingesting throughout, and those rows were never written.
     const removed = this.options.store.deleteThrough(bound.maxRowid);
     this.pendingRollId = null;
+    clearPendingRoll(this.options.dataDir);
     this.options.log(
       `roll ${rollId} wrote ${outcome.summary}; ${removed} rows truncated`,
     );
@@ -207,6 +229,39 @@ export class RollScheduler {
     await exited;
     clearTimeout(hard);
   }
+}
+
+function readPendingRoll(dataDir: string): number | null {
+  try {
+    const raw = JSON.parse(
+      readFileSync(writerPaths(dataDir).pendingRoll, "utf8"),
+    ) as { rollId?: unknown };
+    return Number.isSafeInteger(raw.rollId) && (raw.rollId as number) >= 0
+      ? (raw.rollId as number)
+      : null;
+  } catch {
+    // Absent is the normal case. Unreadable is treated the same way on
+    // purpose: a corrupt file must not be able to stop a device rolling.
+    return null;
+  }
+}
+
+function writePendingRoll(dataDir: string, rollId: number): void {
+  try {
+    writeFileSync(
+      writerPaths(dataDir).pendingRoll,
+      `${JSON.stringify({ rollId })}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // Recording the name is a safeguard against one narrow failure. Refusing
+    // to roll because the safeguard could not be written would be worse than
+    // the failure it guards.
+  }
+}
+
+function clearPendingRoll(dataDir: string): void {
+  rmSync(writerPaths(dataDir).pendingRoll, { force: true });
 }
 
 function defaultSpawn(args: string[]): ChildProcess {
