@@ -301,6 +301,34 @@ describe("a roll that would land on a name already taken", () => {
   });
 });
 
+describe("a failure inside the roll itself", () => {
+  it("costs one roll, not the writer", async () => {
+    // Anything thrown here reaches an unhandled rejection under Node's
+    // default and ends the process — so a hot store that could not be
+    // truncated would stop recording rather than skip a roll.
+    const exploding = {
+      rollBound: () => {
+        throw new Error("the store is unreadable");
+      },
+    } as unknown as HotStore;
+    // Five milliseconds before a one-minute slot, so the armed timer fires
+    // inside the test rather than a minute after it.
+    const almostDue = Math.floor(Date.now() / 60_000) * 60_000 + 60_000 - 5;
+    const rolls = new RollScheduler({
+      store: exploding,
+      dataDir: dir,
+      intervalMinutes: 1,
+      log: (line) => logged.push(line),
+      now: () => almostDue,
+    });
+    rolls.start();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    await rolls.stop();
+
+    assert.match(logged.join("\n"), /failed: the store is unreadable/);
+  });
+});
+
 describe("stopping", () => {
   it("does not start a roll after stop", async () => {
     record(sample({ ts: AUG_23 }));

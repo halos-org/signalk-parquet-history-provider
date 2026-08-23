@@ -106,7 +106,17 @@ export class RollScheduler {
     this.timer = setTimeout(
       () => {
         this.timer = null;
-        void this.rollOnce(slot).finally(() => this.arm());
+        // Caught, not just finally'd. An unhandled rejection ends the process
+        // under Node's default, so a hot store that could not be truncated —
+        // a full disk, say — would take recording down with it instead of
+        // costing one roll.
+        void this.rollOnce(slot)
+          .catch((err: unknown) => {
+            this.options.log(
+              `roll ${slot} failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          })
+          .finally(() => this.arm());
       },
       delayToNextRoll(now, this.options.intervalMinutes),
     );
