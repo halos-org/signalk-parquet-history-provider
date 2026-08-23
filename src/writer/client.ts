@@ -41,6 +41,8 @@ export interface WriterClientOptions {
   log?: (message: string) => void;
   onUnhealthy?: (message: string) => void;
   onHealthy?: () => void;
+  /** Fired once the writer has welcomed this session. */
+  onConnected?: () => void;
   now?: () => number;
   timing?: Partial<typeof DEFAULTS>;
 }
@@ -86,6 +88,7 @@ export class WriterClient {
       log: options.log ?? (() => {}),
       onUnhealthy: options.onUnhealthy ?? (() => {}),
       onHealthy: options.onHealthy ?? (() => {}),
+      onConnected: options.onConnected ?? (() => {}),
       now: options.now ?? (() => Date.now()),
       timing: { ...DEFAULTS, ...options.timing },
     };
@@ -208,6 +211,10 @@ export class WriterClient {
         this.seq = Math.max(this.seq, message.lastSeq);
         this.settleInFlight(message.lastSeq);
         this.welcomed = true;
+        // Reported rather than left for the next status tick: a plugin that
+        // says "writer unreachable" for ten seconds after every enable is
+        // reporting a problem that lasted milliseconds.
+        this.options.onConnected();
         this.pump();
         return;
       }

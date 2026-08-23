@@ -47,8 +47,13 @@ function importedSpecifiers(source: string): string[] {
   return specifiers;
 }
 
-function walk(entry: string): { bare: Set<string>; files: string[] } {
+function walk(entry: string): {
+  bare: Set<string>;
+  builtins: Set<string>;
+  files: string[];
+} {
   const bare = new Set<string>();
+  const builtins = new Set<string>();
   const files: string[] = [];
   const queue = [entry];
   const seen = new Set<string>();
@@ -61,12 +66,14 @@ function walk(entry: string): { bare: Set<string>; files: string[] } {
     for (const specifier of importedSpecifiers(readFileSync(file, "utf8"))) {
       if (specifier.startsWith(".")) {
         queue.push(resolve(dirname(file), specifier));
-      } else if (!specifier.startsWith("node:")) {
+      } else if (specifier.startsWith("node:")) {
+        builtins.add(specifier);
+      } else {
         bare.add(specifier);
       }
     }
   }
-  return { bare, files };
+  return { bare, builtins, files };
 }
 
 describe("the plugin's import graph", () => {
@@ -82,6 +89,21 @@ describe("the plugin's import graph", () => {
       [],
       `dist/index.js reaches ${offenders.join(", ")}. The Signal K process ` +
         `must not map the engine: spawn a process for the work instead.`,
+    );
+  });
+
+  it("never reaches SQLite either", () => {
+    // The same rule as the engine, one layer down and easier to trip over:
+    // node:sqlite is a native module, and importing it here would put a
+    // database handle and its WAL in the server's heap. The hot store is the
+    // writer process's, and the writer is spawned rather than imported --
+    // which is only true as long as nothing on this side pulls in hot-store.ts
+    // for a constant.
+    const { builtins } = walk(ENTRY);
+    assert.ok(
+      !builtins.has("node:sqlite"),
+      "dist/index.js reaches node:sqlite. The hot store belongs to the " +
+        "writer process; import from writer/contract.js, not writer/main.js.",
     );
   });
 

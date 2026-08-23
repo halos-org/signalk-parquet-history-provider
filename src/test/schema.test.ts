@@ -16,6 +16,9 @@ const complete: Config = {
   recordOthers: true,
   maxRecordedPaths: 50,
   maxRecordedContexts: 5,
+  flushIntervalMs: 2000,
+  flushBatchSize: 500,
+  maxBufferMB: 4,
   dataDir: "/var/lib/history",
   retentionDays: 30,
   rollIntervalMinutes: 15,
@@ -29,6 +32,9 @@ describe("ConfigSchema", () => {
     assert.deepEqual(properties.sort(), [
       "dataDir",
       "defaultSamplingRate",
+      "flushBatchSize",
+      "flushIntervalMs",
+      "maxBufferMB",
       "maxRecordedContexts",
       "maxRecordedPaths",
       "pathFilter",
@@ -76,6 +82,9 @@ describe("ConfigSchema", () => {
       samplingRates: (ConfigSchema.properties.samplingRates as any).default,
       recordSelf: (ConfigSchema.properties.recordSelf as any).default,
       recordOthers: (ConfigSchema.properties.recordOthers as any).default,
+      flushIntervalMs: (ConfigSchema.properties.flushIntervalMs as any).default,
+      flushBatchSize: (ConfigSchema.properties.flushBatchSize as any).default,
+      maxBufferMB: (ConfigSchema.properties.maxBufferMB as any).default,
       maxRecordedPaths: (ConfigSchema.properties.maxRecordedPaths as any)
         .default,
       maxRecordedContexts: (ConfigSchema.properties.maxRecordedContexts as any)
