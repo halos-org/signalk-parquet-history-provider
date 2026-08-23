@@ -4,6 +4,7 @@ import {
   FrameDecoder,
   HEADER_BYTES,
   MAX_FRAME_BYTES,
+  MAX_SESSION_BYTES,
   ProtocolError,
   encodeFrame,
 } from "../writer/protocol.js";
@@ -51,6 +52,18 @@ describe("frame round-trip", () => {
     };
 
     assert.deepStrictEqual(decodeAll(encodeFrame(batch)), [batch]);
+  });
+
+  it("returns a hello and a welcome", () => {
+    const hello: Message = { type: "hello", session: "b3f1c0" };
+    const welcome: Message = {
+      type: "welcome",
+      session: "b3f1c0",
+      lastSeq: 41,
+    };
+
+    assert.deepStrictEqual(decodeAll(encodeFrame(hello)), [hello]);
+    assert.deepStrictEqual(decodeAll(encodeFrame(welcome)), [welcome]);
   });
 
   it("returns an ack and an error message", () => {
@@ -255,6 +268,26 @@ describe("a malformed frame is refused, not crashed on", () => {
         `missing ${drop} was accepted`,
       );
     }
+  });
+
+  it("rejects a session that is empty, absent or over-long", () => {
+    // The writer stores the session alongside the sequence number it applied,
+    // so an unbounded string here would be an unbounded string in the store.
+    for (const body of [
+      '{"type":"hello"}',
+      '{"type":"hello","session":""}',
+      '{"type":"hello","session":42}',
+      `{"type":"hello","session":"${"s".repeat(MAX_SESSION_BYTES + 1)}"}`,
+    ]) {
+      assert.throws(() => decodeAll(badBody(body)), ProtocolError, body);
+    }
+    assert.doesNotThrow(() =>
+      decodeAll(
+        badBody(
+          `{"type":"hello","session":"${"s".repeat(MAX_SESSION_BYTES)}"}`,
+        ),
+      ),
+    );
   });
 
   it("rejects an empty context or path", () => {

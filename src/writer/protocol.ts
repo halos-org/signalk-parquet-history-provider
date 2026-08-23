@@ -60,10 +60,27 @@ export type Sample =
   | (SampleBase & { kind: "string" | "boolean" | "identity"; value: string })
   | (SampleBase & { kind: "position"; value: Position });
 
+/**
+ * Identifies one run of the plugin, so the writer knows whose sequence
+ * numbers it is looking at.
+ *
+ * The writer skips a batch whose sequence number it has already committed,
+ * which is what makes a resend after a lost acknowledgement idempotent. That
+ * comparison is only meaningful within a single client run: the plugin's
+ * counter restarts at 1 when the plugin does. Normally the writer restarts
+ * with it, but a writer that outlives its plugin would otherwise discard the
+ * new plugin's batches as duplicates of the old one's, acknowledge them, and
+ * record nothing while reporting healthy.
+ */
 export type Message =
+  | { type: "hello"; session: string }
+  | { type: "welcome"; session: string; lastSeq: number }
   | { type: "batch"; seq: number; samples: Sample[] }
   | { type: "ack"; seq: number; stored: number }
   | { type: "error"; seq: number | null; message: string };
+
+/** Bounds the session id so a hello cannot be used to store an arbitrary string. */
+export const MAX_SESSION_BYTES = 64;
 
 /** A frame that cannot be trusted. The caller logs it and drops the connection. */
 export class ProtocolError extends Error {
@@ -145,6 +162,18 @@ function parseMessage(body: Buffer): Message {
   }
 
   switch (parsed.type) {
+    case "hello":
+      return { type: "hello", session: requireSession(parsed.session) };
+    case "welcome": {
+      if (!isCount(parsed.lastSeq)) {
+        throw new ProtocolError("welcome.lastSeq is not a sequence number");
+      }
+      return {
+        type: "welcome",
+        session: requireSession(parsed.session),
+        lastSeq: parsed.lastSeq,
+      };
+    }
     case "batch": {
       const seq = requireSeq(parsed.seq);
       if (!Array.isArray(parsed.samples)) {
@@ -236,6 +265,18 @@ function parseSample(raw: unknown): Sample {
     default:
       throw new ProtocolError(`unknown value kind ${JSON.stringify(raw.kind)}`);
   }
+}
+
+function requireSession(value: unknown): string {
+  if (typeof value !== "string" || value === "") {
+    throw new ProtocolError("session is not a non-empty string");
+  }
+  if (Buffer.byteLength(value, "utf8") > MAX_SESSION_BYTES) {
+    throw new ProtocolError(
+      `session is longer than ${MAX_SESSION_BYTES} bytes`,
+    );
+  }
+  return value;
 }
 
 function requireSeq(value: unknown): number {
