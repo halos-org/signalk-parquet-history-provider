@@ -19,6 +19,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          # None of these jobs runs an authenticated git operation, and each
+          # one then packs this workspace or mounts it into a container. The
+          # default leaves the job token in .git/config for every later step.
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -54,10 +59,10 @@ jobs:
             # that ships nothing to npm is not mistaken for a real release --
             # bump VERSION to publish a new version.
             echo "::warning::signalk-parquet-history-provider@$VERSION is already on npm; nothing to publish. Bump VERSION to release a new version."
-            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "Version $VERSION not found on npm, will publish"
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and publish to npm

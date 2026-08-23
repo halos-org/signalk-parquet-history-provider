@@ -35,6 +35,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # None of these jobs runs an authenticated git operation, and each
+          # one then packs this workspace or mounts it into a container. The
+          # default leaves the job token in .git/config for every later step.
+          persist-credentials: false
 
       - uses: actions/setup-node@v6
         with:

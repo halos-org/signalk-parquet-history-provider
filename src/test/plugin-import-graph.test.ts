@@ -104,7 +104,10 @@ describe("the plugin's import graph", () => {
       `  selfContext: "vessels.self",`,
       `};`,
       `const plugin = factory(app);`,
-      `plugin.start({});`,
+      // Awaited: if start() ever becomes async and loads the engine lazily --
+      // the case this test exists for -- an un-awaited call leaves the import
+      // pending when the report is taken, and the probe reports nothing.
+      `await plugin.start({});`,
       `await plugin.stop?.();`,
       `const loaded = process.report.getReport().sharedObjects`,
       `  .filter((p) => /duckdb/i.test(p));`,
@@ -114,7 +117,10 @@ describe("the plugin's import graph", () => {
       const output = execFileSync(
         process.execPath,
         ["--input-type=module", "-e", probe],
-        { encoding: "utf8" },
+        // Bounded: a child that never exits would hang the whole suite with no
+        // diagnostic, which is exactly how a /proc deadlock in another test
+        // cost a CI run.
+        { encoding: "utf8", timeout: 30_000 },
       );
       assert.deepEqual(JSON.parse(output.trim()), []);
     } finally {

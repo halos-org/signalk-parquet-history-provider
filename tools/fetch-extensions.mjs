@@ -70,6 +70,8 @@ const connection = await instance.connect();
 const reported = String(
   (await connection.runAndReadAll("select version()")).getRows()[0][0],
 ).replace(/^v/, "");
+connection.closeSync?.();
+instance.closeSync?.();
 if (reported !== version) {
   console.error(
     `@duckdb/node-api@${pinned} reports DuckDB ${reported}, but the version ` +

@@ -180,7 +180,19 @@ function orderMetrics(names: string[]): string[] {
   });
 }
 
-function markdownTable(header: string[], body: string[][]): string[] {
+/** `--label` is free text and a subject name is whatever the operator typed, so
+ * either can carry a pipe — which would add a column and shift every cell in
+ * the row under the wrong condition. */
+function escapeCell(value: string): string {
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll("|", "\\|")
+    .replace(/\r?\n/g, " ");
+}
+
+function markdownTable(rawHeader: string[], rawBody: string[][]): string[] {
+  const header = rawHeader.map(escapeCell);
+  const body = rawBody.map((row) => row.map(escapeCell));
   const widths = header.map((cell, i) =>
     Math.max(cell.length, ...body.map((row) => row[i].length)),
   );

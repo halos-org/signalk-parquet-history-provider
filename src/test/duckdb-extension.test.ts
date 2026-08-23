@@ -7,10 +7,12 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import {
   bundledExtensionRelPath,
@@ -22,6 +24,10 @@ import {
   pinnedDuckdbVersion,
   ensureExtensionExtracted,
 } from "../duckdb/extension.js";
+
+// fileURLToPath rather than URL.pathname, which stays percent-encoded and
+// would make a checkout path containing a space an invalid filesystem path.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 describe("duckdbVersionFromPackageVersion", () => {
   it("strips the wrapper's revision suffix", () => {
@@ -97,13 +103,14 @@ describe("pinnedDuckdbVersion", () => {
   it("reads the exact pin out of package.json", () => {
     // Not a fixture: this asserts the real dependency is pinned, because a
     // range here is what silently ships a mismatched extension.
-    const root = new URL("../..", import.meta.url).pathname;
-    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    const pkg = JSON.parse(
+      readFileSync(join(REPO_ROOT, "package.json"), "utf8"),
+    );
     assert.match(
       pkg.dependencies["@duckdb/node-api"],
       /^\d+\.\d+\.\d+-r\.\d+$/,
     );
-    assert.match(pinnedDuckdbVersion(root), /^\d+\.\d+\.\d+$/);
+    assert.match(pinnedDuckdbVersion(REPO_ROOT), /^\d+\.\d+\.\d+$/);
   });
 });
 
@@ -117,9 +124,7 @@ describe("ensureExtensionExtracted", () => {
     // The manifest is checked against this package's own pin, so the fixture
     // uses the real one rather than a literal that would drift out from under
     // the test on the next DuckDB bump.
-    const version = pinnedDuckdbVersion(
-      new URL("../..", import.meta.url).pathname,
-    );
+    const version = pinnedDuckdbVersion(REPO_ROOT);
     const target = join(root, bundledExtensionRelPath(version, platform));
     mkdirSync(dirname(target), { recursive: true });
     const compressed = gzipSync(payload);
@@ -205,19 +210,34 @@ describe("ensureExtensionExtracted", () => {
     }
   });
 
-  it("sweeps a temporary left by a process that died mid-expansion", () => {
+  it("sweeps an orphaned temporary but leaves a live one alone", () => {
     // The catch covers a thrown error; it does not cover SIGKILL, an OOM kill
-    // or a power cut, and each orphan is 27 MB on the card that also holds
-    // the hot store.
+    // or a power cut, and each orphan is 27 MB on the card that also holds the
+    // hot store. But unlinking a temporary another process is *currently*
+    // writing does not fail — unlink succeeds on an open file and that
+    // process's rename then fails with ENOENT — so age is what makes the
+    // sweep safe alongside the concurrent extraction it exists to support.
     const { root, cacheDir, cleanup } = fixture();
     try {
       const path = ensureExtensionExtracted({ root, cacheDir, platform });
       const directory = dirname(path);
+
       const orphan = join(directory, "sqlite_scanner.999999.tmp");
-      writeFileSync(orphan, "half a binary");
+      writeFileSync(orphan, "half a binary from a process that died");
+      const old = Date.now() / 1000 - 7200;
+      utimesSync(orphan, old, old);
+
+      const live = join(directory, "sqlite_scanner.999998.tmp");
+      writeFileSync(live, "another process is writing this right now");
+
       rmSync(path);
       ensureExtensionExtracted({ root, cacheDir, platform });
+
       assert.ok(!existsSync(orphan), "the orphaned temporary was left behind");
+      assert.ok(
+        existsSync(live),
+        "a live extraction's temporary was swept, which breaks its rename",
+      );
     } finally {
       cleanup();
     }

@@ -173,10 +173,16 @@ function numberRecord(value: unknown): Record<string, number> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return { ...CONFIG_DEFAULTS.samplingRates };
   }
+  // Non-positive overrides are dropped rather than carried through. The field
+  // is a minimum interval between samples, so 0 and negatives are not values
+  // it can honour; dropping them falls back to the default rate, which is what
+  // the rate matcher does with them anyway.
   return Object.fromEntries(
     Object.entries(value).filter(
       (entry): entry is [string, number] =>
-        typeof entry[1] === "number" && Number.isFinite(entry[1]),
+        typeof entry[1] === "number" &&
+        Number.isFinite(entry[1]) &&
+        entry[1] > 0,
     ),
   );
 }

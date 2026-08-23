@@ -122,6 +122,16 @@ describe("normalizeConfig", () => {
     assert.deepEqual(normalized.samplingRates, { "a.*": 200 });
   });
 
+  it("drops a per-path rate that is not an interval", () => {
+    // The field is a minimum interval between samples, so 0 and negatives are
+    // not values it can honour. Dropping them falls back to the default rate,
+    // which is what the rate matcher does with them anyway.
+    const normalized = normalizeConfig({
+      samplingRates: { "a.*": -1, "b.*": 0, "c.*": 250 },
+    });
+    assert.deepEqual(normalized.samplingRates, { "c.*": 250 });
+  });
+
   it("leaves a complete configuration alone", () => {
     assert.deepEqual(normalizeConfig(complete), complete);
   });

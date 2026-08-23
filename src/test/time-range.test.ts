@@ -56,6 +56,28 @@ describe("resolveTimeRange", () => {
     assert.ok(result.to.includes("2024-01-01T01:00:00"));
   });
 
+  it("treats a zero duration as a value, not as absent", () => {
+    // Under a truthiness test every duration branch is skipped: this returned
+    // `from` until now — an unbounded range where an empty one was asked for.
+    const from = Temporal.Instant.from("2024-01-01T00:00:00Z");
+    const result = resolveTimeRange({ from, duration: 0 });
+    assert.equal(result.from, result.to);
+    assert.ok(result.to.includes("2024-01-01T00:00:00"));
+  });
+
+  it("resolves to + a zero duration instead of throwing", () => {
+    const to = Temporal.Instant.from("2024-01-02T00:00:00Z");
+    const result = resolveTimeRange({ to, duration: 0 });
+    assert.equal(result.from, result.to);
+  });
+
+  it("resolves a zero Temporal.Duration the same way", () => {
+    const from = Temporal.Instant.from("2024-01-01T00:00:00Z");
+    const zero = Temporal.Duration.from({ seconds: 0 });
+    const result = resolveTimeRange({ from, duration: zero });
+    assert.equal(result.from, result.to);
+  });
+
   it("throws on empty params", () => {
     assert.throws(() => resolveTimeRange({}));
   });

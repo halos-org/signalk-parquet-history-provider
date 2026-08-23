@@ -150,8 +150,13 @@ export class Throttle {
     if (minMs <= 0) return false;
     if (minMs > this.maxRateMs) this.maxRateMs = minMs;
     const key = `${path}|${context}`;
-    const last = this.lastWrite.get(key) ?? 0;
-    if (now - last < minMs) return true;
+    // Presence, not a 0 sentinel. Treating an unseen pair as "last wrote at
+    // 0" drops its first update whenever the clock's origin is near zero —
+    // performance.now(), or a virtual clock in a test — and because the drop
+    // also skips recording the pair, it stays dropped until the clock passes
+    // minMs. Date.now() hides this; nothing else does.
+    const last = this.lastWrite.get(key);
+    if (last !== undefined && now - last < minMs) return true;
     if (this.lastWrite.size >= this.maxEntries && !this.lastWrite.has(key)) {
       this.evict(now);
     }

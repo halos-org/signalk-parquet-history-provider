@@ -184,14 +184,13 @@ async function doSelftest(argv: string[]): Promise<void> {
           log: (message) => console.error(`[${condition.label}] ${message}`),
         });
       } finally {
+        // Both in the finally: if runBenchmark throws, control leaves here and
+        // a generator still parked in fsync would outlive the outer cleanup
+        // that deletes its working directory. settleChild escalates to SIGKILL
+        // and then gives up, so it cannot hang the run either.
         child.kill("SIGTERM");
+        await settleChild(child, exited);
       }
-
-      // The generator exits at the end of its current slice — unless it is
-      // parked in fsync on a stalled card, which ignores every signal. Waiting
-      // unconditionally would hang a run whose measurement already completed,
-      // inside the try, so the temp directory would leak too.
-      await settleChild(child, exited);
 
       // The generator's own account of what it did. It is not a second
       // estimate — it counted the bytes it fsynced and asked the kernel for

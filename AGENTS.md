@@ -58,6 +58,12 @@ a check on module evaluation alone.
   because the spawned processes do not share the server's working directory.
 - `src/path-matcher.ts`, `src/time-range.ts` — copied from
   `signalk-questdb-history-provider` with their suites. Fix bugs in both.
+  They currently **differ** from the sibling by two fixes: `resolveTimeRange`
+  treats a zero duration as a value rather than as absent, and `Throttle` tests
+  a pair for presence rather than using a `0` sentinel. The sibling is tracked
+  at
+  [signalk-questdb-history-provider#23](https://github.com/halos-org/signalk-questdb-history-provider/issues/23);
+  fold the copies back together when it lands.
 - `src/duckdb/` — version and platform naming, the bundled-extension resolver,
   and the standalone offline check. This is the only place that may import the
   engine.

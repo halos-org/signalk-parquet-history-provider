@@ -159,6 +159,19 @@ describe("renderComparison", () => {
     assert.match(table, /mmcblk0/);
   });
 
+  it("escapes a pipe in a label so it cannot forge a column", () => {
+    // --label is free text. An unescaped pipe adds a column and shifts every
+    // cell in that row under the wrong condition.
+    const table = renderComparison([run("a|b", [1, 1, 1])]);
+    const header = table.split("\n").find((l) => l.startsWith("| measurement"));
+    assert.ok(header, "expected a header row");
+    // Counted on unescaped pipes only — a `\|` is a literal pipe in a cell,
+    // not a column boundary.
+    const columns = header.split(/(?<!\\)\|/);
+    assert.equal(columns.length, 4, `the label forged a column: ${header}`);
+    assert.match(table, /a\\\|b/);
+  });
+
   it("refuses to compare nothing", () => {
     assert.throws(() => renderComparison([]));
   });

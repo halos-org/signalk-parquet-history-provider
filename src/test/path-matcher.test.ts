@@ -255,6 +255,17 @@ describe("Throttle", () => {
     assert.equal(t.shouldDrop("a.b", "self", -5, T0 + 2), false);
   });
 
+  it("records the first update even when the clock starts near zero", () => {
+    // A missing pair used to read as "last wrote at 0", so with a clock whose
+    // origin is near zero — performance.now(), or a virtual clock in a test —
+    // the first update was dropped, and the drop also skipped recording the
+    // pair, so it stayed dropped until the clock passed minMs.
+    const t = new Throttle();
+    assert.equal(t.shouldDrop("a.b", "self", 2000, 5), false);
+    assert.equal(t.shouldDrop("a.b", "self", 2000, 10), true);
+    assert.equal(t.shouldDrop("a.b", "self", 2000, 2005), false);
+  });
+
   it("clear() forgets all pairs", () => {
     const t = new Throttle();
     t.shouldDrop("a.b", "self", 2000, T0);

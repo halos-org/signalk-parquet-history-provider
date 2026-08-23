@@ -181,7 +181,6 @@ export function ensureExtensionExtracted(options: ResolveOptions): string {
   }
 
   mkdirSync(targetDir, { recursive: true });
-  sweepStaleTemporaries(targetDir);
 
   // Expand through a temporary name and rename into place: several query
   // processes can spawn at once, and a reader must never see a half-written
@@ -189,6 +188,7 @@ export function ensureExtensionExtracted(options: ResolveOptions): string {
   // atomic against a concurrent reader and says nothing about what reached
   // the disk, and power loss is the normal way a vessel's Pi shuts down.
   const temp = join(targetDir, `${SQLITE_SCANNER}.${process.pid}.tmp`);
+  sweepStaleTemporaries(targetDir, temp);
   try {
     const fd = openSync(temp, "wx", 0o644);
     try {
@@ -210,21 +210,37 @@ export function ensureExtensionExtracted(options: ResolveOptions): string {
   return target;
 }
 
+/** How long a temporary must sit untouched before it counts as an orphan
+ * rather than a live extraction. Expanding 27 MB takes well under a second
+ * even on an SD card, so an hour is far past any legitimate write. */
+const ORPHAN_AGE_MS = 60 * 60 * 1000;
+
 /**
  * Remove `*.tmp` left by a process that died between the write and the
- * rename. The catch above covers a thrown error; it does not cover SIGKILL,
- * an OOM kill or a power cut, and each orphan is 27 MB on the same card that
- * holds the hot store and the Parquet tree.
+ * rename. The catch in the caller covers a thrown error; it does not cover
+ * SIGKILL, an OOM kill or a power cut, and each orphan is 27 MB on the same
+ * card that holds the hot store and the Parquet tree.
+ *
+ * Age is what makes this safe. Several query processes can extract at once,
+ * and unlinking a temporary another process is *currently* writing does not
+ * fail — POSIX unlink succeeds on an open file, the writer carries on into an
+ * unlinked inode, and its `renameSync` then fails with ENOENT. So a sweep that
+ * simply deleted every `.tmp` would break the concurrency this function exists
+ * to support.
  */
-function sweepStaleTemporaries(directory: string): void {
+function sweepStaleTemporaries(directory: string, own: string): void {
+  const cutoff = Date.now() - ORPHAN_AGE_MS;
   for (const entry of readdirSync(directory)) {
     if (!entry.startsWith(`${SQLITE_SCANNER}.`) || !entry.endsWith(".tmp")) {
       continue;
     }
+    const path = join(directory, entry);
+    if (path === own) continue;
     try {
-      unlinkSync(join(directory, entry));
+      if (statSync(path).mtimeMs > cutoff) continue;
+      unlinkSync(path);
     } catch {
-      /* another process may be writing it right now */
+      /* it may have been renamed into place, or swept by another process */
     }
   }
 }

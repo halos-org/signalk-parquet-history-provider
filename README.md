@@ -69,7 +69,7 @@ with no network.
 
 To check an installation on the machine it runs on:
 
-```
+```bash
 ./run check-extension          # in a clone
 node dist/duckdb/check-extension.js   # in an installed copy on a device
 ```
@@ -94,7 +94,7 @@ the kernel's own high-water mark (`VmHWM`, or cgroup `memory.peak`) rather than
 from the samples, because the roll process is short-lived by design and its
 peak is exactly what a sampling interval misses.
 
-```
+```bash
 ./run bench run --label sqhp --subject signalk:pid=1234 -o sqhp.json
 ./run bench compare control.json sqhp.json parquet.json
 ./run bench selftest
@@ -108,7 +108,7 @@ counters, so it only runs on Linux.
 
 ## Development
 
-```
+```bash
 ./run            # list the commands
 ./run test       # build, then run the suites
 ./run lint
