@@ -13,6 +13,7 @@ import type { DuckDBConnection } from "@duckdb/node-api";
 import { DATA_DIR_MODE, DATA_LAYOUT } from "../data-dir.js";
 import { commitFile } from "../durable-write.js";
 import { BASE_DUCKDB_CONFIG, loadSqliteScanner } from "../duckdb/extension.js";
+import { sqlLiteral } from "../duckdb/sql.js";
 import { writerPaths } from "../writer/contract.js";
 import {
   dateDirectory,
@@ -415,13 +416,3 @@ function sweepStaleScratch(root: string): void {
  * orphan. Comfortably past the roll timeout that would have killed its
  * owner. */
 const STALE_SCRATCH_MS = 60 * 60_000;
-
-/**
- * Single-quoted SQL literal. Every path here is composed from the configured
- * data directory rather than from a delta, but DuckDB has no parameter
- * binding for `COPY … TO` or `ATTACH`, and the data directory is still one
- * string in them that a person types.
- */
-function sqlLiteral(value: string): string {
-  return value.replaceAll("'", "''");
-}

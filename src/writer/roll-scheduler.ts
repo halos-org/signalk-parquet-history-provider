@@ -1,14 +1,16 @@
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { commitFile } from "../durable-write.js";
 import { fileURLToPath } from "node:url";
 import { delayToNextRoll, nextRollAt } from "../roll/schedule.js";
 import {
   EXIT_NAME_TAKEN,
   ROLL_KILL_GRACE_MS,
+  readPendingRoll,
   writerPaths,
 } from "./contract.js";
+import type { PendingRoll } from "./contract.js";
 import type { HotStore } from "./hot-store.js";
 
 /**
@@ -415,32 +417,6 @@ export class RollScheduler {
   }
 }
 
-function readPendingRoll(dataDir: string): PendingRoll | null {
-  try {
-    const raw = JSON.parse(
-      readFileSync(writerPaths(dataDir).pendingRoll, "utf8"),
-    ) as Partial<PendingRoll>;
-    // `>= 1`, matching what the roll process accepts. Accepting 0 here made a
-    // `{"rollId":0}` file wedge every future roll: the scheduler adopted it
-    // and the roll refused it, for ever. `nextRollAt` really can return 0 —
-    // for any clock set before the epoch.
-    if (
-      !Number.isSafeInteger(raw.rollId) ||
-      (raw.rollId as number) < 1 ||
-      !Number.isSafeInteger(raw.maxRowid) ||
-      (raw.maxRowid as number) < 1 ||
-      (raw.phase !== "rolling" && raw.phase !== "written")
-    ) {
-      return null;
-    }
-    return raw as PendingRoll;
-  } catch {
-    // Absent is the normal case. Unreadable is treated the same way on
-    // purpose: a corrupt file must not be able to stop a device rolling.
-    return null;
-  }
-}
-
 function writePendingRoll(
   dataDir: string,
   pending: PendingRoll,
@@ -483,15 +459,6 @@ function clearPendingRoll(
       `could not clear the pending roll record (${err instanceof Error ? err.message : String(err)})`,
     );
   }
-}
-
-/** What one roll attempt was doing, durable across a writer's death. */
-interface PendingRoll {
-  rollId: number;
-  maxRowid: number;
-  /** `rolling`: files may exist and nothing is truncated — a retry owns them.
-   * `written`: the roll finished; only the truncate is outstanding. */
-  phase: "rolling" | "written";
 }
 
 type RollOutcome =
