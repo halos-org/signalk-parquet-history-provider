@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -133,6 +134,70 @@ describe("a delta reaching the writer's store", () => {
         "the writer to clean up after itself",
         10_000,
       ).catch(() => {});
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("survives a writer that cannot be spawned at all", async () => {
+    // A ChildProcess with no `error` listener rethrows the event, and the throw
+    // lands a tick after start() returned, so start()'s catch cannot see it.
+    // Measured before this was fixed: the process exits with code 1. Inside
+    // Signal K that is the whole server, for a failure that should cost one
+    // plugin its recording.
+    //
+    // Driven in a child because the only way to make spawn fail is to make the
+    // executable unspawnable, and the plugin spawns process.execPath. The child
+    // reports whether it was still alive after the event had to have fired.
+    const base = mkdtempSync(join(tmpdir(), "sk-parquet-e2e-"));
+    try {
+      const script = `
+        import createPlugin from ${JSON.stringify(
+          new URL("../index.js", import.meta.url).href,
+        )};
+        const errors = [];
+        const app = {
+          debug: () => {},
+          error: () => {},
+          setPluginStatus: () => {},
+          setPluginError: (m) => errors.push(m),
+          getDataDirPath: () => ${JSON.stringify(base)},
+          selfContext: "vessels.self",
+          streambundle: { getBus: () => ({ onValue: () => () => {} }) },
+        };
+        // Nothing can be spawned from here on.
+        process.execPath = "/nonexistent/for/this/test/node";
+        createPlugin(app).start({});
+        setTimeout(() => {
+          process.stdout.write("alive " + JSON.stringify(errors) + "\\n");
+          process.exit(0);
+        }, 500);
+      `;
+      const child = spawn(
+        process.execPath,
+        [
+          "--disable-warning=ExperimentalWarning",
+          "--input-type=module",
+          "-e",
+          script,
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (c: Buffer) => (out += c.toString()));
+      child.stderr.on("data", (c: Buffer) => (err += c.toString()));
+      const code = await new Promise<number | null>((resolve) =>
+        child.on("exit", (value: number | null) => resolve(value)),
+      );
+
+      assert.equal(code, 0, `the plugin took the process down: ${err}`);
+      assert.match(out, /^alive /, `child did not survive: ${out} ${err}`);
+      assert.match(
+        out,
+        /could not be started/,
+        "the failure was survived but never reported",
+      );
+    } finally {
       rmSync(base, { recursive: true, force: true });
     }
   });

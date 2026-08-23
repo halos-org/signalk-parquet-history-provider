@@ -85,6 +85,23 @@ export default (app: App) => {
     child.stderr?.on("data", (chunk: Buffer) =>
       app.error(`writer: ${chunk.toString().trimEnd()}`),
     );
+    // A ChildProcess is an EventEmitter, and an EventEmitter with no `error`
+    // listener rethrows the event. Node emits it when the process cannot be
+    // spawned at all -- EAGAIN or ENOMEM under memory pressure, ENOENT,
+    // EACCES -- and when a kill fails. The event arrives a tick after start()
+    // returned, so start()'s catch cannot see it, and the uncaught exception
+    // exits the Signal K server: the whole process, for a failure that should
+    // cost one plugin its recording. The streams need the same treatment,
+    // since EPIPE on a dead pipe throws the same way.
+    child.stdout?.on("error", (err) => app.error(`writer stdout: ${err.name}`));
+    child.stderr?.on("error", (err) => app.error(`writer stderr: ${err.name}`));
+    child.on("error", (err) => {
+      if (writer !== child) return;
+      writer = null;
+      app.error(err);
+      fatal = `the writer process could not be started: ${err.message}`;
+      app.setPluginError(fatal);
+    });
     child.on("exit", (code, signal) => {
       if (writer !== child) return;
       writer = null;
