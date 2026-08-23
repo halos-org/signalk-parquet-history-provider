@@ -85,8 +85,7 @@ a check on module evaluation alone.
   soon — without that, a device whose clock is stepped at boot stops recording
   for the length of the step. The sibling is tracked
   at
-  [signalk-questdb-history-provider#23](https://github.com/halos-org/signalk-questdb-history-provider/issues/23);
-  fold the copies back together when it lands.
+  [signalk-questdb-history-provider#23](https://github.com/halos-org/signalk-questdb-history-provider/issues/23).
 - `src/duckdb/` — version and platform naming, the bundled-extension resolver,
   and the standalone offline check. This is the only place that may import the
   engine.
