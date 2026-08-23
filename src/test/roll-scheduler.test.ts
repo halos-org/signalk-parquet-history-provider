@@ -17,7 +17,7 @@ import { dateDirectory } from "../roll/tree-path.js";
 import { writerPaths } from "../writer/contract.js";
 import { HotStore } from "../writer/hot-store.js";
 import { RollScheduler } from "../writer/roll-scheduler.js";
-import { sample } from "./fixtures.js";
+import { NO_BUNDLED_EXTENSION, sample } from "./fixtures.js";
 import type { Sample } from "../writer/protocol.js";
 
 const AUG_23 = Date.UTC(2026, 7, 23);
@@ -265,41 +265,45 @@ describe("a roll left unfinished by a writer that died", () => {
   });
 });
 
-describe("a roll that would land on a name already taken", () => {
-  it("fails rather than replacing it, and truncates nothing", async () => {
-    // Only a retry may replace a file. A fresh roll handed an id that already
-    // has a file has been given the wrong slot, and writing it would replace
-    // that roll's rows with a fraction of them.
-    record(sample({ ts: AUG_23, path: "a.b" }));
-    const first = new RollScheduler({
-      store,
-      dataDir: dir,
-      intervalMinutes: 60,
-      log: (line) => logged.push(line),
-      now: () => NOW,
-    });
-    await first.rollOnce(SLOT);
-    assert.equal(store.rowCount(), 0);
+describe(
+  "a roll that would land on a name already taken",
+  { skip: NO_BUNDLED_EXTENSION },
+  () => {
+    it("fails rather than replacing it, and truncates nothing", async () => {
+      // Only a retry may replace a file. A fresh roll handed an id that already
+      // has a file has been given the wrong slot, and writing it would replace
+      // that roll's rows with a fraction of them.
+      record(sample({ ts: AUG_23, path: "a.b" }));
+      const first = new RollScheduler({
+        store,
+        dataDir: dir,
+        intervalMinutes: 60,
+        log: (line) => logged.push(line),
+        now: () => NOW,
+      });
+      await first.rollOnce(SLOT);
+      assert.equal(store.rowCount(), 0);
 
-    record(sample({ ts: AUG_23 + 1, path: "c.d" }));
-    const second = new RollScheduler({
-      store,
-      dataDir: dir,
-      intervalMinutes: 60,
-      log: (line) => logged.push(line),
-      now: () => NOW,
-    });
-    // The same slot again: what an early-firing timer used to produce.
-    await second.rollOnce(SLOT);
+      record(sample({ ts: AUG_23 + 1, path: "c.d" }));
+      const second = new RollScheduler({
+        store,
+        dataDir: dir,
+        intervalMinutes: 60,
+        log: (line) => logged.push(line),
+        now: () => NOW,
+      });
+      // The same slot again: what an early-firing timer used to produce.
+      await second.rollOnce(SLOT);
 
-    assert.equal(store.rowCount(), 1, "nothing may be truncated");
-    assert.match(logged.join("\n"), /did not finish/);
-    assert.equal(
-      readParquetRows(join(dateDirectory(dir, AUG_23), `${SLOT}.parquet`)),
-      1,
-    );
-  });
-});
+      assert.equal(store.rowCount(), 1, "nothing may be truncated");
+      assert.match(logged.join("\n"), /did not finish/);
+      assert.equal(
+        readParquetRows(join(dateDirectory(dir, AUG_23), `${SLOT}.parquet`)),
+        1,
+      );
+    });
+  },
+);
 
 describe("a failure inside the roll itself", () => {
   it("costs one roll, not the writer", async () => {
@@ -358,26 +362,33 @@ describe("stopping", () => {
   });
 });
 
-describe("the real roll process, driven by the scheduler", () => {
-  it("writes the tree and truncates the store", async () => {
-    record(
-      sample({ ts: AUG_23 + 1000, path: "a.b" }),
-      sample({ ts: AUG_23 + 2000, path: "c.d" }),
-    );
-    // No spawnRoll: this is the production path, DuckDB and all.
-    const rolls = new RollScheduler({
-      store,
-      dataDir: dir,
-      intervalMinutes: 60,
-      log: (line) => logged.push(line),
-      now: () => NOW,
-    });
-    await rolls.rollOnce(SLOT);
+describe(
+  "the real roll process, driven by the scheduler",
+  { skip: NO_BUNDLED_EXTENSION },
+  () => {
+    it("writes the tree and truncates the store", async () => {
+      record(
+        sample({ ts: AUG_23 + 1000, path: "a.b" }),
+        sample({ ts: AUG_23 + 2000, path: "c.d" }),
+      );
+      // No spawnRoll: this is the production path, DuckDB and all.
+      const rolls = new RollScheduler({
+        store,
+        dataDir: dir,
+        intervalMinutes: 60,
+        log: (line) => logged.push(line),
+        now: () => NOW,
+      });
+      await rolls.rollOnce(SLOT);
 
-    assert.equal(store.rowCount(), 0);
-    assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), [
-      `${SLOT}.parquet`,
-    ]);
-    assert.match(logged.join("\n"), /2 rows to 2026-08-23 and 2 sidecar rows/);
-  });
-});
+      assert.equal(store.rowCount(), 0);
+      assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), [
+        `${SLOT}.parquet`,
+      ]);
+      assert.match(
+        logged.join("\n"),
+        /2 rows to 2026-08-23 and 2 sidecar rows/,
+      );
+    });
+  },
+);

@@ -17,7 +17,7 @@ import { roll } from "../roll/roll.js";
 import { dateDirectory, sidecarFile } from "../roll/tree-path.js";
 import { writerPaths } from "../writer/contract.js";
 import { HotStore } from "../writer/hot-store.js";
-import { sample } from "./fixtures.js";
+import { NO_BUNDLED_EXTENSION, sample } from "./fixtures.js";
 import type { Sample } from "../writer/protocol.js";
 
 const DIST = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -78,7 +78,7 @@ function readParquet(pattern: string): Record<string, unknown>[] {
 const DAY = 86_400_000;
 const AUG_23 = Date.UTC(2026, 7, 23);
 
-describe("a roll", () => {
+describe("a roll", { skip: NO_BUNDLED_EXTENSION }, () => {
   it("writes every covered row and no more", async () => {
     record(
       sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }),
@@ -189,7 +189,7 @@ describe("a roll", () => {
   });
 });
 
-describe("the sidecar", () => {
+describe("the sidecar", { skip: NO_BUNDLED_EXTENSION }, () => {
   it("keeps a path that stopped reporting before this roll", async () => {
     record(
       sample({ ts: AUG_23 + 1000, path: "gone.away", value: 11 }),
@@ -226,7 +226,7 @@ describe("the sidecar", () => {
   });
 });
 
-describe("the roll process", () => {
+describe("the roll process", { skip: NO_BUNDLED_EXTENSION }, () => {
   it("prints what it wrote and exits 0", () => {
     record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
     const output = execFileSync(

@@ -1,4 +1,26 @@
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Position, Sample } from "../writer/protocol.js";
+
+/**
+ * Why a suite that needs the real DuckDB extension may not run.
+ *
+ * `null` when it can. The binaries are not committed — `./run
+ * fetch-extensions` downloads them — so a fresh clone has none and the tests
+ * that spawn a real roll would fail for a reason that is not a defect. CI
+ * fetches them before the suite, so a skip there means the fetch step failed,
+ * and that step fails the job on its own.
+ */
+export const NO_BUNDLED_EXTENSION: string | false = existsSync(
+  join(
+    resolve(dirname(fileURLToPath(import.meta.url)), "..", ".."),
+    "extensions",
+    "manifest.json",
+  ),
+)
+  ? false
+  : "no bundled DuckDB extension; run `./run fetch-extensions`";
 
 /**
  * Shared test fixtures.
