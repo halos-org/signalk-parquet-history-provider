@@ -12,7 +12,9 @@ one after data exists means re-rolling the tree.
 1. **No path partitioning.** One Parquet file per roll, holding every context
    and every path, with `context` and `path` as columns. The directory tree
    carries time only: `<data-dir>/parquet/date=<YYYY-MM-DD>/<rollStart>.parquet`.
-2. **Hourly rolls**, aligned to the UTC hour.
+2. **Hourly rolls by default**, aligned to the UTC hour, and configurable. What
+   the interval really has to hold is the hot store's ceiling near 50 MB; an
+   hour does that at the rate measured here and not at ten times it.
 3. **No compaction pass.** The roll's output is the final form of the file.
 4. **A cumulative last-value sidecar per roll**, one row per
    `(context, path)`.
@@ -41,11 +43,19 @@ input.
 
 Every roll and every query ran in its own process at `memory_limit = 256MB`, and
 each cell ran three times. Peaks are `VmHWM` from `/proc/self/status`, write
-volume is `write_bytes` from `/proc/self/io`, CPU is `process.cpuUsage`, read
-the same way `src/bench/proc.ts` parses them — the scratch scripts duplicated
-that parsing rather than importing the harness, which is the one place these
-numbers depart from the project's measurement rule. Figures are median with
-range.
+volume is `write_bytes` from `/proc/self/io`, CPU is `process.cpuUsage`. Figures
+are median with range.
+
+`src/bench/` did not run these. Its method is three settled windows against a
+subject addressed by pid or cgroup, differencing counters for rates and
+splitting each window in half to check steadiness — which needs a subject that
+is still running. A roll lives between 0.7 and 5 seconds and its quantity is the
+high-water mark the kernel already recorded, so there is no window to settle and
+no pid to attach to before it exits. The scratch scripts therefore read the same
+files with the same expressions `src/bench/proc.ts` parses, and duplicated that
+parsing rather than importing it. What the project's measurement rule actually
+needs here is for the one-shot peak to become part of the harness, which is
+Unit 3b's to do when it has a roll process to point at.
 
 **Every peak below includes the process itself.** Node alone is 75–87 MB
 resident; opening DuckDB takes it to 85–96 MB; loading `sqlite_scanner`,
@@ -68,12 +78,15 @@ partitions.
 | path   | 381,494   | **out of memory, 3 of 3** |          |         |       |
 | path   | 1,267,240 | **out of memory, 3 of 3** |          |         |       |
 
-A partitioned write's peak follows the row count and a plain `COPY`'s does not.
-Rolling 38,970, 381,494 and 1,267,240 rows costs the group layout 130.9, 280.6
-and 470.4 MB, and the flat layout 109.3, 141.6 and 146.5 MB. The shape of that —
-memory proportional to input, released only at the end — is what a write that
-collects its result set before emitting it looks like, though this measured the
-behaviour and not the engine's source. At 552 partitions it exceeds a 256 MB
+A partitioned write's peak rises with the row count and a plain `COPY`'s rises
+far more slowly. Rolling 38,970, 381,494 and 1,267,240 rows costs the group
+layout 130.9, 280.6 and 470.4 MB — a 33-fold increase in rows for a 3.6-fold
+increase in memory — against the flat layout's 109.3, 141.6 and 146.5 MB, which
+is 1.3-fold, and 37 MB of it lands between the first two points. Flat is not
+constant; it is bounded, and the bound is measured below at 204–246 MB for
+11.4M rows. The partitioned shape — memory rising with input and released only
+at the end — is what a write that collects its result set before emitting it
+looks like, though this measured the behaviour and not the engine's source. At 552 partitions it exceeds a 256 MB
 limit on anything longer than a ten-minute window, and none of the knobs that
 look like they should contain it do: `row_group_size` at 2,048, 10,000, 40,000
 and 122,880 all fail, `partitioned_write_max_open_files` at 8, 32 and 100 all
@@ -195,10 +208,18 @@ the point where file count is doing any harm, and the remaining 40 ms is inside
 the startup cost of the process asking for it.
 
 Two constraints come with it. The interval must divide 24 hours and align to UTC
-midnight, so that no roll straddles a date directory. And the sample rate that
-produced these figures — 125.7 rows/second, 552 paths — is one vessel's; the
-hot-store column scales with it, and an installation recording ten times as much
-should read the 130 MB row rather than the 50 MB one.
+midnight, so that no roll straddles a date directory.
+
+And the interval has to be configurable, because the rate that produced these
+figures — 125.7 rows/second, 552 paths — is one vessel's and the hot store
+scales with it. An installation recording ten times as much fills roughly
+500 MB an hour, which is four times past the largest store measured here and
+puts the recent-query floor near a second by the same slope. The rule that
+follows is to hold the hot store's ceiling near 50 MB rather than to hold the
+interval at an hour: ten times the rate wants a six-minute roll, at 240 files a
+day. Nothing in the flat layout objects to that — the roll cost at 38,970 rows
+is 109 MB and 1.0 s — but it is the roll interval, not the layout, that has to
+move, and the default of one hour is right for a rate near the one measured.
 
 ## Compaction: no
 
@@ -250,13 +271,19 @@ scan — 94 ms at 13 MB, 441 ms at 130 MB — which is the roll interval again.
 
 ## Provisional
 
-**Query latency is provisional in one direction and settled in the other.** The
-reader that will actually run these queries is Unit 4a; every statement measured
-here was written for the measurement. The _ordering_ between layouts is robust —
-a 43 MB tree of 10,337 files is not going to overtake a 3.6 MB tree of 24
-through better SQL — and that ordering is what the decision rests on. The
-absolute numbers are not a prediction of what Unit 4a will report, and Unit 4a
-re-measures them against the real reader.
+**Every query figure here is provisional, including the ordering between
+layouts.** The reader that will actually run these queries is Unit 4a; every
+statement measured here was written for the measurement, so none of these
+numbers predicts what Unit 4a will report, and Unit 4a re-measures all of them.
+
+The ordering is what the decision rests on, so state what it would take to
+overturn it rather than calling it safe. A real reader would have to make a
+10,337-file tree answer a single-path range about eight times faster than the
+ad-hoc statement did — 1,298 ms against the flat tree's 150 ms — while not
+speeding the flat tree up at all. The bytes and the file count do not move: the
+per-path tree holds six times the Parquet and twelve times the disk whatever
+reads it. That is the margin, and Unit 4a is where it is checked rather than
+asserted.
 
 Two other limits worth stating. The aged trees hold thirty days of _files_ and
 one day of _bytes_, so their timestamps repeat and no time pruning is possible
@@ -277,6 +304,9 @@ reports — is unpriced.
 - **Unit 4a** reads a tree of dated directories holding one file per roll, and
   its file selection is a date-directory glob plus a timestamp filter — not hive
   partition pruning on `path`.
+- **Unit 3b** moves the one-shot peak measurement into `src/bench/`. The harness
+  measures running subjects over settled windows and has nothing that reads a
+  short-lived process's `VmHWM` at exit, which is the only quantity a roll has.
 - **Unit 5a** expires whole files by their roll window, and can drop a whole
   date directory when the retention boundary falls on one. Whether retention is
   a storage bound or a deletion guarantee is still that unit's to state: a roll
