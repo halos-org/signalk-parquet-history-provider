@@ -136,6 +136,43 @@ counter restarts at 1 when the plugin does, so without the session a writer
 outliving its plugin would discard the new run's batches as duplicates of the
 old run's, acknowledge them, and record nothing while reporting healthy.
 
+## The roll
+
+One roll process per roll, spawned by **the writer** — not by the plugin. The
+reason is ownership: the roll opens the hot store `READ_ONLY`, so the delete
+that follows a successful roll can only happen in the process that owns the
+store. Scheduling it anywhere else would mean a protocol message asking the
+owner to do what the owner already knows how to do.
+
+`src/writer/roll-scheduler.ts` holds the timer, spawns `src/roll/main.ts`, and
+deletes only on exit 0. Nothing in the writer's import graph reaches DuckDB;
+`src/test/plugin-import-graph.test.ts` checks that against the compiled writer
+as well as the compiled plugin, because a long-lived writer that imported the
+engine would hold the ~100 MB addon for as long as recording runs.
+
+**The set a roll covers is `rowid <= maxRowid`, read by the writer before the
+roll starts.** Not a time window: the recorder stamps `ts` when the delta
+arrives and the flush buffer holds it for up to a flush interval, so a sample
+older than any window routinely reaches the store _after_ the roll has read it.
+Truncating by timestamp would delete that sample unrolled. The bound is read,
+used and dropped inside one roll — SQLite restarts the rowid sequence at 1 once
+the table has been emptied, so a bound carried across two rolls could name rows
+it never covered.
+
+**A roll that fails keeps its id.** A roll that wrote its Parquet and then died
+leaves those rows in the tree and in the store; reusing the id makes the retry
+overwrite what the first attempt wrote instead of adding a second copy under a
+new name.
+
+Inside the roll: one streaming `COPY` per UTC date, never `PARTITION_BY`, and
+no `ORDER BY`. Both of those are measurements rather than preferences —
+`docs/layout-decision.md` has the numbers, and the short version is that a
+partitioned write's peak rises with the row count and runs out of memory at
+this package's path cardinality, while a sort costs three times the memory of
+the whole rest of the roll. Each file is fsynced under a `.tmp` name and
+renamed; the suffix is the whole mechanism that keeps a killed roll from
+leaving something a `*.parquet` glob reads as finished.
+
 ## Conventions
 
 - TypeScript strict; do not loosen `tsconfig.json`.

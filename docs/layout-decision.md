@@ -214,8 +214,13 @@ defensible other answer. Hourly is chosen because 24 files a day is already past
 the point where file count is doing any harm, and the remaining 40 ms is inside
 the startup cost of the process asking for it.
 
-Two constraints come with it. The interval must divide 24 hours and align to UTC
-midnight, so that no roll straddles a date directory.
+One constraint comes with it: the interval must divide 1,440 minutes, because
+"every N minutes from UTC midnight" describes a cadence only when it does. At
+100 minutes the last slot before midnight is 40 minutes long. This was written
+here as the thing that stops a roll straddling a date directory, and
+implementation showed that is not what it does — the roll places each row in
+the directory its own timestamp names, so a roll spanning midnight writes two
+files and both are correct. The constraint is about the schedule alone.
 
 And the interval has to be configurable, because the rate that produced these
 figures — 125.7 rows/second, 552 paths — is one vessel's and the hot store
@@ -307,10 +312,16 @@ task assignments.
 
 - **Nothing untrusted becomes a path.** Contexts and paths are columns. Only the
   roll's own UTC date is a directory.
-- **The interval must divide 1,440 minutes and align to UTC midnight.** A value
-  that does not — `rollIntervalMinutes` accepts one today, since
-  `src/config/schema.ts` normalizes it with `positive()` alone — puts one roll's
-  rows in two date directories.
+- **The interval must divide 1,440 minutes.** Not because a roll would
+  otherwise straddle a date directory — rows are placed by their own timestamp,
+  so a roll spanning midnight writes two files — but because a schedule of
+  "every N minutes from UTC midnight" only describes a cadence when N divides
+  the day.
+- **The set a roll covers is identified by rowid, not by a time window.** The
+  recorder stamps `ts` on arrival and the buffer holds it for up to a flush
+  interval, so a sample older than any window routinely reaches the store after
+  the roll has read it. What Parquet receives and what the store then deletes
+  have to be the same set, and only a monotonic id makes them so.
 - **Selection is by date directory and timestamp, not by partition pruning.** A
   reader narrows to files with a directory glob and a `ts` filter; nothing in
   the tree prunes on `path`.
@@ -319,7 +330,8 @@ task assignments.
   the boundary is an interval wide — whether that makes retention a storage
   bound or a deletion guarantee is for the unit that ships it to state.
 - **The sidecar is read as well as written.** Each roll folds the previous one
-  in, so it is an input to the roll that produces it.
+  in, so it is an input to the roll that produces it. It lives at
+  `latest/latest.parquet`, a sibling of the tree rather than a file inside it.
 - **A roll's peak needs a measurement the harness does not have.** `src/bench/`
   measures running subjects over settled windows; a roll's only quantity is
   `VmHWM` at exit.
