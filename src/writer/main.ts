@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR_MODE, DATA_LAYOUT } from "../data-dir.js";
 import { HotStore } from "./hot-store.js";
+import { RollScheduler } from "./roll-scheduler.js";
 import { StoreLockedError, WriterServer } from "./server.js";
 import { EXIT_LOCKED, writerPaths } from "./contract.js";
 
@@ -30,9 +31,16 @@ function argValue(flag: string): string | undefined {
 async function main(): Promise<void> {
   const dataDir = argValue("--data-dir");
   if (dataDir === undefined || dataDir === "") {
-    process.stderr.write("usage: writer/main.js --data-dir <path>\n");
+    process.stderr.write(
+      "usage: writer/main.js --data-dir <path> --roll-interval-minutes <n>\n",
+    );
     process.exit(1);
   }
+  // Already normalized by the plugin, which refuses an interval that does not
+  // divide the day. Re-read rather than re-derived, so the writer and the
+  // plugin cannot disagree about the schedule; the scheduler throws if the
+  // value is one it cannot turn into a grid.
+  const rollIntervalMinutes = Number(argValue("--roll-interval-minutes"));
 
   const paths = writerPaths(dataDir);
   const hot = join(dataDir, DATA_LAYOUT.hotStore);
@@ -63,11 +71,23 @@ async function main(): Promise<void> {
   writeFileSync(paths.pidFile, `${process.pid}\n`, { mode: 0o600 });
   process.stdout.write(`writer ready on ${paths.socket}\n`);
 
+  // The roll runs here rather than in the plugin because only this process may
+  // write to the store: the roll reads it read-only, and the delete that
+  // follows a successful roll has nowhere else it could happen.
+  const rolls = new RollScheduler({
+    store,
+    dataDir,
+    intervalMinutes: rollIntervalMinutes,
+    log: (line) => process.stdout.write(`${line}\n`),
+  });
+  rolls.start();
+
   let stopping = false;
   const stop = async (signal: string): Promise<void> => {
     if (stopping) return;
     stopping = true;
     process.stdout.write(`writer stopping on ${signal}\n`);
+    await rolls.stop();
     await server.close();
     store.close();
     rmSync(paths.pidFile, { force: true });

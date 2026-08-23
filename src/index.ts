@@ -73,7 +73,10 @@ export default (app: App) => {
   let dataDir = "";
   let lockedRetries = 0;
 
-  function spawnWriter(dataDir: string): ChildProcess {
+  function spawnWriter(
+    dataDir: string,
+    rollIntervalMinutes: number,
+  ): ChildProcess {
     // An argument array, never a shell: a data directory an operator typed
     // into the Admin UI would otherwise be a command line.
     //
@@ -88,6 +91,8 @@ export default (app: App) => {
         WRITER_ENTRY,
         "--data-dir",
         dataDir,
+        "--roll-interval-minutes",
+        String(rollIntervalMinutes),
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
@@ -131,7 +136,9 @@ export default (app: App) => {
             `the hot store is still held; retry ${lockedRetries} in ${delay}ms`,
           );
           const timer = setTimeout(() => {
-            if (!stopping && writer === null) writer = spawnWriter(dataDir);
+            if (!stopping && writer === null) {
+              writer = spawnWriter(dataDir, rollIntervalMinutes);
+            }
           }, delay);
           timer.unref();
           return;
@@ -219,7 +226,7 @@ export default (app: App) => {
         fatal = null;
         stopping = false;
         lockedRetries = 0;
-        writer = spawnWriter(dataDir);
+        writer = spawnWriter(dataDir, config.rollIntervalMinutes);
 
         const buffer = new FlushBuffer({
           flushIntervalMs: config.flushIntervalMs,
