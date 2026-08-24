@@ -28,6 +28,20 @@ import { fileURLToPath } from "node:url";
 
 const QUERY_ENTRY = fileURLToPath(new URL("./main.js", import.meta.url));
 
+/**
+ * Rows one query returns before the answer is reported as truncated.
+ *
+ * The caller holds all of them in the Signal K process, so this is a ceiling
+ * on that rather than on the engine. History playback already reads a long
+ * range as a series of shorter ones; this is what makes an unbounded request
+ * degrade into a truncated answer rather than into the server's heap.
+ *
+ * Here rather than beside the reader that applies it, because the history
+ * surface has to know the ceiling to say which request exceeded it, and it
+ * may not import anything that reaches the engine.
+ */
+export const DEFAULT_ROW_LIMIT = 100_000;
+
 /** The columns a `range` row carries, in the order the tree writes them. */
 export const RANGE_COLUMNS = [
   "ts",

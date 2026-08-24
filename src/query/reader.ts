@@ -11,7 +11,7 @@ import {
 import { sqlLiteral } from "../duckdb/sql.js";
 import { treeRoot, utcDateSegment } from "../roll/tree-path.js";
 import { readPendingRoll, writerPaths } from "../writer/contract.js";
-import { RANGE_COLUMNS, VALUE_COLUMNS } from "./duck.js";
+import { DEFAULT_ROW_LIMIT, RANGE_COLUMNS, VALUE_COLUMNS } from "./duck.js";
 import type { QueryRequest, ValueAggregate } from "./duck.js";
 
 /**
@@ -50,16 +50,6 @@ const MAX_SPECS = 200;
 
 /** Milliseconds in a UTC day. The tree's directories are cut on these. */
 const DAY_MS = 86_400_000;
-
-/**
- * Rows one query returns before the answer is reported as truncated.
- *
- * The caller holds all of them in the Signal K process, so this is a ceiling
- * on that rather than on the engine. History playback already reads a long
- * range as a series of shorter ones; this is what makes an unbounded request
- * degrade into a truncated answer rather than into the server's heap.
- */
-export const DEFAULT_ROW_LIMIT = 100_000;
 
 const COLUMNS = RANGE_COLUMNS.join(", ");
 

@@ -8,7 +8,7 @@ import type {
   ValuesRequest,
   ValuesResponse,
 } from "@signalk/server-api/history";
-import { QueryRunner, VALUE_COLUMNS } from "./query/duck.js";
+import { DEFAULT_ROW_LIMIT, QueryRunner, VALUE_COLUMNS } from "./query/duck.js";
 import type { ValueAggregate, ValueSpec } from "./query/duck.js";
 import { resolveTimeRange } from "./time-range.js";
 
@@ -275,6 +275,20 @@ export function createHistoryV2(
       ...(bucketSeconds > 0 ? { bucketMs: bucketSeconds * 1000 } : {}),
       limit: RAW_ROW_LIMIT,
     });
+
+    // The ceilings that bound a request are per series — a raw one's rows, and
+    // the buckets counted above — and the answer carries every series, so
+    // enough of them together still exceed what one answer may return. Refused
+    // rather than served short: the rows arrive ordered by bucket, so what a
+    // truncated answer drops is the end of the range across every series at
+    // once, and a moving average over a series cut in half is wrong for its
+    // tail rather than merely absent there.
+    if (answer.truncated) {
+      throw new Error(
+        `this request returns more than ${DEFAULT_ROW_LIMIT} rows — use a ` +
+          `shorter range, fewer paths, or a coarser resolution`,
+      );
+    }
 
     // Keyed by spec index rather than by path: a request may name the same
     // path twice with different sources, one column per receiver, and a

@@ -366,6 +366,33 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
   });
 });
 
+describe("an answer that did not fit", () => {
+  it("refuses it rather than serving the range with its end cut off", async () => {
+    // The reader's own ceiling is on the answer, and a request's ceilings are
+    // per series, so enough series together exceed it. Nothing downstream
+    // reads `truncated`, and the rows come back ordered by bucket — so a
+    // served answer would be every series stopping at the same early moment,
+    // with nothing to say so.
+    const truncating = {
+      run: async () => ({
+        rows: [],
+        truncated: true,
+        wallMs: 1,
+        treeFiles: 0,
+        rssBytes: null,
+        peakRssBytes: null,
+      }),
+    } as unknown as QueryRunner;
+
+    await assert.rejects(
+      createHistoryV2(truncating, "vessels.self").getValues(
+        ask({ pathSpecs: [spec("a.b")], resolution: 10 }),
+      ),
+      /more than 100000 rows/,
+    );
+  });
+});
+
 describe("getPaths and getContexts", { skip: NO_BUNDLED_EXTENSION }, () => {
   it("list what was recorded in the range, across contexts", async () => {
     record(
