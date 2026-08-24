@@ -51,6 +51,11 @@ jobs:
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
           npm run build
+          # extensions/ is gitignored and downloaded, so a checkout has none.
+          # `prepublishOnly` fetches them for a real publish, but npm does not
+          # run that hook for `npm pack` -- so without this the tarball ships
+          # no sqlite_scanner and every hot-store query below answers 400.
+          npm run fetch-extensions
           echo "PLUGIN_TGZ=$(npm pack --ignore-scripts --pack-destination /tmp)" >> "$GITHUB_ENV"
 
       - name: Install signalk-server and the plugin
