@@ -90,23 +90,26 @@ function toQueryAggregate(method: AggregateMethod): ValueAggregate {
  * The window and the smoothing factor a client-side aggregate is given.
  *
  * The API defines `parameter` as strings, and the value reaches here from a
- * query string. An unusable one takes the documented default rather than
- * refusing the request, which is what the sibling provider does for an absent
- * one — the alternative is a series of nulls the caller cannot tell from a
- * gap, because `NaN` serialises as `null`: a window of `"0"` divides by zero,
- * and an alpha of `"abc"` makes the whole series `NaN` from its first sample.
+ * query string. Anything the whole string does not spell takes the documented
+ * default rather than refusing the request, which is what the sibling provider
+ * does for an absent one — the alternative is a series of nulls the caller
+ * cannot tell from a gap, because `NaN` serialises as `null`.
+ *
+ * `Number` rather than `parseInt` or `parseFloat`, which read a leading number
+ * and discard the rest: `"2x"` is not a window of 2 and `"0.9x"` is not an
+ * alpha of 0.9, and reading them as such honours a parameter nobody wrote.
  */
 const SMA_WINDOW = 5;
 const EMA_ALPHA = 0.2;
 
 function smaWindow(parameter: string | undefined): number {
-  const n = Number.parseInt(parameter ?? "", 10);
-  return Number.isFinite(n) && n >= 1 ? n : SMA_WINDOW;
+  const n = Number(parameter);
+  return Number.isInteger(n) && n >= 1 ? n : SMA_WINDOW;
 }
 
 function emaAlpha(parameter: string | undefined): number {
-  const alpha = Number.parseFloat(parameter ?? "");
-  return Number.isFinite(alpha) && alpha > 0 && alpha <= 1 ? alpha : EMA_ALPHA;
+  const alpha = Number(parameter);
+  return alpha > 0 && alpha <= 1 ? alpha : EMA_ALPHA;
 }
 
 function computeSMA(values: (number | null)[], n: number): (number | null)[] {

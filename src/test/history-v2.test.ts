@@ -274,10 +274,19 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
       ).data.map((row) => row[1]);
 
     // A five-sample window over 0, 10, 20, 30 never fills, so each value is
-    // the mean of everything before it.
+    // the mean of everything before it. "2x" and "2.7" are neither a window of
+    // 2 nor an error, which is what reading a leading number would make them.
     assert.deepEqual(await over("sma", ["0"]), [0, 5, 10, 15]);
     assert.deepEqual(await over("sma", ["-1"]), [0, 5, 10, 15]);
+    assert.deepEqual(await over("sma", ["2x"]), [0, 5, 10, 15]);
+    assert.deepEqual(await over("sma", ["2.7"]), [0, 5, 10, 15]);
+    assert.deepEqual(await over("sma", [""]), [0, 5, 10, 15]);
     assert.deepEqual(await over("sma", undefined), [0, 5, 10, 15]);
+    // And a window the whole string does spell is honoured.
+    assert.deepEqual(await over("sma", ["2"]), [0, 5, 15, 25]);
+
+    // 0.9 would leave the last value at 27.09; the default leaves it at 10.48.
+    assert.deepEqual(await over("ema", ["0.9x"]), await over("ema", undefined));
 
     for (const parameter of [["abc"], ["0"], ["2"], undefined]) {
       const values = await over("ema", parameter);

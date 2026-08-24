@@ -37,16 +37,6 @@ import type { QueryRequest, ValueAggregate } from "./duck.js";
 export const DEFAULT_MEMORY_LIMIT = "256MB";
 
 /**
- * Rows one query returns before the answer is reported as truncated.
- *
- * The caller holds all of them in the Signal K process, so this is a ceiling
- * on that rather than on the engine. History playback already reads a long
- * range as a series of shorter ones; this is what makes an unbounded request
- * degrade into a truncated answer rather than into the server's heap.
- */
-export const DEFAULT_ROW_LIMIT = 100_000;
-
-/**
  * Series one values request may name.
  *
  * A bound on the statement rather than on the answer: every spec is another
@@ -60,6 +50,16 @@ const MAX_SPECS = 200;
 
 /** Milliseconds in a UTC day. The tree's directories are cut on these. */
 const DAY_MS = 86_400_000;
+
+/**
+ * Rows one query returns before the answer is reported as truncated.
+ *
+ * The caller holds all of them in the Signal K process, so this is a ceiling
+ * on that rather than on the engine. History playback already reads a long
+ * range as a series of shorter ones; this is what makes an unbounded request
+ * degrade into a truncated answer rather than into the server's heap.
+ */
+export const DEFAULT_ROW_LIMIT = 100_000;
 
 const COLUMNS = RANGE_COLUMNS.join(", ");
 
