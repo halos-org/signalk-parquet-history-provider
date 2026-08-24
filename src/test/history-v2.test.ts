@@ -256,6 +256,39 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
     ]);
   });
 
+  it("takes the documented window and alpha when the parameter is unusable", async () => {
+    // Both arrive as text from a query string. A window of "0" divided by an
+    // empty window and an alpha of "abc" multiplied the series by NaN — and
+    // NaN serialises as null, so the caller saw a gap rather than an error.
+    for (let i = 0; i < 4; i += 1) {
+      record(sample({ ts: AUG_23 + i * 1000, path: "a.b", value: i * 10 }));
+    }
+    const over = async (aggregate: string, parameter: string[] | undefined) =>
+      (
+        await history.getValues(
+          ask({
+            pathSpecs: [spec("a.b", aggregate, { parameter })],
+            resolution: 10,
+          }),
+        )
+      ).data.map((row) => row[1]);
+
+    // A five-sample window over 0, 10, 20, 30 never fills, so each value is
+    // the mean of everything before it.
+    assert.deepEqual(await over("sma", ["0"]), [0, 5, 10, 15]);
+    assert.deepEqual(await over("sma", ["-1"]), [0, 5, 10, 15]);
+    assert.deepEqual(await over("sma", undefined), [0, 5, 10, 15]);
+
+    for (const parameter of [["abc"], ["0"], ["2"], undefined]) {
+      const values = await over("ema", parameter);
+      assert.ok(
+        values.every((value) => typeof value === "number"),
+        `ema with ${JSON.stringify(parameter)} returned ${JSON.stringify(values)}`,
+      );
+      assert.equal(values[0], 0);
+    }
+  });
+
   it("reads across the seam between the tree and the store", async () => {
     record(sample({ ts: AUG_23 + 1000, path: "a.b", value: 10 }));
     const bound = store.rollBound();

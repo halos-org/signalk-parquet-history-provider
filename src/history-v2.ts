@@ -86,6 +86,29 @@ function toQueryAggregate(method: AggregateMethod): ValueAggregate {
     : "average";
 }
 
+/**
+ * The window and the smoothing factor a client-side aggregate is given.
+ *
+ * The API defines `parameter` as strings, and the value reaches here from a
+ * query string. An unusable one takes the documented default rather than
+ * refusing the request, which is what the sibling provider does for an absent
+ * one — the alternative is a series of nulls the caller cannot tell from a
+ * gap, because `NaN` serialises as `null`: a window of `"0"` divides by zero,
+ * and an alpha of `"abc"` makes the whole series `NaN` from its first sample.
+ */
+const SMA_WINDOW = 5;
+const EMA_ALPHA = 0.2;
+
+function smaWindow(parameter: string | undefined): number {
+  const n = Number.parseInt(parameter ?? "", 10);
+  return Number.isFinite(n) && n >= 1 ? n : SMA_WINDOW;
+}
+
+function emaAlpha(parameter: string | undefined): number {
+  const alpha = Number.parseFloat(parameter ?? "");
+  return Number.isFinite(alpha) && alpha > 0 && alpha <= 1 ? alpha : EMA_ALPHA;
+}
+
 function computeSMA(values: (number | null)[], n: number): (number | null)[] {
   const result: (number | null)[] = [];
   const window: number[] = [];
@@ -287,9 +310,9 @@ export function createHistoryV2(
       });
       let computed: (number | null)[];
       if (spec.aggregate === "sma") {
-        computed = computeSMA(numbers, parseInt(spec.parameter[0] ?? "5", 10));
+        computed = computeSMA(numbers, smaWindow(spec.parameter?.[0]));
       } else if (spec.aggregate === "ema") {
-        computed = computeEMA(numbers, parseFloat(spec.parameter[0] ?? "0.2"));
+        computed = computeEMA(numbers, emaAlpha(spec.parameter?.[0]));
       } else {
         const middle = Math.floor(numbers.length / 2);
         computed = numbers.map((value, i) => (i === middle ? value : null));
