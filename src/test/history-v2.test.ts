@@ -222,6 +222,40 @@ describe("getValues", { skip: NO_BUNDLED_EXTENSION }, () => {
     );
   });
 
+  it("fills the gaps on the bucket grid when one spec is not on it", async () => {
+    // A client-side aggregate is read raw, so its rows carry their own
+    // timestamps rather than bucket boundaries. Taking the fill's bounds over
+    // those started the walk between two boundaries, and every step after it
+    // landed on a stamp no series holds — an all-null row apiece, up to one
+    // per bucket over the whole range.
+    record(
+      sample({ ts: AUG_23 + 1000, path: "c.d", value: 0 }),
+      sample({ ts: AUG_23 + 2000, path: "c.d", value: 10 }),
+      sample({ ts: AUG_23 + 3000, path: "c.d", value: 20 }),
+      sample({ ts: AUG_23 + 12_000, path: "a.b", value: 7 }),
+      sample({ ts: AUG_23 + 35_000, path: "a.b", value: 9 }),
+    );
+
+    const answer = await history.getValues(
+      ask({
+        pathSpecs: [spec("a.b"), spec("c.d", "sma", { parameter: ["2"] })],
+        resolution: 10,
+      }),
+    );
+
+    // Every fabricated stamp is a boundary: 20 s is the gap in `a.b`, and the
+    // walk never starts from `c.d`'s 1 s. Bounding it over both series instead
+    // filled 11 s and 21 s, which no series holds and no boundary names.
+    assert.deepEqual(answer.data, [
+      [new Date(AUG_23 + 1000).toISOString(), null, 0],
+      [new Date(AUG_23 + 2000).toISOString(), null, 5],
+      [new Date(AUG_23 + 3000).toISOString(), null, 15],
+      [new Date(AUG_23 + 10_000).toISOString(), 7, null],
+      [new Date(AUG_23 + 20_000).toISOString(), null, null],
+      [new Date(AUG_23 + 30_000).toISOString(), 9, null],
+    ]);
+  });
+
   it("reads across the seam between the tree and the store", async () => {
     record(sample({ ts: AUG_23 + 1000, path: "a.b", value: 10 }));
     const bound = store.rollBound();

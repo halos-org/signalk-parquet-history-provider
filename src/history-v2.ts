@@ -253,12 +253,24 @@ export function createHistoryV2(
     let firstBucket = Infinity;
     let lastBucket = -Infinity;
 
+    // Only a bucketed spec reports bucket boundaries. A client-side aggregate
+    // is read raw, so its rows carry their own timestamps, and a walk started
+    // from one of those would land between boundaries at every step and
+    // fabricate an all-null row for each.
+    const onGrid = new Set(
+      query.pathSpecs
+        .map((spec: PathSpec, index: number) => ({ spec, index }))
+        .filter(({ spec }) => !needsClientSideAggregation(spec.aggregate))
+        .map(({ index }) => index),
+    );
+
     for (const raw of answer.rows) {
       const row = toValueRow(raw);
       const series = bySpec.get(row.spec) ?? new Map<number, unknown>();
       bySpec.set(row.spec, series);
       series.set(row.bucket, decode(row));
       if (row.num === null && row.str !== null) fromText.add(row.spec);
+      if (!onGrid.has(row.spec)) continue;
       if (row.bucket < firstBucket) firstBucket = row.bucket;
       if (row.bucket > lastBucket) lastBucket = row.bucket;
     }
@@ -299,7 +311,9 @@ export function createHistoryV2(
     // anything, so a gap inside the data is a row of nulls and a chart breaks
     // its line there. Only the interior is filled — the sibling's `FILL(NULL)`
     // spans the data rather than the request, and a range with two points at
-    // its ends must not fabricate a week of empty rows.
+    // its ends must not fabricate a week of empty rows. A request naming no
+    // bucketed spec fills nothing: its rows are the real stamps below, which
+    // is again what the sibling returns for one.
     const stamps = new Set<number>();
     if (bucketSeconds > 0 && firstBucket <= lastBucket) {
       const step = bucketSeconds * 1000;
