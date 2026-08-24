@@ -34,39 +34,85 @@ Three runs each, on a HALPI2 (4 GB, aarch64, DuckDB 1.5.5, Node 22.23.2):
 
 **Mapping the engine's native addon is ~220 ms of it**, and nothing in this
 design avoids that. Loading the extension is another ~80 ms. Together they are
-why the service exists: a process per query spent six times longer starting
-than answering.
+why the service exists: a process per query paid all of it before every
+request, and an ordinary request costs less than that to answer.
 
 The hot store is attached per query rather than at startup, which costs
-0.2–1.2 ms against the live 264 MB store and buys two things — a store that did
+0.2–1.2 ms against the live hot store and buys two things — a store that did
 not exist when the service started is picked up, and no SQLite handle is held
 between queries. Neither was strictly necessary: measured across processes, a
 held attachment still sees rows written after it, and the writer's
 `wal_checkpoint(TRUNCATE)` still truncates to zero with `busy: 0` while it is
-held. It is a millisecond for one less thing to reason about.
+held. Nor does it slow the statement that follows: alternating five held-attach
+runs with five per-query-attach runs, twice, gives 104–137 ms either way. It is
+a millisecond for one less thing to reason about.
 
 ## What a query costs
 
-Against the live data directory — 10 roll files under one date, and a hot store
-holding about half an hour — driven through `./run bench query`, which uses the
-same client the plugin does. Wall clock is request to answer.
+Against the live data directory — 23 roll files across two dates, and a hot
+store file of 271 MB — driven through `./run bench query`, which uses the same
+client the plugin does. Wall clock is request to answer.
 
 | query                       | first request | later requests | rows   |
 | --------------------------- | ------------- | -------------- | ------ |
-| one path, one day           | 652 ms        | 215–246 ms     | 6,501  |
-| one path, last hour         | 529–558 ms    | 135–175 ms     | 1,664  |
-| paths in the day            | 450 ms        | 96–117 ms      | 524    |
-| every path, last 10 minutes | 1,576 ms      | 1,158–1,244 ms | 81,687 |
+| paths in the day            | 499 ms        | 93–101 ms      | 524    |
+| one path, last hour         | 548 ms        | 127–174 ms     | 1,664  |
+| one path, one day           | 736 ms        | 353–408 ms     | 12,849 |
+| every path, last 10 minutes | 1,647 ms      | 1,226–1,289 ms | 81,381 |
 
-Over forty consecutive hour-long queries the warm figure is a median of 148 ms,
-between 135 and 242.
+**These figures move with how much data the device holds**, which is why they
+are dated rather than fixed: the same shapes measured a day earlier, against a
+tree of 10 files and half as many rows in the day, ran roughly twice as fast.
+Compare them against each other, not against a run from another day.
 
-**Against the plan's criterion — sqhp's ~34 ms for an hour-long request — this
-is four to five times slower, where a process per query was fifteen.** What is
-left is not startup. The same statement on an already-open engine, without the
-pipe or the request's own planning, runs in 39–45 ms; the rest is serialising
-1,664 rows to JSON, the pipe, and parsing them back. That is where to look next
-if the number has to come down again.
+## Where the time goes
+
+The same four shapes, measured inside the service in one process minutes apart
+from the table above, split at the two boundaries that exist inside a request:
+`plan` is `planSources` plus the `ATTACH`, `sql` is the statement, and `shape`
+is `getRowsJS`, the BigInt pass and the `DETACH`.
+
+| query               | plan    | sql     | shape     | rows   |
+| ------------------- | ------- | ------- | --------- | ------ |
+| paths in the day    | 0.9–1.5 | 106–130 | 2.4–4.9   | 524    |
+| one path, last hour | 1.2–2.9 | 98–149  | 13.2–16.9 | 1,659  |
+| one path, one day   | 0.9–9.3 | 204–244 | 91–118    | 12,849 |
+| every path, 10 min  | 1.0–5.8 | 149–201 | 727–805   | 81,219 |
+
+Read against the end-to-end table, that leaves the pipe and the plugin's own
+handling at about 4 µs per row — nothing at 524 rows, ~10 ms at 1,664, ~40 ms
+at 12,849 and ~330 ms at 81,381 — and **no fixed per-request cost worth
+naming.** Row handling either side of the pipe is ~13 µs per row in total.
+
+**So a small answer is its statement, and a large one is its rows.** For a
+recent range the statement is dominated by the full scan of the hot store
+through `sqlite_scanner`, which `docs/layout-decision.md` measured at ~1.9 ms
+per MB and predicted would put an hourly store's recent-query floor near
+100 ms. That is the ~100 ms measured above. The lever on it is the roll
+interval, which is the hot store's ceiling — not the process model, and not the
+transport.
+
+## What this is not comparable to
+
+The plan's criterion asks for a query "within sqhp's range (~34 ms for an
+hour-long request)". **Nothing here is a like-for-like against that**, and the
+numbers above should not be read as one:
+
+- Those sqhp figures are Signal K history API requests for **one hour at
+  60-second resolution** — about 60 rows, aggregated inside QuestDB before
+  anything crosses its HTTP connection. The measurements above are raw ranges
+  returning 1,664 rows, because this provider has no aggregation yet.
+- They are measured through the server's HTTP API; these are measured at the
+  plugin's client boundary, with no HTTP layer.
+- The archived sqhp measurements on this hardware span 14.2, 18.8, 27 and
+  38.8 ms across four runs, moving with QuestDB's tuning. `~34 ms` is a point
+  inside that spread rather than a measured constant.
+
+What can be said from the split above: an aggregated hour would cost this
+provider its statement plus a few milliseconds of shaping, because 60 rows
+carry no transport cost worth counting. That predicts something near the
+statement time — currently ~100 ms against a 271 MB hot store — and it is a
+prediction, not a measurement, until the v2 surface can aggregate.
 
 Nothing here changes the memory case the design was chosen for: QuestDB's
 standing cost is ~366 MB.
@@ -157,8 +203,8 @@ sibling provider's QuestDB tables do by dedup key but this store does not.
 ## Concurrency, and what can overlap
 
 The service answers one request at a time: two queries on one connection would
-interleave their rows on one pipe, and at 96–246 ms each a queue is a better
-answer than a second engine. Eight may wait; past that a request is refused
+interleave their rows on one pipe, and at the time one request takes, a queue
+is a better answer than a second engine. Eight may wait; past that a request is refused
 rather than queued behind requests that will not be served in time either. The
 deadline is 30 seconds and covers the wait as well as the work.
 

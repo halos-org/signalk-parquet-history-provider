@@ -197,9 +197,9 @@ leaving something a `*.parquet` glob reads as finished.
 
 **One service, not one process per query.** The plugin starts `query/main.js`
 on the first history request and keeps it. Starting an engine costs 336–375 ms
-on the device — ~220 ms of it mapping the addon — and a warm query answers in
-96–246 ms, so a process per query spent six times longer starting than
-answering.
+on the device — ~220 ms of it mapping the addon — which is more than an
+ordinary request costs to answer, so a process per query spent more on starting
+than on working.
 
 What that costs is memory the service does not give back: 92 MB idle, ~165 MB
 after a dozen ordinary queries, and the high-water mark of the largest shape it

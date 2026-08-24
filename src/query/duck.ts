@@ -11,9 +11,11 @@ import { fileURLToPath } from "node:url";
  * loaded engine inside a request handler is exactly the shape this design
  * exists to prevent.
  *
- * **One process, kept.** Starting an engine costs 336–375 ms on the device and
- * a warm request costs 96–246 ms, so a process per query spent more on starting
- * than on answering. The price is memory the query process does not
+ * **One process, kept.** Starting an engine costs 336–375 ms on the device,
+ * which is more than an ordinary request costs to answer — so a process per
+ * query spent more on starting than on working. What a request costs depends
+ * on how much data the device holds; `docs/query-layer.md` carries the
+ * measurements and the date they were taken. The price is memory the query process does not
  * give back; recycling it is
  * [halos-org/halos#178](https://github.com/halos-org/halos/issues/178).
  *
@@ -82,8 +84,8 @@ export interface QueryResult {
  *
  * The query process answers one at a time — two on one connection would
  * interleave their rows on one pipe — so a burst queues. A Grafana dashboard
- * opens with one request per panel, and at 96–246 ms each a queue is the right
- * response to that. A refusal is the right response to a backlog: past this
+ * opens with one request per panel, and at the tens to hundreds of
+ * milliseconds each one takes, a queue is the right response to that. A refusal is the right response to a backlog: past this
  * many, the requests already waiting will not be served inside their own
  * deadline either.
  */
