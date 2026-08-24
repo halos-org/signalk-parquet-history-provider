@@ -22,7 +22,6 @@ function stubApp(dataDirPath: string) {
     busValues: [] as ((value: BusValue) => void)[],
     unsubscribed: 0,
     registered: [] as unknown[],
-    unregistered: 0,
   };
   return {
     calls,
@@ -35,9 +34,6 @@ function stubApp(dataDirPath: string) {
       selfContext: "vessels.self",
       registerHistoryApiProvider: (provider: unknown) =>
         calls.registered.push(provider),
-      unregisterHistoryApiProvider: () => {
-        calls.unregistered++;
-      },
       streambundle: {
         getBus: () => ({
           onValue: (fn: (value: BusValue) => void) => {
@@ -141,7 +137,7 @@ describe("the plugin", () => {
     }
   });
 
-  it("registers the history surface, and takes it back on stop", async () => {
+  it("registers the history surface", async () => {
     const work = mkdtempSync(join(tmpdir(), "sk-parquet-history-"));
     const { app, calls } = stubApp(work);
     const plugin = createPlugin(app);
@@ -158,9 +154,9 @@ describe("the plugin", () => {
         );
       }
 
+      // Nothing unregisters here: the server queues that itself when the
+      // provider is registered, and runs it before `stop()` is entered.
       await plugin.stop();
-      // Before the writer is asked to close the store a query might be reading.
-      assert.equal(calls.unregistered, 1);
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
@@ -174,7 +170,6 @@ describe("the plugin", () => {
     const { app, calls } = stubApp(work);
     const older = { ...app } as Record<string, unknown>;
     delete older.registerHistoryApiProvider;
-    delete older.unregisterHistoryApiProvider;
     const plugin = createPlugin(older as typeof app);
     try {
       plugin.start({});

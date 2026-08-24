@@ -4,6 +4,7 @@ import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { HistoryProvider } from "@signalk/server-api/history";
 import {
   ConfigSchema,
   StoredConfig,
@@ -48,9 +49,13 @@ interface App {
    * without the registry serves no history from this plugin and says so once,
    * rather than failing to start and taking recording down with it — recording
    * is the half that has no alternative.
+   *
+   * There is no matching unregister to call. The server's plugin wrapper is
+   * what installs this, and registering through it queues the unregister as an
+   * onStop handler; those run before `stop()` is entered, so the provider is
+   * already gone by the time anything below happens.
    */
-  registerHistoryApiProvider?: (provider: unknown) => void;
-  unregisterHistoryApiProvider?: () => void;
+  registerHistoryApiProvider?: (provider: HistoryProvider) => void;
   streambundle: {
     getBus: (path?: string) => {
       onValue: (fn: (value: BusValue) => void) => () => void;
@@ -314,8 +319,8 @@ export default (app: App) => {
       recorder = null;
 
       // Before the writer goes: a query holds a read on the hot store, and the
-      // writer is about to be asked to close it.
-      app.unregisterHistoryApiProvider?.();
+      // writer is about to be asked to close it. The server has already taken
+      // the provider back, so this is the whole of the teardown.
       queries?.stop();
       queries = null;
 

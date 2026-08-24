@@ -243,10 +243,12 @@ allowed directory still works afterwards.
 
 ## The history surface
 
-The plugin registers the v2 provider on start and gives it back on stop, before
-the writer is asked to close the store — a query holds a read on it. A server
-with no registry gets recording and a debug line, because recording is the half
-with no alternative.
+The plugin registers the v2 provider on start and does not unregister it: the
+server's plugin wrapper queues that when the provider is registered and runs it
+before `stop()` is entered, so the provider is gone before the plugin stops the
+query service and asks the writer to close the store — a query holds a read on
+it. A server with no registry gets recording and a debug line, because
+recording is the half with no alternative.
 
 **A request is buckets, and this side lays them out.** The sibling provider
 fabricates a row per bucket inside QuestDB with `FILL(NULL)`, because it issues
