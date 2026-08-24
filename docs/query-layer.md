@@ -67,30 +67,36 @@ Compare them against each other, not against a run from another day.
 
 ## Where the time goes
 
-The same four shapes, measured inside the service in one process minutes apart
-from the table above, split at the two boundaries that exist inside a request:
-`plan` is `planSources` plus the `ATTACH`, `sql` is the statement, and `shape`
-is `getRowsJS`, the BigInt pass and the `DETACH`.
+In-process and end-to-end for the same request, **alternated inside one run**,
+because the device keeps recording and rolling: two tables taken minutes apart
+describe two datasets, and subtracting one from the other measures the clock as
+much as the code. `plan` is `planSources` plus the `ATTACH`, `sql` is the
+statement, `shape` is `getRowsJS`, the BigInt pass and the `DETACH`. Medians of
+four pairs.
 
-| query               | plan    | sql     | shape     | rows   |
-| ------------------- | ------- | ------- | --------- | ------ |
-| paths in the day    | 0.9–1.5 | 106–130 | 2.4–4.9   | 524    |
-| one path, last hour | 1.2–2.9 | 98–149  | 13.2–16.9 | 1,659  |
-| one path, one day   | 0.9–9.3 | 204–244 | 91–118    | 12,849 |
-| every path, 10 min  | 1.0–5.8 | 149–201 | 727–805   | 81,219 |
+| query               | rows   | plan | sql | shape | in-process | end-to-end | difference |
+| ------------------- | ------ | ---- | --- | ----- | ---------- | ---------- | ---------- |
+| paths in the day    | 524    | 2.4  | 158 | 4     | 168 ms     | 164 ms     | −4 ms      |
+| one path, last hour | 1,655  | 4.4  | 174 | 17    | 192 ms     | 219 ms     | +27 ms     |
+| one path, one day   | 12,849 | 1.6  | 295 | 126   | 415 ms     | 482 ms     | +67 ms     |
+| every path, 10 min  | 81,455 | 2.0  | 240 | 771   | 1,017 ms   | 1,227 ms   | +209 ms    |
 
-Read against the end-to-end table, that leaves the pipe and the plugin's own
-handling at about 4 µs per row — nothing at 524 rows, ~10 ms at 1,664, ~40 ms
-at 12,849 and ~330 ms at 81,381 — and **no fixed per-request cost worth
-naming.** Row handling either side of the pipe is ~13 µs per row in total.
+These totals run higher than the table above them because they were taken later
+against more data, and because two engines share the process while the pair is
+being measured. Read the columns against each other, not against another run.
 
-**So a small answer is its statement, and a large one is its rows.** For a
-recent range the statement is dominated by the full scan of the hot store
-through `sqlite_scanner`, which `docs/layout-decision.md` measured at ~1.9 ms
-per MB and predicted would put an hourly store's recent-query floor near
-100 ms. That is the ~100 ms measured above. The lever on it is the roll
-interval, which is the hot store's ceiling — not the process model, and not the
-transport.
+**The difference between the two columns is the pipe and the plugin's own
+handling**, and it is 80–85% of nothing: −4, +27, +67 and +209 ms against
+totals of 164 to 1,227. It does not reduce to a rate — 16.2, 5.2 and 2.6 µs per
+row for the three largest answers — so it has a small fixed part lost in noise
+and a per-row part that only becomes visible in the tens of thousands.
+
+**A small answer is its statement; a large one is its rows.** `plan` never
+exceeds 5 ms. For a recent range the statement is dominated by the full scan of
+the hot store through `sqlite_scanner`, which `docs/layout-decision.md`
+measured at ~1.9 ms per MB and predicted would put an hourly store's
+recent-query floor near 100 ms. The lever on that is the roll interval, which
+is the hot store's ceiling — not the process model, and not the transport.
 
 ## What this is not comparable to
 
@@ -100,19 +106,18 @@ numbers above should not be read as one:
 
 - Those sqhp figures are Signal K history API requests for **one hour at
   60-second resolution** — about 60 rows, aggregated inside QuestDB before
-  anything crosses its HTTP connection. The measurements above are raw ranges
-  returning 1,664 rows, because this provider has no aggregation yet.
+  anything crosses its HTTP connection. Every figure here is a raw range, and
+  this provider returns raw rows.
 - They are measured through the server's HTTP API; these are measured at the
   plugin's client boundary, with no HTTP layer.
 - The archived sqhp measurements on this hardware span 14.2, 18.8, 27 and
   38.8 ms across four runs, moving with QuestDB's tuning. `~34 ms` is a point
   inside that spread rather than a measured constant.
 
-What can be said from the split above: an aggregated hour would cost this
-provider its statement plus a few milliseconds of shaping, because 60 rows
-carry no transport cost worth counting. That predicts something near the
-statement time — currently ~100 ms against a 271 MB hot store — and it is a
-prediction, not a measurement, until the v2 surface can aggregate.
+**The cost of an aggregated answer is unmeasured.** What the split above
+supports is only that 60 rows carry no shaping or transport cost worth
+counting, so such an answer would be close to its own statement — and no
+statement of that shape has been run here.
 
 Nothing here changes the memory case the design was chosen for: QuestDB's
 standing cost is ~366 MB.
