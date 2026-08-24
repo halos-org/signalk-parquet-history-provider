@@ -151,7 +151,18 @@ export async function openReader(options: ReaderOptions): Promise<Reader> {
   // a crafted path or an unknown function from turning a query into a
   // download. Attaching a database inside the allowed directory still works,
   // which is what the per-query attach below relies on.
-  await lockDownFileAccess(connection, [dataDir]);
+  //
+  // Inside the cleanup scope, like the engine above: a data directory these
+  // settings will not accept leaves the caller no handle to close, and the
+  // service is restarted on every request after that.
+  try {
+    await lockDownFileAccess(connection, [dataDir]);
+  } catch (err) {
+    connection.closeSync();
+    instance.closeSync();
+    rmSync(scratch, { recursive: true, force: true });
+    throw err;
+  }
 
   const live = connection;
   return {

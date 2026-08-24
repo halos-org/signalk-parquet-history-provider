@@ -105,8 +105,8 @@ per-file cost rather than by startup.
 Both trees below are one day of real data hard-linked into 30 dated
 directories, with no hot store. The rows therefore repeat, and a 30-day range
 returns 30× the rows — so these numbers overstate the row cost of a real 30-day
-window and measure the file cost honestly. Each figure includes one service
-start, because they were taken with a process per query.
+window and measure the file cost honestly. Each figure includes one engine
+start: they were taken before the service existed, with a process per query.
 
 | tree                   | files | one path, 30 days           | paths, 30 days      | one path, one day |
 | ---------------------- | ----- | --------------------------- | ------------------- | ----------------- |

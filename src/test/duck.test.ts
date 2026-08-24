@@ -261,16 +261,48 @@ describe("a query that fails", () => {
     assert.match(errors.join("\n"), /exited with code 7/);
   });
 
+  it("does not let a dead process take its replacement down with it", async () => {
+    // The exit of a process this side already killed arrives an event loop
+    // turn or more later — by which time the next request has started a
+    // replacement and is being served by it. Acting on that exit rejects the
+    // wrong request and kills the wrong process.
+    let started = 0;
+    const runner = make({
+      timeoutMs: 120,
+      spawnQuery: () => {
+        started += 1;
+        return started === 1
+          ? HANGS()
+          : service(
+              `console.log(JSON.stringify({id: req.id, rows: 0, truncated: false, treeFiles: 0}));`,
+            )();
+      },
+    });
+
+    await assert.rejects(runner.run(RANGE), QueryTimeoutError);
+    const second = await runner.run(RANGE);
+
+    assert.equal(started, 2, "the replacement was killed and respawned");
+    assert.equal(second.rows.length, 0);
+    assert.equal(runner.running, true, "the replacement was taken down");
+  });
+
   it("restarts rather than guessing when the answers get out of step", async () => {
     const confused = service(
       `console.log(JSON.stringify({id: req.id + 100, rows: 0, truncated: false, treeFiles: 0}));`,
     );
+    const runner = make({ spawnQuery: confused });
+
     await assert.rejects(
-      make({ spawnQuery: confused }).run(RANGE),
+      runner.run(RANGE),
       (err: Error) =>
         err instanceof QueryFailedError &&
         /while 1 was outstanding/.test(err.message),
     );
+
+    // The restart is the recovery, and the message alone would pass with a
+    // desynchronised process left running.
+    assert.equal(runner.running, false);
   });
 });
 

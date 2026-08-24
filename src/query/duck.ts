@@ -12,8 +12,8 @@ import { fileURLToPath } from "node:url";
  * exists to prevent.
  *
  * **One process, kept.** Starting an engine costs ~345 ms on the device and a
- * query costs 39–141 ms, so a process per query spent six times more on
- * starting than on answering. The price is memory the query process does not
+ * warm request costs 96–246 ms, so a process per query spent more on starting
+ * than on answering. The price is memory the query process does not
  * give back; recycling it is
  * [halos-org/halos#178](https://github.com/halos-org/halos/issues/178).
  *
@@ -82,7 +82,7 @@ export interface QueryResult {
  *
  * The query process answers one at a time — two on one connection would
  * interleave their rows on one pipe — so a burst queues. A Grafana dashboard
- * opens with one request per panel, and at 39–141 ms each a queue is the right
+ * opens with one request per panel, and at 96–246 ms each a queue is the right
  * response to that. A refusal is the right response to a backlog: past this
  * many, the requests already waiting will not be served inside their own
  * deadline either.
@@ -342,8 +342,17 @@ export class QueryRunner {
     // JSON. With an encoding set, Node holds the partial sequence.
     child.stdout?.setEncoding("utf8");
     child.stderr?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => this.take(chunk));
+    // **Every handler is gated on this process still being the current one.**
+    // A killed process's `close` arrives an event loop turn or more later, and
+    // by then the next request has started a replacement and is being served
+    // by it. Ungated, the dead one's exit rejected that request and killed its
+    // replacement — one timeout took down the two requests after it.
+    child.stdout?.on("data", (chunk: string) => {
+      if (this.child !== child) return;
+      this.take(chunk);
+    });
     child.stderr?.on("data", (chunk: string) => {
+      if (this.child !== child) return;
       // Bounded: this accumulates for the life of the process, and a query
       // service that logs on every request must not grow the server's heap.
       this.stderr = `${this.stderr}${chunk}`.slice(-STDERR_KEPT);
@@ -353,10 +362,23 @@ export class QueryRunner {
     child.stdout?.on("error", () => {});
     child.stderr?.on("error", () => {});
     child.stdin?.on("error", () => {});
-    child.on("error", (err) => this.fail(new QueryFailedError(err.message)));
+    child.on("error", (err) => {
+      if (this.child !== child) return;
+      this.fail(new QueryFailedError(err.message));
+    });
     child.on("close", (code, signal) => {
       const how = code === null ? `signal ${signal}` : `code ${code}`;
       const asked = this.killed.delete(child);
+      if (this.child !== child) {
+        // Already replaced. Its exit says nothing about the request the
+        // replacement is serving, and nothing about the replacement.
+        if (!asked) {
+          this.options.onError?.(
+            `a query service this side had already replaced exited with ${how}`,
+          );
+        }
+        return;
+      }
       this.forget(child);
       this.fail(
         new QueryFailedError(

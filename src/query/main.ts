@@ -15,8 +15,8 @@ import type { QueryRequest } from "./duck.js";
  * allocator does not return what a query allocates — neither belongs in a
  * process that also serves the vessel's data.
  *
- * It stays alive because starting it is ~345 ms on the device, against 39–141
- * ms for the queries themselves. What that costs is memory the process never
+ * It stays alive because starting it is ~345 ms on the device, against
+ * 96–246 ms for a warm request. What that costs is memory the process never
  * gives back: it settles at the high-water mark of the largest query it has
  * served. Recycling it is
  * [halos-org/halos#178](https://github.com/halos-org/halos/issues/178).
@@ -135,7 +135,7 @@ async function main(): Promise<void> {
   try {
     // A line at a time, and one at a time. Two queries on one connection would
     // interleave their rows on this pipe; the caller serialises for the same
-    // reason, and 39–141 ms per query is a queue nobody notices.
+    // reason, and 96–246 ms per request is a queue nobody notices.
     for await (const line of createInterface({ input: process.stdin })) {
       if (line.trim() !== "") await answer(reader, line);
     }
