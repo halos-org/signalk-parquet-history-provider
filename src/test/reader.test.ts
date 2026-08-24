@@ -639,6 +639,19 @@ describe("a values query", { skip: NO_BUNDLED_EXTENSION }, () => {
       ],
     );
   });
+
+  it("refuses more series than one statement may carry", async () => {
+    record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+    const specs = Array.from({ length: 201 }, () => ({
+      path: "a.b",
+      aggregate: "average" as const,
+    }));
+
+    await assert.rejects(
+      runner.run(values({ specs })),
+      /may name 200 series; this one names 201/,
+    );
+  });
 });
 
 describe("the tree's file selection", () => {

@@ -46,6 +46,18 @@ export const DEFAULT_MEMORY_LIMIT = "256MB";
  */
 export const DEFAULT_ROW_LIMIT = 100_000;
 
+/**
+ * Series one values request may name.
+ *
+ * A bound on the statement rather than on the answer: every spec is another
+ * `UNION ALL` branch over the materialized source and two more bound
+ * parameters. The caller's bucket budget does not contain it, because that
+ * counts buckets × series — a coarse resolution leaves room for thousands of
+ * paths inside it. The service answers one request at a time, so a statement
+ * that wide holds the only engine until the deadline kills it.
+ */
+const MAX_SPECS = 200;
+
 /** Milliseconds in a UTC day. The tree's directories are cut on these. */
 const DAY_MS = 86_400_000;
 
@@ -618,9 +630,22 @@ function validate(request: QueryRequest): void {
   ) {
     throw new Error("context must be a string");
   }
+  if (
+    (request.kind === "range" || request.kind === "values") &&
+    request.limit !== undefined &&
+    (typeof request.limit !== "number" || !Number.isFinite(request.limit))
+  ) {
+    throw new Error("limit must be a number of rows");
+  }
   if (request.kind === "values") {
     if (!Array.isArray(request.specs) || request.specs.length === 0) {
       throw new Error("a values request needs at least one spec");
+    }
+    if (request.specs.length > MAX_SPECS) {
+      throw new Error(
+        `a values request may name ${MAX_SPECS} series; this one names ` +
+          `${request.specs.length}`,
+      );
     }
     for (const spec of request.specs) {
       if (typeof spec?.path !== "string") {
@@ -652,11 +677,5 @@ function validate(request: QueryRequest): void {
     ) {
       throw new Error("paths must be an array of strings");
     }
-  }
-  if (
-    request.limit !== undefined &&
-    (typeof request.limit !== "number" || !Number.isFinite(request.limit))
-  ) {
-    throw new Error("limit must be a number of rows");
   }
 }
