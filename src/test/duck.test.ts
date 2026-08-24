@@ -115,8 +115,8 @@ describe("the query service", () => {
   });
 
   it("answers a second request from the same process", async () => {
-    // The reason the service exists: starting an engine costs ~345 ms on the
-    // device and a query costs 39–141 ms.
+    // The reason the service exists: starting an engine costs 336–375 ms on
+    // the device and a warm request costs 96–246 ms.
     const fake = counted(ANSWERS);
     const runner = make({ spawnQuery: fake.spawn });
 

@@ -208,7 +208,7 @@ async function doRoll(argv: string[]): Promise<void> {
  * the plugin uses.
  *
  * **Every run is reported, and the first one is not an outlier to discard.**
- * It pays to start the engine — ~345 ms on the device — and every run after it
+ * It pays to start the engine — 336–375 ms on the device — and every run after
  * does not, which is the whole shape of this design. A mean across them would
  * describe neither.
  *

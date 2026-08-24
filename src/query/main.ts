@@ -15,7 +15,7 @@ import type { QueryRequest } from "./duck.js";
  * allocator does not return what a query allocates — neither belongs in a
  * process that also serves the vessel's data.
  *
- * It stays alive because starting it is ~345 ms on the device, against
+ * It stays alive because starting it is 336–375 ms on the device, against
  * 96–246 ms for a warm request. What that costs is memory the process never
  * gives back: it settles at the high-water mark of the largest query it has
  * served. Recycling it is

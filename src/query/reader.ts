@@ -17,10 +17,11 @@ import type { QueryRequest } from "./duck.js";
 /**
  * The hot store and the Parquet tree, read as one.
  *
- * This runs in the spawned query process — it is the only file besides
- * `roll/roll.ts` that may import the engine, and it may because the process
- * exits. Everything is one statement: the tree files that intersect the range,
- * the unrolled remainder of the hot store, and one filter over both.
+ * This runs in the query service — it is the only file besides `roll/roll.ts`
+ * that may import the engine, and it may because that process is not the
+ * Signal K server. Everything is one statement: the tree files that intersect
+ * the range, the unrolled remainder of the hot store, and one filter over
+ * both.
  *
  * **The seam between them is the interesting part.** A roll writes its rows to
  * Parquet and the writer deletes them from the store afterwards, so between
@@ -99,9 +100,8 @@ export interface Reader {
  *
  * Everything expensive happens here and once: mapping the addon, creating the
  * instance, expanding and loading `sqlite_scanner`, and locking the engine to
- * the data directory. Measured on the device, that is ~345 ms of a cold
- * query's ~600 ms, and it is why a query answers in 39–141 ms once this has
- * run.
+ * the data directory. Measured on the device, that is 336–375 ms, paid once
+ * instead of by every request.
  *
  * The extension is loaded even though no store is attached yet, because the
  * lockdown that follows would refuse it later. A device whose bundle cannot be

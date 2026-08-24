@@ -11,8 +11,8 @@ import { fileURLToPath } from "node:url";
  * loaded engine inside a request handler is exactly the shape this design
  * exists to prevent.
  *
- * **One process, kept.** Starting an engine costs ~345 ms on the device and a
- * warm request costs 96–246 ms, so a process per query spent more on starting
+ * **One process, kept.** Starting an engine costs 336–375 ms on the device and
+ * a warm request costs 96–246 ms, so a process per query spent more on starting
  * than on answering. The price is memory the query process does not
  * give back; recycling it is
  * [halos-org/halos#178](https://github.com/halos-org/halos/issues/178).

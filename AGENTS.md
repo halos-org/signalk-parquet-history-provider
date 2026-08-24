@@ -113,7 +113,7 @@ a check on module evaluation alone.
   or the reader; the measurements behind each choice are in it, and so is what
   would reopen one.
 - `docs/query-layer.md` — what a query costs, measured through the shipped
-  reader: the ~345 ms an engine takes to start, what a warm query costs
+  reader: the 336–375 ms an engine takes to start, what a warm query costs
   against it, what the service holds while it waits, and the layout decision
   re-checked against all three. Read it before changing anything about how a
   query is executed.
@@ -196,8 +196,8 @@ leaving something a `*.parquet` glob reads as finished.
 ## The query
 
 **One service, not one process per query.** The plugin starts `query/main.js`
-on the first history request and keeps it. Starting an engine costs ~345 ms on
-the device — ~220 ms of it mapping the addon — and a warm query answers in
+on the first history request and keeps it. Starting an engine costs 336–375 ms
+on the device — ~220 ms of it mapping the addon — and a warm query answers in
 96–246 ms, so a process per query spent six times longer starting than
 answering.
 
