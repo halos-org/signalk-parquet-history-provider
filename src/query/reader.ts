@@ -11,8 +11,8 @@ import {
 import { sqlLiteral } from "../duckdb/sql.js";
 import { treeRoot, utcDateSegment } from "../roll/tree-path.js";
 import { readPendingRoll, writerPaths } from "../writer/contract.js";
-import { RANGE_COLUMNS } from "./duck.js";
-import type { QueryRequest } from "./duck.js";
+import { DEFAULT_ROW_LIMIT, RANGE_COLUMNS, VALUE_COLUMNS } from "./duck.js";
+import type { QueryRequest, ValueAggregate } from "./duck.js";
 
 /**
  * The hot store and the Parquet tree, read as one.
@@ -37,19 +37,33 @@ import type { QueryRequest } from "./duck.js";
 export const DEFAULT_MEMORY_LIMIT = "256MB";
 
 /**
- * Rows one query returns before the answer is reported as truncated.
+ * Series one values request may name.
  *
- * The caller holds all of them in the Signal K process, so this is a ceiling
- * on that rather than on the engine. History playback already reads a long
- * range as a series of shorter ones; this is what makes an unbounded request
- * degrade into a truncated answer rather than into the server's heap.
+ * A bound on the statement rather than on the answer: every spec is another
+ * `UNION ALL` branch over the materialized source and two more bound
+ * parameters. The caller's bucket budget does not contain it, because that
+ * counts buckets × series — a coarse resolution leaves room for thousands of
+ * paths inside it. The service answers one request at a time, so a statement
+ * that wide holds the only engine until the deadline kills it.
  */
-export const DEFAULT_ROW_LIMIT = 100_000;
+const MAX_SPECS = 200;
 
 /** Milliseconds in a UTC day. The tree's directories are cut on these. */
 const DAY_MS = 86_400_000;
 
 const COLUMNS = RANGE_COLUMNS.join(", ");
+
+/**
+ * The `values` projection, in the order `VALUE_COLUMNS` declares.
+ *
+ * `lat` and `lon` are unpacked from the position struct the branches pack;
+ * the rest pass through. Derived rather than written out, because the decoder
+ * reads the row by position and a reordering here would mislabel every value
+ * it produced without failing anything.
+ */
+const VALUES_PROJECTION = VALUE_COLUMNS.map((name) =>
+  name === "lat" || name === "lon" ? `pos.${name} AS ${name}` : name,
+).join(", ");
 
 export interface ReaderOptions {
   dataDir: string;
@@ -362,14 +376,15 @@ function compile(request: QueryRequest, plan: Plan): Compiled | null {
     toMs: BigInt(Math.trunc(request.to)),
   };
   const filters = ["ts >= $fromMs", "ts < $toMs"];
-  if (request.kind !== "contexts") {
+  if (request.kind !== "contexts" && request.context !== undefined) {
     params.context = request.context;
     filters.push("context = $context");
   }
-  if (request.kind === "range" && (request.paths?.length ?? 0) > 0) {
-    // Bound as a list rather than composed into the statement: these come from
-    // an HTTP request, and they are the only strings in here that do.
-    params.paths = listValue(request.paths as string[]);
+  // Bound as a list rather than composed into the statement: these come from
+  // an HTTP request, and they are the only strings in here that do.
+  const wanted = requestedPaths(request);
+  if (wanted.length > 0) {
+    params.paths = listValue(wanted);
     filters.push("list_contains($paths, path)");
   }
   const where = filters.join(" AND ");
@@ -401,11 +416,115 @@ function compile(request: QueryRequest, plan: Plan): Compiled | null {
       params,
     };
   }
+  if (request.kind === "values") {
+    return compileValues(request, union, params);
+  }
   const column = request.kind === "paths" ? "path" : "context";
   return {
     text: `SELECT DISTINCT ${column} FROM (${union}) ORDER BY ${column}`,
     params,
   };
+}
+
+/** Every path a request needs, so the scan is pruned to those and no more. */
+function requestedPaths(request: QueryRequest): string[] {
+  if (request.kind === "range") return request.paths ?? [];
+  if (request.kind === "values") {
+    return [...new Set(request.specs.map((spec) => spec.path))];
+  }
+  return [];
+}
+
+/**
+ * Every series a history request asked for, as one statement.
+ *
+ * The source is read once — `MATERIALIZED`, because DuckDB inlines a CTE by
+ * default and would otherwise scan the tree once per series — and each series
+ * is a branch over it. The sibling provider issues a query per series and a
+ * second one for any series that turns out to be non-numeric; both are free
+ * against a running server and neither is free here.
+ *
+ * **Every value column comes back on every row.** A path has one kind, so at
+ * most one of them is set, and which one is not known until the rows are read:
+ * asking for all four costs one pass and removes the fallback query entirely.
+ *
+ * Buckets are only the ones that hold something. The caller lays out the full
+ * timeline and fills the gaps, which is the same answer the sibling provider's
+ * `FILL(NULL)` produces without fabricating rows to send down a pipe.
+ */
+function compileValues(
+  request: Extract<QueryRequest, { kind: "values" }>,
+  source: string,
+  params: Record<string, DuckDBValue>,
+): Compiled {
+  const bucketMs = Math.max(1, Math.trunc(request.bucketMs ?? 0));
+  const bucketed = (request.bucketMs ?? 0) > 0;
+  // Exact, unlike the range path's limit: nothing reports a truncated series,
+  // so a row over the ceiling would only be a row over the ceiling.
+  const branchLimit = perSpecLimit(request);
+
+  const branches = request.specs.map((spec, index) => {
+    const filters = [`path = $p${index}`];
+    params[`p${index}`] = spec.path;
+    if (spec.sourceRef !== undefined) {
+      params[`s${index}`] = spec.sourceRef;
+      filters.push(`source = $s${index}`);
+    }
+    const where = filters.join(" AND ");
+    // One `arg_min`/`arg_max` over a struct, never one per axis: two of them
+    // tie-break independently when two sources record in the same
+    // millisecond, and can return a latitude and a longitude the vessel was
+    // never at simultaneously — which is the same fabrication the per-axis
+    // aggregates are refused for.
+    const position = `struct_pack(lat := value_lat, lon := value_lon)`;
+    if (!bucketed || spec.aggregate === "raw") {
+      return (
+        `(SELECT ${index} AS spec, ts AS bucket, value_num AS num, ` +
+        `value_str AS str, value_kind AS kind, ${position} AS pos ` +
+        `FROM src WHERE ${where} ORDER BY ts LIMIT ${branchLimit})`
+      );
+    }
+    // `first` and `last` are `arg_min`/`arg_max` over `ts`, because DuckDB's
+    // own `first()` and `last()` are undefined within a group.
+    const pick = spec.aggregate === "last" ? "arg_max" : "arg_min";
+    return (
+      `SELECT ${index} AS spec, ` +
+      `CAST(floor(ts / ${bucketMs}.0) AS BIGINT) * ${bucketMs} AS bucket, ` +
+      `${numericAggregate(spec.aggregate)} AS num, ` +
+      // Text is never averaged: a bucket takes the value in force at its end,
+      // which is what a state channel means, and the kind travels with it so
+      // a boolean is replayed as a boolean rather than as "true".
+      `arg_max(value_str, ts) AS str, arg_max(value_kind, ts) AS kind, ` +
+      `${pick}(${position}, ts) AS pos ` +
+      `FROM src WHERE ${where} GROUP BY 1, 2`
+    );
+  });
+
+  return {
+    text:
+      `WITH src AS MATERIALIZED (${source}) ` +
+      `SELECT ${VALUES_PROJECTION} ` +
+      `FROM (${branches.join(" UNION ALL ")}) ORDER BY bucket, spec`,
+    params,
+  };
+}
+
+/** The bucket reduction for a numeric series. */
+function numericAggregate(aggregate: ValueAggregate): string {
+  switch (aggregate) {
+    case "min":
+      return "min(value_num)";
+    case "max":
+      return "max(value_num)";
+    case "mid":
+      return "(min(value_num) + max(value_num)) / 2";
+    case "first":
+      return "arg_min(value_num, ts)";
+    case "last":
+      return "arg_max(value_num, ts)";
+    default:
+      return "avg(value_num)";
+  }
 }
 
 /**
@@ -429,15 +548,43 @@ function seam(
   return ` AND (rowid > $maxRowid OR NOT (${days}))`;
 }
 
+/** The cap on what one answer returns, whatever it is made of. */
 function rowLimit(request: QueryRequest): number {
   if (request.kind !== "range") return DEFAULT_ROW_LIMIT;
-  const asked = request.limit;
+  return clampLimit(request.limit);
+}
+
+/**
+ * The cap on what one raw branch returns.
+ *
+ * Separate from `rowLimit`, and deliberately: that one bounds the answer, and
+ * this one bounds a series inside it. A values request sends the ceiling its
+ * caller reduces a raw series under, which is smaller than the answer's — and
+ * applying it to the answer instead would drop whole trailing series rather
+ * than shortening each, because the rows arrive ordered by bucket and spec.
+ */
+function perSpecLimit(request: Extract<QueryRequest, { kind: "values" }>) {
+  return clampLimit(request.limit);
+}
+
+function clampLimit(asked: number | undefined): number {
   if (asked === undefined) return DEFAULT_ROW_LIMIT;
   return Math.max(1, Math.min(Math.floor(asked), DEFAULT_ROW_LIMIT));
 }
 
 /** The kinds a request may name. Anything else is not a query. */
-const KINDS = ["range", "paths", "contexts"] as const;
+const KINDS = ["range", "values", "paths", "contexts"] as const;
+
+/** The bucket reductions a spec may name. */
+const AGGREGATES: readonly ValueAggregate[] = [
+  "average",
+  "min",
+  "max",
+  "first",
+  "last",
+  "mid",
+  "raw",
+];
 
 /**
  * Check the request at the boundary it crosses.
@@ -462,8 +609,55 @@ function validate(request: QueryRequest): void {
   };
   time("from", request.from);
   time("to", request.to);
-  if (request.kind !== "contexts" && typeof request.context !== "string") {
+  if (request.kind === "range" || request.kind === "values") {
+    if (typeof request.context !== "string") {
+      throw new Error("context must be a string");
+    }
+  } else if (
+    request.kind === "paths" &&
+    request.context !== undefined &&
+    typeof request.context !== "string"
+  ) {
     throw new Error("context must be a string");
+  }
+  if (
+    (request.kind === "range" || request.kind === "values") &&
+    request.limit !== undefined &&
+    (typeof request.limit !== "number" || !Number.isFinite(request.limit))
+  ) {
+    throw new Error("limit must be a number of rows");
+  }
+  if (request.kind === "values") {
+    if (!Array.isArray(request.specs) || request.specs.length === 0) {
+      throw new Error("a values request needs at least one spec");
+    }
+    if (request.specs.length > MAX_SPECS) {
+      throw new Error(
+        `a values request may name ${MAX_SPECS} series; this one names ` +
+          `${request.specs.length}`,
+      );
+    }
+    for (const spec of request.specs) {
+      if (typeof spec?.path !== "string") {
+        throw new Error("every spec needs a path");
+      }
+      if (!AGGREGATES.includes(spec.aggregate)) {
+        throw new Error(
+          `${JSON.stringify(spec.aggregate)} is not an aggregate; expected one of ${AGGREGATES.join(", ")}`,
+        );
+      }
+      if (spec.sourceRef !== undefined && typeof spec.sourceRef !== "string") {
+        throw new Error("sourceRef must be a string");
+      }
+    }
+    if (
+      request.bucketMs !== undefined &&
+      (typeof request.bucketMs !== "number" ||
+        !Number.isFinite(request.bucketMs))
+    ) {
+      throw new Error("bucketMs must be a number of milliseconds");
+    }
+    return;
   }
   if (request.kind !== "range") return;
   if (request.paths !== undefined) {
@@ -473,11 +667,5 @@ function validate(request: QueryRequest): void {
     ) {
       throw new Error("paths must be an array of strings");
     }
-  }
-  if (
-    request.limit !== undefined &&
-    (typeof request.limit !== "number" || !Number.isFinite(request.limit))
-  ) {
-    throw new Error("limit must be a number of rows");
   }
 }

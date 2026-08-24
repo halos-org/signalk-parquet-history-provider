@@ -4,12 +4,15 @@ import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { HistoryProvider } from "@signalk/server-api/history";
 import {
   ConfigSchema,
   StoredConfig,
   normalizeConfig,
 } from "./config/schema.js";
 import type { Config } from "./config/schema.js";
+import { createHistoryV2 } from "./history-v2.js";
+import { QueryRunner } from "./query/duck.js";
 import { DATA_DIR_MODE, DATA_LAYOUT, resolveDataDir } from "./data-dir.js";
 import { FlushBuffer } from "./flush-buffer.js";
 import { PLUGIN_ID } from "./plugin-id.js";
@@ -41,6 +44,18 @@ interface App {
   setPluginError: (msg: string) => void;
   getDataDirPath: () => string;
   selfContext: string;
+  /**
+   * Optional because the plugin declares no server version floor. A server
+   * without the registry serves no history from this plugin and says so once,
+   * rather than failing to start and taking recording down with it — recording
+   * is the half that has no alternative.
+   *
+   * There is no matching unregister to call. The server's plugin wrapper is
+   * what installs this, and registering through it queues the unregister as an
+   * onStop handler; those run before `stop()` is entered, so the provider is
+   * already gone by the time anything below happens.
+   */
+  registerHistoryApiProvider?: (provider: HistoryProvider) => void;
   streambundle: {
     getBus: (path?: string) => {
       onValue: (fn: (value: BusValue) => void) => () => void;
@@ -69,6 +84,7 @@ export default (app: App) => {
   let writer: ChildProcess | null = null;
   let statusTimer: NodeJS.Timeout | null = null;
   let recorder: Recorder | null = null;
+  let queries: QueryRunner | null = null;
   let fatal: string | null = null;
   let stopping = false;
   let dataDir = "";
@@ -258,6 +274,25 @@ export default (app: App) => {
           .getBus()
           .onValue((value) => recorder?.handle(value));
 
+        // The query service is not started here — it starts on the first
+        // history request and stays. A device nobody asks for history on pays
+        // nothing for it.
+        queries = new QueryRunner({
+          dataDir,
+          memoryLimit: undefined,
+          onError: (line) => app.error(line),
+        });
+        if (app.registerHistoryApiProvider) {
+          app.registerHistoryApiProvider(
+            createHistoryV2(queries, app.selfContext),
+          );
+          app.debug("registered the history v2 provider");
+        } else {
+          app.debug(
+            "this server has no history provider registry; recording only",
+          );
+        }
+
         statusTimer = setInterval(status, STATUS_INTERVAL_MS);
         statusTimer.unref();
         status();
@@ -282,6 +317,12 @@ export default (app: App) => {
         statusTimer = null;
       }
       recorder = null;
+
+      // Before the writer goes: a query holds a read on the hot store, and the
+      // writer is about to be asked to close it. The server has already taken
+      // the provider back, so this is the whole of the teardown.
+      queries?.stop();
+      queries = null;
 
       // Send what is buffered before tearing anything down. Discarding it lost
       // several hundred samples on every config save, while the configuration

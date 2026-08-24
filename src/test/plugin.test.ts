@@ -21,6 +21,7 @@ function stubApp(dataDirPath: string) {
     logged: [] as unknown[],
     busValues: [] as ((value: BusValue) => void)[],
     unsubscribed: 0,
+    registered: [] as unknown[],
   };
   return {
     calls,
@@ -31,6 +32,8 @@ function stubApp(dataDirPath: string) {
       setPluginError: (message: string) => calls.errors.push(message),
       getDataDirPath: () => dataDirPath,
       selfContext: "vessels.self",
+      registerHistoryApiProvider: (provider: unknown) =>
+        calls.registered.push(provider),
       streambundle: {
         getBus: () => ({
           onValue: (fn: (value: BusValue) => void) => {
@@ -131,6 +134,50 @@ describe("the plugin", () => {
       assert.ok(calls.logged[0] instanceof Error, "the log lost the stack");
     } finally {
       rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("registers the history surface", async () => {
+    const work = mkdtempSync(join(tmpdir(), "sk-parquet-history-"));
+    const { app, calls } = stubApp(work);
+    const plugin = createPlugin(app);
+    try {
+      plugin.start({});
+
+      assert.equal(calls.registered.length, 1, "no provider was registered");
+      const provider = calls.registered[0] as Record<string, unknown>;
+      for (const method of ["getValues", "getPaths", "getContexts"]) {
+        assert.equal(
+          typeof provider[method],
+          "function",
+          `the registered provider has no ${method}`,
+        );
+      }
+
+      // Nothing unregisters here: the server queues that itself when the
+      // provider is registered, and runs it before `stop()` is entered.
+      await plugin.stop();
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it("records even on a server with no history registry", async () => {
+    // The plugin declares no server version floor. Recording is the half with
+    // no alternative, so an older server must not lose it over a surface it
+    // cannot serve.
+    const work = mkdtempSync(join(tmpdir(), "sk-parquet-noreg-"));
+    const { app, calls } = stubApp(work);
+    const older = { ...app } as Record<string, unknown>;
+    delete older.registerHistoryApiProvider;
+    const plugin = createPlugin(older as typeof app);
+    try {
+      plugin.start({});
+      assert.deepEqual(calls.errors, []);
+      assert.equal(calls.busValues.length, 1, "the plugin did not subscribe");
+      await plugin.stop();
+    } finally {
+      rmSync(work, { recursive: true, force: true });
     }
   });
 

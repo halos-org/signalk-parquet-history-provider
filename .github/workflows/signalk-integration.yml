@@ -3,10 +3,11 @@
 # modules in isolation, and package-e2e asserts the tarball's shape -- not
 # that signalk-server finds the package, reads its schema and starts it.
 #
-# It does not yet assert history-provider registration, because this build
-# registers none. The v2 and v1 surfaces are issues 171 and 172 under
-# https://github.com/halos-org/halos/issues/152, and the assertion belongs
-# with them.
+# It asserts the v2 history surface answers, because that is the only place
+# the whole chain is exercised at once: sample NMEA into the recorder, through
+# the socket to the writer, into SQLite, out through the query service's
+# DuckDB and back as JSON. The v1 surface is issue 172 under
+# https://github.com/halos-org/halos/issues/172.
 
 name: Signal K Integration
 
@@ -50,6 +51,11 @@ jobs:
         run: |
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
           npm run build
+          # extensions/ is gitignored and downloaded, so a checkout has none.
+          # `prepublishOnly` fetches them for a real publish, but npm does not
+          # run that hook for `npm pack` -- so without this the tarball ships
+          # no sqlite_scanner and every hot-store query below answers 400.
+          npm run fetch-extensions
           echo "PLUGIN_TGZ=$(npm pack --ignore-scripts --pack-destination /tmp)" >> "$GITHUB_ENV"
 
       - name: Install signalk-server and the plugin
@@ -134,7 +140,85 @@ jobs:
             echo "  $DATA_DIR/$sub"
           done
 
+          # The whole chain, and the only check that covers it end to end: the
+          # sample stream reached the recorder, the socket, SQLite, the query
+          # service's DuckDB and came back as JSON. A server with no provider
+          # registered answers 501 here, which is what this build did before
+          # the v2 surface existed.
+          echo "--- history v2 surface ---"
+          HISTORY="http://localhost:3000/signalk/v2/api/history"
+          # A path the sample stream always carries -- plaka.log holds 7250
+          # $IIDBT sentences -- so the answers below are built by this plugin's
+          # own assembly rather than by an empty short circuit.
+          ASKED=environment.depth.belowTransducer
+
+          # `to` is recomputed on every attempt below, so it never falls behind
+          # while the loop waits.
+          window() {
+            FROM=$(node -e 'console.log(new Date(Date.now() - 3600000).toISOString())')
+            TO=$(node -e 'console.log(new Date().toISOString())')
+          }
+          nonEmpty() {
+            WHAT="$1" node -e '
+              const body = JSON.parse(require("fs").readFileSync(0, "utf8"));
+              if (Array.isArray(body) && body.length > 0) process.exit(0);
+              console.error(`::error::history/${process.env.WHAT} answered ${JSON.stringify(body)}`);
+              process.exit(1);
+            '
+          }
+
+          # A recorded sample reaches the store a flush interval after the
+          # server starts answering, and the loop above stops waiting at the
+          # first answer -- seconds earlier. The assertions below require a
+          # non-empty body, so they need the store to hold something first.
+          echo "waiting for $ASKED to reach the store"
+          for _ in $(seq 1 60); do
+            window
+            if curl -sf -o /tmp/paths.json "$HISTORY/paths?from=$FROM&to=$TO" &&
+               grep -q "\"$ASKED\"" /tmp/paths.json; then
+              break
+            fi
+            sleep 2
+          done
+
+          CODE=$(curl -s -o /tmp/contexts.json -w '%{http_code}' "$HISTORY/contexts?from=$FROM&to=$TO")
+          [ "$CODE" = "200" ] || {
+            echo "::error::history/contexts answered $CODE: $(cat /tmp/contexts.json)"
+            cat /tmp/sk.log; exit 1; }
+          nonEmpty contexts < /tmp/contexts.json || { cat /tmp/sk.log; exit 1; }
+          echo "  contexts: $(cat /tmp/contexts.json)"
+
+          CODE=$(curl -s -o /tmp/paths.json -w '%{http_code}' "$HISTORY/paths?from=$FROM&to=$TO")
+          [ "$CODE" = "200" ] || {
+            echo "::error::history/paths answered $CODE: $(cat /tmp/paths.json)"
+            cat /tmp/sk.log; exit 1; }
+          nonEmpty paths < /tmp/paths.json || { cat /tmp/sk.log; exit 1; }
+          echo "  paths: $(head -c 300 /tmp/paths.json)"
+
+          CODE=$(curl -s -o /tmp/values.json -w '%{http_code}' \
+            "$HISTORY/values?from=$FROM&to=$TO&resolution=10&paths=$ASKED")
+          [ "$CODE" = "200" ] || {
+            echo "::error::history/values answered $CODE: $(cat /tmp/values.json)"
+            cat /tmp/sk.log; exit 1; }
+          ASKED="$ASKED" node -e '
+            const answer = JSON.parse(require("fs").readFileSync("/tmp/values.json", "utf8"));
+            const series = answer.values?.[0];
+            if (series?.path !== process.env.ASKED) {
+              console.error(`::error::the response describes ${JSON.stringify(answer.values)}, not ${process.env.ASKED}`);
+              process.exit(1);
+            }
+            // The rows are the point. A provider that echoes the requested
+            // series and queries nothing answers 200 with an empty `data`.
+            if (!Array.isArray(answer.data) || answer.data.length === 0) {
+              console.error("::error::history/values returned no rows");
+              process.exit(1);
+            }
+            console.log(`  values: ${answer.data.length} rows for ${series.path} as ${series.method}`);
+          ' || { cat /tmp/sk.log; exit 1; }
+
           # The premise of the design: the server pays for no storage engine.
+          # Checked after a query has run, which is the moment an engine would
+          # have been mapped if anything about the query path were in-process.
           # /tmp/sk.pid is npx's, not the server's, so the process is found by
           # name -- and not finding it fails, because a check that cannot
           # locate its target must not report success.

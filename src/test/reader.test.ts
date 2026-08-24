@@ -384,6 +384,276 @@ describe("what a query reads", { skip: NO_BUNDLED_EXTENSION }, () => {
   });
 });
 
+describe("a values query", { skip: NO_BUNDLED_EXTENSION }, () => {
+  const values = (over: Partial<QueryRequest> = {}) =>
+    ({
+      kind: "values",
+      from: AUG_23,
+      to: AUG_23 + DAY,
+      context: "self",
+      bucketMs: 10_000,
+      specs: [{ path: "a.b", aggregate: "average" }],
+      ...over,
+    }) as QueryRequest;
+
+  it("reduces each bucket and skips the ones with nothing in them", async () => {
+    // Two rows in the first bucket, one in the third, nothing in the second.
+    record(
+      sample({ ts: AUG_23 + 1000, path: "a.b", value: 10 }),
+      sample({ ts: AUG_23 + 2000, path: "a.b", value: 20 }),
+      sample({ ts: AUG_23 + 25_000, path: "a.b", value: 7 }),
+    );
+
+    const result = await runner.run(values());
+
+    // spec, bucket, num — the empty bucket is the caller's to fabricate.
+    assert.deepEqual(
+      result.rows.map((row) => [row[0], row[1], row[2]]),
+      [
+        [0, AUG_23, 15],
+        [0, AUG_23 + 20_000, 7],
+      ],
+    );
+  });
+
+  it("answers every series in one request", async () => {
+    record(
+      sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }),
+      sample({ ts: AUG_23 + 1000, path: "c.d", value: 2 }),
+    );
+
+    const result = await runner.run(
+      values({
+        specs: [
+          { path: "a.b", aggregate: "average" },
+          { path: "c.d", aggregate: "average" },
+        ],
+      }),
+    );
+
+    assert.deepEqual(
+      result.rows.map((row) => [row[0], row[2]]),
+      [
+        [0, 1],
+        [1, 2],
+      ],
+    );
+  });
+
+  it("picks first and last by timestamp rather than by arrival", async () => {
+    // Written out of order on purpose: DuckDB's own first()/last() are
+    // undefined within a group, so a reduction that used them would pass or
+    // fail on the scan order.
+    record(
+      sample({ ts: AUG_23 + 5000, path: "a.b", value: 50 }),
+      sample({ ts: AUG_23 + 1000, path: "a.b", value: 10 }),
+      sample({ ts: AUG_23 + 9000, path: "a.b", value: 90 }),
+    );
+
+    const first = await runner.run(
+      values({ specs: [{ path: "a.b", aggregate: "first" }] }),
+    );
+    const last = await runner.run(
+      values({ specs: [{ path: "a.b", aggregate: "last" }] }),
+    );
+    const mid = await runner.run(
+      values({ specs: [{ path: "a.b", aggregate: "mid" }] }),
+    );
+
+    assert.equal(first.rows[0][2], 10);
+    assert.equal(last.rows[0][2], 90);
+    assert.equal(mid.rows[0][2], 50);
+  });
+
+  it("returns a position that was recorded, not one assembled per axis", async () => {
+    // Two sources in one bucket. Taking latitude from one and longitude from
+    // the other would put the vessel somewhere it has never been.
+    record(
+      sample({
+        ts: AUG_23 + 1000,
+        path: "navigation.position",
+        kind: "position",
+        source: "gps.1",
+        value: { latitude: 60.1, longitude: 24.1 },
+      }),
+      sample({
+        ts: AUG_23 + 2000,
+        path: "navigation.position",
+        kind: "position",
+        source: "gps.2",
+        value: { latitude: 61.9, longitude: 25.9 },
+      }),
+    );
+
+    const first = await runner.run(
+      values({ specs: [{ path: "navigation.position", aggregate: "first" }] }),
+    );
+    const last = await runner.run(
+      values({ specs: [{ path: "navigation.position", aggregate: "last" }] }),
+    );
+
+    assert.deepEqual([first.rows[0][5], first.rows[0][6]], [60.1, 24.1]);
+    assert.deepEqual([last.rows[0][5], last.rows[0][6]], [61.9, 25.9]);
+  });
+
+  it("carries a text value and its kind, so a boolean stays a boolean", async () => {
+    record(
+      sample({
+        ts: AUG_23 + 1000,
+        path: "s.t",
+        kind: "boolean",
+        value: "false",
+      }),
+      sample({
+        ts: AUG_23 + 5000,
+        path: "s.t",
+        kind: "boolean",
+        value: "true",
+      }),
+    );
+
+    const result = await runner.run(
+      values({ specs: [{ path: "s.t", aggregate: "average" }] }),
+    );
+
+    // The numeric reduction has nothing to work with; the text one takes the
+    // value in force at the end of the bucket.
+    assert.equal(result.rows[0][2], null);
+    assert.equal(result.rows[0][3], "true");
+    assert.equal(result.rows[0][4], "boolean");
+  });
+
+  it("restricts a series to one source when asked", async () => {
+    record(
+      sample({ ts: AUG_23 + 1000, path: "a.b", source: "n2k.0", value: 1 }),
+      sample({ ts: AUG_23 + 2000, path: "a.b", source: "n2k.9", value: 99 }),
+    );
+
+    const result = await runner.run(
+      values({
+        specs: [{ path: "a.b", aggregate: "average", sourceRef: "n2k.9" }],
+      }),
+    );
+
+    assert.equal(result.rows[0][2], 99);
+  });
+
+  it("returns rows unreduced for a client-side aggregate", async () => {
+    record(
+      sample({ ts: AUG_23 + 1000, path: "a.b", value: 1 }),
+      sample({ ts: AUG_23 + 2000, path: "a.b", value: 2 }),
+      sample({ ts: AUG_23 + 3000, path: "a.b", value: 3 }),
+    );
+
+    const result = await runner.run(
+      values({ specs: [{ path: "a.b", aggregate: "raw" }] }),
+    );
+
+    assert.deepEqual(
+      result.rows.map((row) => [row[1], row[2]]),
+      [
+        [AUG_23 + 1000, 1],
+        [AUG_23 + 2000, 2],
+        [AUG_23 + 3000, 3],
+      ],
+    );
+  });
+
+  it("reads the tree and the store as one series", async () => {
+    record(sample({ ts: AUG_23 + 1000, path: "a.b", value: 10 }));
+    store.deleteThrough(await rollAll(1));
+    record(sample({ ts: AUG_23 + 25_000, path: "a.b", value: 30 }));
+
+    const result = await runner.run(values());
+
+    assert.deepEqual(
+      result.rows.map((row) => [row[1], row[2]]),
+      [
+        [AUG_23, 10],
+        [AUG_23 + 20_000, 30],
+      ],
+    );
+  });
+
+  it("refuses an aggregate it does not know", async () => {
+    record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+    await assert.rejects(
+      runner.run(
+        values({
+          specs: [{ path: "a.b", aggregate: "median" as never }],
+        }),
+      ),
+      /is not an aggregate/,
+    );
+  });
+
+  it("holds a raw series to the ceiling the caller sent", async () => {
+    // The caller reduces a raw series in the Signal K process, so its limit is
+    // the budget for that. It used to be discarded, and every raw branch
+    // returned the whole-answer default instead.
+    for (let i = 0; i < 6; i += 1) {
+      record(sample({ ts: AUG_23 + i * 1000, path: "a.b", value: i }));
+    }
+
+    const result = await runner.run(
+      values({
+        specs: [{ path: "a.b", aggregate: "raw" }],
+        limit: 3,
+      }),
+    );
+
+    assert.deepEqual(
+      result.rows.map((row) => row[2]),
+      [0, 1, 2],
+    );
+  });
+
+  it("holds each series to that ceiling rather than the answer to it", async () => {
+    // The rows arrive ordered by bucket and then by spec, so a ceiling applied
+    // to the answer would drop the trailing series outright instead of
+    // shortening each of them.
+    for (let i = 0; i < 4; i += 1) {
+      record(
+        sample({ ts: AUG_23 + i * 1000, path: "a.b", value: i }),
+        sample({ ts: AUG_23 + i * 1000, path: "c.d", value: 10 + i }),
+      );
+    }
+
+    const result = await runner.run(
+      values({
+        specs: [
+          { path: "a.b", aggregate: "raw" },
+          { path: "c.d", aggregate: "raw" },
+        ],
+        limit: 2,
+      }),
+    );
+
+    assert.deepEqual(
+      result.rows.map((row) => [row[0], row[2]]),
+      [
+        [0, 0],
+        [1, 10],
+        [0, 1],
+        [1, 11],
+      ],
+    );
+  });
+
+  it("refuses more series than one statement may carry", async () => {
+    record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+    const specs = Array.from({ length: 201 }, () => ({
+      path: "a.b",
+      aggregate: "average" as const,
+    }));
+
+    await assert.rejects(
+      runner.run(values({ specs })),
+      /may name 200 series; this one names 201/,
+    );
+  });
+});
+
 describe("the tree's file selection", () => {
   it("keeps the dates that intersect the range and no others", async () => {
     for (const date of ["2026-08-22", "2026-08-23", "2026-08-24"]) {

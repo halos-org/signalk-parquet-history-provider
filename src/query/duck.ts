@@ -15,8 +15,9 @@ import { fileURLToPath } from "node:url";
  * which is more than an ordinary request costs to answer — so a process per
  * query spent more on starting than on working. What a request costs depends
  * on how much data the device holds; `docs/query-layer.md` carries the
- * measurements and the date they were taken. The price is memory the query process does not
- * give back; recycling it is
+ * measurements and the date they were taken.
+ *
+ * The price is memory the query process does not give back. Bounding it is
  * [halos-org/halos#178](https://github.com/halos-org/halos/issues/178).
  *
  * **One request, one statement.** The sibling provider issues a query per
@@ -26,6 +27,20 @@ import { fileURLToPath } from "node:url";
  */
 
 const QUERY_ENTRY = fileURLToPath(new URL("./main.js", import.meta.url));
+
+/**
+ * Rows one query returns before the answer is reported as truncated.
+ *
+ * The caller holds all of them in the Signal K process, so this is a ceiling
+ * on that rather than on the engine. History playback already reads a long
+ * range as a series of shorter ones; this is what makes an unbounded request
+ * degrade into a truncated answer rather than into the server's heap.
+ *
+ * Here rather than beside the reader that applies it, because the history
+ * surface has to know the ceiling to say which request exceeded it, and it
+ * may not import anything that reaches the engine.
+ */
+export const DEFAULT_ROW_LIMIT = 100_000;
 
 /** The columns a `range` row carries, in the order the tree writes them. */
 export const RANGE_COLUMNS = [
@@ -39,6 +54,41 @@ export const RANGE_COLUMNS = [
   "value_lat",
   "value_lon",
 ] as const;
+
+/**
+ * The columns a `values` row carries.
+ *
+ * One row per bucket per series. All four value columns come back on every
+ * row and the caller picks: a path has one kind, so at most one of them is
+ * ever set, and which one is not known before the query runs. That is what
+ * replaces the sibling provider's "query the numeric table, and if it came
+ * back empty query the string table" — here they are one table and one pass.
+ */
+export const VALUE_COLUMNS = [
+  "spec",
+  "bucket",
+  "num",
+  "str",
+  "kind",
+  "lat",
+  "lon",
+] as const;
+
+/**
+ * How a bucket is reduced.
+ *
+ * `raw` returns the rows themselves, for the aggregates the API defines as
+ * client-side: a moving average cannot be computed a bucket at a time.
+ */
+export type ValueAggregate =
+  "average" | "min" | "max" | "first" | "last" | "mid" | "raw";
+
+export interface ValueSpec {
+  path: string;
+  aggregate: ValueAggregate;
+  /** Restrict the series to rows recorded from this source. */
+  sourceRef?: string;
+}
 
 /**
  * What a query asks for. `from` is inclusive and `to` exclusive, both in
@@ -55,7 +105,30 @@ export type QueryRequest =
       /** Rows to return before the answer is reported as truncated. */
       limit?: number;
     }
-  | { kind: "paths"; from: number; to: number; context: string }
+  | {
+      /** One statement for every series a history request asked for. */
+      kind: "values";
+      from: number;
+      to: number;
+      context: string;
+      specs: ValueSpec[];
+      /** Bucket width in milliseconds. Absent means every spec is raw. */
+      bucketMs?: number;
+      /**
+       * Rows a raw branch returns. Per series rather than per answer: a
+       * bucketed branch is already bounded by the bucket count, and it is the
+       * raw ones the caller reduces in its own heap.
+       */
+      limit?: number;
+    }
+  | {
+      kind: "paths";
+      from: number;
+      to: number;
+      /** Absent lists every context's paths, which is what the v2 surface asks
+       * for — its request carries a range and nothing else. */
+      context?: string;
+    }
   | { kind: "contexts"; from: number; to: number };
 
 export interface QueryResult {
@@ -85,9 +158,10 @@ export interface QueryResult {
  * The query process answers one at a time — two on one connection would
  * interleave their rows on one pipe — so a burst queues. A Grafana dashboard
  * opens with one request per panel, and at the tens to hundreds of
- * milliseconds each one takes, a queue is the right response to that. A refusal is the right response to a backlog: past this
- * many, the requests already waiting will not be served inside their own
- * deadline either.
+ * milliseconds each one takes, a queue is the right response to that.
+ *
+ * A refusal is the right response to a backlog: past this many, the requests
+ * already waiting will not be served inside their own deadline either.
  */
 export const MAX_QUEUED_QUERIES = 8;
 
