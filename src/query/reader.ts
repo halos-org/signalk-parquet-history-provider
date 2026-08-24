@@ -11,7 +11,7 @@ import {
 import { sqlLiteral } from "../duckdb/sql.js";
 import { treeRoot, utcDateSegment } from "../roll/tree-path.js";
 import { readPendingRoll, writerPaths } from "../writer/contract.js";
-import { RANGE_COLUMNS } from "./duck.js";
+import { RANGE_COLUMNS, VALUE_COLUMNS } from "./duck.js";
 import type { QueryRequest, ValueAggregate } from "./duck.js";
 
 /**
@@ -50,6 +50,18 @@ export const DEFAULT_ROW_LIMIT = 100_000;
 const DAY_MS = 86_400_000;
 
 const COLUMNS = RANGE_COLUMNS.join(", ");
+
+/**
+ * The `values` projection, in the order `VALUE_COLUMNS` declares.
+ *
+ * `lat` and `lon` are unpacked from the position struct the branches pack;
+ * the rest pass through. Derived rather than written out, because the decoder
+ * reads the row by position and a reordering here would mislabel every value
+ * it produced without failing anything.
+ */
+const VALUES_PROJECTION = VALUE_COLUMNS.map((name) =>
+  name === "lat" || name === "lon" ? `pos.${name} AS ${name}` : name,
+).join(", ");
 
 export interface ReaderOptions {
   dataDir: string;
@@ -487,7 +499,7 @@ function compileValues(
   return {
     text:
       `WITH src AS MATERIALIZED (${source}) ` +
-      `SELECT spec, bucket, num, str, kind, pos.lat AS lat, pos.lon AS lon ` +
+      `SELECT ${VALUES_PROJECTION} ` +
       `FROM (${branches.join(" UNION ALL ")}) ORDER BY bucket, spec`,
     params,
   };

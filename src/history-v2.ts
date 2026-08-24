@@ -8,7 +8,7 @@ import type {
   ValuesRequest,
   ValuesResponse,
 } from "@signalk/server-api/history";
-import { QueryRunner } from "./query/duck.js";
+import { QueryRunner, VALUE_COLUMNS } from "./query/duck.js";
 import type { ValueAggregate, ValueSpec } from "./query/duck.js";
 import { resolveTimeRange } from "./time-range.js";
 
@@ -174,15 +174,20 @@ interface ValueRow {
   lon: number | null;
 }
 
+/** Where each value lives in a row, from the order the query layer declares. */
+const AT = Object.fromEntries(
+  VALUE_COLUMNS.map((name, index) => [name, index]),
+) as Record<(typeof VALUE_COLUMNS)[number], number>;
+
 function toValueRow(row: unknown[]): ValueRow {
   return {
-    spec: row[0] as number,
-    bucket: row[1] as number,
-    num: (row[2] as number | null) ?? null,
-    str: (row[3] as string | null) ?? null,
-    kind: (row[4] as string | null) ?? null,
-    lat: (row[5] as number | null) ?? null,
-    lon: (row[6] as number | null) ?? null,
+    spec: row[AT.spec] as number,
+    bucket: row[AT.bucket] as number,
+    num: (row[AT.num] as number | null) ?? null,
+    str: (row[AT.str] as string | null) ?? null,
+    kind: (row[AT.kind] as string | null) ?? null,
+    lat: (row[AT.lat] as number | null) ?? null,
+    lon: (row[AT.lon] as number | null) ?? null,
   };
 }
 
