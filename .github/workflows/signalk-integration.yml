@@ -7,7 +7,7 @@
 # the whole chain is exercised at once: sample NMEA into the recorder, through
 # the socket to the writer, into SQLite, out through the query service's
 # DuckDB and back as JSON. The v1 surface is issue 172 under
-# https://github.com/halos-org/halos/issues/152.
+# https://github.com/halos-org/halos/issues/172.
 
 name: Signal K Integration
 
@@ -146,25 +146,56 @@ jobs:
           # registered answers 501 here, which is what this build did before
           # the v2 surface existed.
           echo "--- history v2 surface ---"
-          FROM=$(node -e 'console.log(new Date(Date.now() - 3600000).toISOString())')
-          TO=$(node -e 'console.log(new Date().toISOString())')
           HISTORY="http://localhost:3000/signalk/v2/api/history"
+          # A path the sample stream always carries -- plaka.log holds 7250
+          # $IIDBT sentences -- so the answers below are built by this plugin's
+          # own assembly rather than by an empty short circuit.
+          ASKED=environment.depth.belowTransducer
+
+          # `to` is recomputed on every attempt below, so it never falls behind
+          # while the loop waits.
+          window() {
+            FROM=$(node -e 'console.log(new Date(Date.now() - 3600000).toISOString())')
+            TO=$(node -e 'console.log(new Date().toISOString())')
+          }
+          nonEmpty() {
+            WHAT="$1" node -e '
+              const body = JSON.parse(require("fs").readFileSync(0, "utf8"));
+              if (Array.isArray(body) && body.length > 0) process.exit(0);
+              console.error(`::error::history/${process.env.WHAT} answered ${JSON.stringify(body)}`);
+              process.exit(1);
+            '
+          }
+
+          # The wait loop above returns as soon as the server answers, which is
+          # a second or two after start -- and a sample reaches the store only
+          # once the plugin's flush interval has elapsed. Without this wait
+          # every assertion below runs against an empty store, and each one
+          # passes on an empty 200 while claiming to have exercised the chain.
+          echo "waiting for $ASKED to reach the store"
+          for _ in $(seq 1 60); do
+            window
+            if curl -sf -o /tmp/paths.json "$HISTORY/paths?from=$FROM&to=$TO" &&
+               grep -q "\"$ASKED\"" /tmp/paths.json; then
+              break
+            fi
+            sleep 2
+          done
 
           CODE=$(curl -s -o /tmp/contexts.json -w '%{http_code}' "$HISTORY/contexts?from=$FROM&to=$TO")
           [ "$CODE" = "200" ] || {
             echo "::error::history/contexts answered $CODE: $(cat /tmp/contexts.json)"
             cat /tmp/sk.log; exit 1; }
+          nonEmpty contexts < /tmp/contexts.json || { cat /tmp/sk.log; exit 1; }
           echo "  contexts: $(cat /tmp/contexts.json)"
 
           CODE=$(curl -s -o /tmp/paths.json -w '%{http_code}' "$HISTORY/paths?from=$FROM&to=$TO")
           [ "$CODE" = "200" ] || {
             echo "::error::history/paths answered $CODE: $(cat /tmp/paths.json)"
             cat /tmp/sk.log; exit 1; }
+          nonEmpty paths < /tmp/paths.json || { cat /tmp/sk.log; exit 1; }
           echo "  paths: $(head -c 300 /tmp/paths.json)"
 
-          # A path the sample stream always carries, so the response is built
-          # by this plugin's own assembly rather than by an empty short circuit.
-          ASKED=environment.depth.belowTransducer
           CODE=$(curl -s -o /tmp/values.json -w '%{http_code}' \
             "$HISTORY/values?from=$FROM&to=$TO&resolution=10&paths=$ASKED")
           [ "$CODE" = "200" ] || {
@@ -177,8 +208,14 @@ jobs:
               console.error(`::error::the response describes ${JSON.stringify(answer.values)}, not ${process.env.ASKED}`);
               process.exit(1);
             }
+            // The rows are the point. A provider that echoes the requested
+            // series and queries nothing answers 200 with an empty `data`.
+            if (!Array.isArray(answer.data) || answer.data.length === 0) {
+              console.error("::error::history/values returned no rows");
+              process.exit(1);
+            }
             console.log(`  values: ${answer.data.length} rows for ${series.path} as ${series.method}`);
-          '
+          ' || { cat /tmp/sk.log; exit 1; }
 
           # The premise of the design: the server pays for no storage engine.
           # Checked after a query has run, which is the moment an engine would
