@@ -167,11 +167,10 @@ jobs:
             '
           }
 
-          # The wait loop above returns as soon as the server answers, which is
-          # a second or two after start -- and a sample reaches the store only
-          # once the plugin's flush interval has elapsed. Without this wait
-          # every assertion below runs against an empty store, and each one
-          # passes on an empty 200 while claiming to have exercised the chain.
+          # A recorded sample reaches the store a flush interval after the
+          # server starts answering, and the loop above stops waiting at the
+          # first answer -- seconds earlier. The assertions below require a
+          # non-empty body, so they need the store to hold something first.
           echo "waiting for $ASKED to reach the store"
           for _ in $(seq 1 60); do
             window
