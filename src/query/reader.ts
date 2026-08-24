@@ -457,7 +457,9 @@ function compileValues(
 ): Compiled {
   const bucketMs = Math.max(1, Math.trunc(request.bucketMs ?? 0));
   const bucketed = (request.bucketMs ?? 0) > 0;
-  const perSpecLimit = rowLimit(request) + 1;
+  // Exact, unlike the range path's limit: nothing reports a truncated series,
+  // so a row over the ceiling would only be a row over the ceiling.
+  const branchLimit = perSpecLimit(request);
 
   const branches = request.specs.map((spec, index) => {
     const filters = [`path = $p${index}`];
@@ -477,7 +479,7 @@ function compileValues(
       return (
         `(SELECT ${index} AS spec, ts AS bucket, value_num AS num, ` +
         `value_str AS str, value_kind AS kind, ${position} AS pos ` +
-        `FROM src WHERE ${where} ORDER BY ts LIMIT ${perSpecLimit})`
+        `FROM src WHERE ${where} ORDER BY ts LIMIT ${branchLimit})`
       );
     }
     // `first` and `last` are `arg_min`/`arg_max` over `ts`, because DuckDB's
@@ -544,9 +546,26 @@ function seam(
   return ` AND (rowid > $maxRowid OR NOT (${days}))`;
 }
 
+/** The cap on what one answer returns, whatever it is made of. */
 function rowLimit(request: QueryRequest): number {
   if (request.kind !== "range") return DEFAULT_ROW_LIMIT;
-  const asked = request.limit;
+  return clampLimit(request.limit);
+}
+
+/**
+ * The cap on what one raw branch returns.
+ *
+ * Separate from `rowLimit`, and deliberately: that one bounds the answer, and
+ * this one bounds a series inside it. A values request sends the ceiling its
+ * caller reduces a raw series under, which is smaller than the answer's — and
+ * applying it to the answer instead would drop whole trailing series rather
+ * than shortening each, because the rows arrive ordered by bucket and spec.
+ */
+function perSpecLimit(request: Extract<QueryRequest, { kind: "values" }>) {
+  return clampLimit(request.limit);
+}
+
+function clampLimit(asked: number | undefined): number {
   if (asked === undefined) return DEFAULT_ROW_LIMIT;
   return Math.max(1, Math.min(Math.floor(asked), DEFAULT_ROW_LIMIT));
 }

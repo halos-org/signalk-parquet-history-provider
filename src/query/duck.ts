@@ -100,6 +100,11 @@ export type QueryRequest =
       specs: ValueSpec[];
       /** Bucket width in milliseconds. Absent means every spec is raw. */
       bucketMs?: number;
+      /**
+       * Rows a raw branch returns. Per series rather than per answer: a
+       * bucketed branch is already bounded by the bucket count, and it is the
+       * raw ones the caller reduces in its own heap.
+       */
       limit?: number;
     }
   | {

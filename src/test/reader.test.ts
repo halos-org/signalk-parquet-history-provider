@@ -586,6 +586,59 @@ describe("a values query", { skip: NO_BUNDLED_EXTENSION }, () => {
       /is not an aggregate/,
     );
   });
+
+  it("holds a raw series to the ceiling the caller sent", async () => {
+    // The caller reduces a raw series in the Signal K process, so its limit is
+    // the budget for that. It used to be discarded, and every raw branch
+    // returned the whole-answer default instead.
+    for (let i = 0; i < 6; i += 1) {
+      record(sample({ ts: AUG_23 + i * 1000, path: "a.b", value: i }));
+    }
+
+    const result = await runner.run(
+      values({
+        specs: [{ path: "a.b", aggregate: "raw" }],
+        limit: 3,
+      }),
+    );
+
+    assert.deepEqual(
+      result.rows.map((row) => row[2]),
+      [0, 1, 2],
+    );
+  });
+
+  it("holds each series to that ceiling rather than the answer to it", async () => {
+    // The rows arrive ordered by bucket and then by spec, so a ceiling applied
+    // to the answer would drop the trailing series outright instead of
+    // shortening each of them.
+    for (let i = 0; i < 4; i += 1) {
+      record(
+        sample({ ts: AUG_23 + i * 1000, path: "a.b", value: i }),
+        sample({ ts: AUG_23 + i * 1000, path: "c.d", value: 10 + i }),
+      );
+    }
+
+    const result = await runner.run(
+      values({
+        specs: [
+          { path: "a.b", aggregate: "raw" },
+          { path: "c.d", aggregate: "raw" },
+        ],
+        limit: 2,
+      }),
+    );
+
+    assert.deepEqual(
+      result.rows.map((row) => [row[0], row[2]]),
+      [
+        [0, 0],
+        [1, 10],
+        [0, 1],
+        [1, 11],
+      ],
+    );
+  });
 });
 
 describe("the tree's file selection", () => {
