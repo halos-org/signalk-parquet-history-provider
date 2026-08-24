@@ -49,23 +49,6 @@ describe("measuring a process that does not stay still", () => {
     }
   });
 
-  it("gives the subject its input and closes the pipe", async () => {
-    // The query process takes its request on stdin and reads to end-of-input,
-    // so a pipe left open would make it hang rather than answer.
-    const result = await measureOneShot({
-      command: process.execPath,
-      args: [
-        "-e",
-        `let text = ""; process.stdin.on("data", (c) => (text += c));` +
-          `process.stdin.on("end", () => console.log(text.trim().toUpperCase()))`,
-      ],
-      stdin: "a request\n",
-    });
-
-    assert.equal(result.exitCode, 0);
-    assert.equal(result.stdout.trim(), "A REQUEST");
-  });
-
   it("reports a failure rather than throwing", async () => {
     const result = await measureOneShot({
       command: process.execPath,

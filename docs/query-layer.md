@@ -8,19 +8,22 @@ both belong to is
 
 ## The shape
 
-One HTTP request compiles to one statement in one spawned process. The process
-exits, which is what keeps ~120 MB of engine from becoming a standing cost
-inside the Signal K server, and it is also what sets the floor below.
+One query service, started on the first history request and kept until the
+plugin stops. It answers one request at a time; the plugin queues the rest.
 
-The statement unions the tree files whose date directory intersects the range
-with the unrolled remainder of the hot store. Nothing prunes on `path`: the
-tree carries time as directories and everything else as columns, so a range is
-a directory selection plus a `ts` filter.
+It is a separate process because `@duckdb/node-api` maps a ~100 MB native addon
+and DuckDB does not return what a query allocates — neither belongs in the
+process serving the vessel's data. It stays alive because starting it costs
+more than answering anything.
 
-## The floor
+One request compiles to one statement: the tree files whose date directory
+intersects the range, unioned with the unrolled remainder of the hot store.
+Nothing prunes on `path` — the tree carries time as directories and everything
+else as columns — so a range is a directory selection plus a `ts` filter.
 
-Every spawned query pays this before it reads a row. Three runs each, on a
-HALPI2 (4 GB, aarch64, DuckDB 1.5.5, Node 22.23.2):
+## The floor, paid once
+
+Three runs each, on a HALPI2 (4 GB, aarch64, DuckDB 1.5.5, Node 22.23.2):
 
 | up to and including         | ms            |
 | --------------------------- | ------------- |
@@ -28,56 +31,130 @@ HALPI2 (4 GB, aarch64, DuckDB 1.5.5, Node 22.23.2):
 | `import @duckdb/node-api`   | 251, 255, 218 |
 | instance created, connected | 265, 266, 269 |
 | `LOAD sqlite_scanner`       | 375, 353, 336 |
-| `ATTACH` the hot store      | 374, 384, 341 |
 
-**Mapping the engine's native addon is ~220 ms of it.** Nothing in this design
-can avoid that: the addon is why the query runs in its own process, and the
-process is why the memory is transient. Loading `sqlite_scanner` is another
-~80 ms, which is why the reader loads it only when there is a hot store to
-attach — a range old enough to sit entirely in the tree needs no SQLite.
+**Mapping the engine's native addon is ~220 ms of it**, and nothing in this
+design avoids that. Loading the extension is another ~80 ms. Together they are
+why the service exists: a process per query paid all of it before every
+request, and an ordinary request costs less than that to answer.
 
-So the floor is **~265 ms for a tree-only query and ~345 ms when the hot store
-is in range**, on this device, before any work.
+The hot store is attached per query rather than at startup, which costs
+0.2–1.2 ms against the live hot store and buys two things — a store that did
+not exist when the service started is picked up, and no SQLite handle is held
+between queries. Neither was strictly necessary: measured across processes, a
+held attachment still sees rows written after it, and the writer's
+`wal_checkpoint(TRUNCATE)` still truncates to zero with `busy: 0` while it is
+held. Nor does it slow the statement that follows: alternating five held-attach
+runs with five per-query-attach runs, twice, gives 104–137 ms either way. It is
+a millisecond for one less thing to reason about.
 
-## What a query costs on top
+## What a query costs
 
-Against the live data directory: 8 roll files under one date, and a hot store
-holding about half an hour. Wall clock is spawn to answer — the figure a
-request actually pays. `engine` is the query process's own timing, which
-excludes its own startup and is reported only so the difference stays visible.
+Against the live data directory — 23 roll files across two dates, and a hot
+store file of 271 MB — driven through `./run bench query`, which uses the same
+client the plugin does. Wall clock is request to answer.
 
-| query                         | wall (ms)   | engine (ms) | rows    | peak (MB) |
-| ----------------------------- | ----------- | ----------- | ------- | --------- |
-| one path, one day, tree + hot | 610–612     | 348–350     | 3,745   | 126–127   |
-| one path, last hour           | 526–684     | 262–427     | 1,623   | 118–119   |
-| every path, last 10 minutes   | 1,548–1,665 | 1,233–1,309 | ~82,000 | 218–221   |
-| paths in the day              | 448–486     | 190–224     | 519     | 112–114   |
-| contexts in the day           | 447–516     | 155–218     | 1       | 110–111   |
-| a range with no data          | 464–506     | 201–225     | 0       | 102–104   |
+| query                       | first request | later requests | rows   |
+| --------------------------- | ------------- | -------------- | ------ |
+| paths in the day            | 499 ms        | 93–101 ms      | 524    |
+| one path, last hour         | 548 ms        | 127–174 ms     | 1,664  |
+| one path, one day           | 736 ms        | 353–408 ms     | 12,849 |
+| every path, last 10 minutes | 1,647 ms      | 1,226–1,289 ms | 81,381 |
 
-**The plan's query criterion is not met, and cannot be by this shape.** It asks
-for a single-path range "within sqhp's range (~34 ms for an hour-long
-request)". The measured answer is 526–684 ms, of which ~345 ms is the floor
-above. The 16–37 ms in `docs/layout-decision.md` was in-engine time for a
-statement inside an already-running process. A history
-provider that spawns per query answers in half a second; one that talks to a
-running server answers in tens of milliseconds. That is the trade the design
-makes for not having a database server resident, and it is now a measurement
-rather than an estimate.
+**These figures move with how much data the device holds**, which is why they
+are dated rather than fixed: the same shapes measured a day earlier, against a
+tree of 10 files and half as many rows in the day, ran roughly twice as fast.
+Compare them against each other, not against a run from another day.
 
-Nothing here changes the memory case: an idle QuestDB is ~366 MB standing,
-while this is 0 MB standing and ~120 MB for as long as a query runs.
+## Where the time goes
+
+In-process and end-to-end for the same request, **alternated inside one run**,
+because the device keeps recording and rolling: two tables taken minutes apart
+describe two datasets, and subtracting one from the other measures the clock as
+much as the code. `plan` is `planSources` plus the `ATTACH`, `sql` is the
+statement, `shape` is `getRowsJS`, the BigInt pass and the `DETACH`. Medians of
+four pairs.
+
+| query               | rows   | plan | sql | shape | in-process | end-to-end | difference |
+| ------------------- | ------ | ---- | --- | ----- | ---------- | ---------- | ---------- |
+| paths in the day    | 524    | 2.4  | 158 | 4     | 168 ms     | 164 ms     | −4 ms      |
+| one path, last hour | 1,655  | 4.4  | 174 | 17    | 192 ms     | 219 ms     | +27 ms     |
+| one path, one day   | 12,849 | 1.6  | 295 | 126   | 415 ms     | 482 ms     | +67 ms     |
+| every path, 10 min  | 81,455 | 2.0  | 240 | 771   | 1,017 ms   | 1,227 ms   | +209 ms    |
+
+These totals run higher than the table above them because they were taken later
+against more data, and because two engines share the process while the pair is
+being measured. Read the columns against each other, not against another run.
+
+**The difference between the two columns is the pipe and the plugin's own
+handling.** It grows with the size of the answer and stays a small share of the
+whole: at most a sixth of what a request takes, and inside the noise for the
+smallest one.
+
+**A small answer is its statement; a large one is its rows.** `plan` never
+exceeds 5 ms. For a recent range the statement is dominated by the full scan of
+the hot store through `sqlite_scanner`, which `docs/layout-decision.md`
+measured at ~1.9 ms per MB and predicted would put an hourly store's
+recent-query floor near 100 ms. The lever on that is the roll interval, which
+is the hot store's ceiling — not the process model, and not the transport.
+
+## What this is not comparable to
+
+The plan's criterion asks for a query "within sqhp's range (~34 ms for an
+hour-long request)". **Nothing here is a like-for-like against that**, and the
+numbers above should not be read as one:
+
+- Those sqhp figures are Signal K history API requests for **one hour at
+  60-second resolution** — about 60 rows, aggregated inside QuestDB before
+  anything crosses its HTTP connection. Every figure here is a raw range, and
+  this provider returns raw rows.
+- They are measured through the server's HTTP API; these are measured at the
+  plugin's client boundary, with no HTTP layer.
+- The archived sqhp measurements on this hardware span 14.2, 18.8, 27 and
+  38.8 ms across four runs, moving with QuestDB's tuning. `~34 ms` is a point
+  inside that spread rather than a measured constant.
+
+**The cost of an aggregated answer is unmeasured.** No query of that shape has
+been run here, and nothing in the table above stands in for one.
+
+Nothing here changes the memory case the design was chosen for: QuestDB's
+standing cost is ~366 MB.
+
+## What the service holds
+
+It reports its own resident size with every answer, because a process that
+stays is judged on what it holds as well as on what it takes.
+
+| after                                     | service RSS |
+| ----------------------------------------- | ----------- |
+| started, nothing asked                    | 92 MB       |
+| one single-path hour                      | 117 MB      |
+| fifteen of them                           | 164 MB      |
+| forty of them                             | 170 MB      |
+| one all-paths ten-minute query (82k rows) | 317 MB      |
+
+So repeated work converges rather than leaking — 117 to 164 MB over fifteen
+queries, then 6 MB over the next twenty-five. What it does not do is come back
+down: the service settles at the high-water mark of the largest shape it has
+been asked for. With the writer at 87 MB, a service that has answered a few
+queries puts the plugin's standing cost near 260 MB, against the 150 MB this
+project set itself and QuestDB's ~366 MB.
+
+Bounding that is
+[halos-org/halos#178](https://github.com/halos-org/halos/issues/178): recycle
+the service on an idle timeout, an RSS ceiling, or both. Until then it is one
+process for the life of the plugin, and this is what that costs.
 
 ## The layout decision, re-checked
 
 `docs/layout-decision.md` chose one file per roll, no path partitioning and no
-compaction, and named what would reopen it: a multi-day query dominated by per-file cost
-rather than by startup.
+compaction, and named what would reopen it: a multi-day query dominated by
+per-file cost rather than by startup.
 
 Both trees below are one day of real data hard-linked into 30 dated
 directories, with no hot store. The rows therefore repeat, and a 30-day range
-returns 30× the rows — so these numbers overstate the row cost of a real
-30-day window and measure the file cost honestly.
+returns 30× the rows — so these numbers overstate the row cost of a real 30-day
+window and measure the file cost honestly. Each figure includes one engine
+start: they were taken before the service existed, with a process per query.
 
 | tree                   | files | one path, 30 days           | paths, 30 days      | one path, one day |
 | ---------------------- | ----- | --------------------------- | ------------------- | ----------------- |
@@ -92,8 +169,8 @@ there at 344–484 MB — the largest transient in the design — to save 230 ms
 query nobody has to make.
 
 **A date-scoped query does not care how large the tree is.** 1 file, 8 files
-and 240 files all answer a one-day single-path range in 360–444 ms. That is
-the property the layout was chosen for, and it is the reason a long-range query
+and 240 files all answer a one-day single-path range in 360–444 ms. That is the
+property the layout was chosen for, and it is the reason a long-range query
 stays avoidable rather than fast.
 
 So the decision stands: no compaction pass, no path partitioning. What would
@@ -102,10 +179,9 @@ same per-file slope predicts ~720 ms of planning. That is worth re-measuring
 once a device has one, and it is not worth pre-emptively engineering for.
 
 `getPaths` is a scan rather than a directory listing, and the flat layout is
-why. It costs 448–486 ms over a day and 601–727 ms over thirty. The cumulative
-sidecar could answer "every path ever" from one 11 kB file, but not "every path
-with data in this range", which is what the history API asks. Nothing reads
-the sidecar.
+why. The cumulative sidecar could answer "every path ever" from one 11 kB file,
+but not "every path with data in this range", which is what the history API
+asks. Nothing reads the sidecar.
 
 ## The seam
 
@@ -128,38 +204,36 @@ sibling provider's QuestDB tables do by dedup key but this store does not.
 
 ## Concurrency, and what can overlap
 
-Two query processes may run at once; a third waits, and past eight waiting the
-answer is a refusal rather than a queue. The deadline for one request is 30
-seconds and covers the wait as well as the work, so a request that spent it all
-queued is failed rather than spawned into a socket nobody is reading.
+The service answers one request at a time: two queries on one connection would
+interleave their rows on one pipe, and at the time one request takes, a queue
+is a better answer than a second engine. Eight may wait; past that a request is refused
+rather than queued behind requests that will not be served in time either. The
+deadline is 30 seconds and covers the wait as well as the work.
+
+A query that overruns it costs the service — the engine cannot be interrupted
+from the plugin's side — and the next request starts a new one. A query that
+_fails_ costs only the request; the engine is worth more than one answer.
 
 **Nothing coordinates a query with a roll.** The roll runs on the writer's
 schedule and a query arrives when a client asks, so the worst case is the sum
-of separately measured peaks:
+of peaks measured apart: a service that has served a large query at ~320 MB and
+a roll at 163 MB, so under 500 MB. That fits a 4 GB device running the marine
+stack, which is why nothing admission-controls the two against each other.
 
-| at once               | MB   |
-| --------------------- | ---- |
-| two queries at 220 MB | 440  |
-| a roll, on this data  | 163  |
-| **summed transient**  | ~600 |
-
-That is a sum of peaks measured apart, not a measured combination. It fits a
-4 GB device running the marine stack, which is why nothing admission-controls
-the two against each other. A device where it does not fit wants a lower query
-cap before it wants a scheduler.
-
-The 220 MB is an answer of ~82,000 rows; a single-path range is 118–127 MB. A
-query returns at most 100,000 rows and says so when it truncated, because the
+A query returns at most 100,000 rows and says so when it truncated, because the
 Signal K process holds the whole answer to serialise it — the row limit is a
-ceiling on _that_ process, not on this one.
+ceiling on that process, not on this one.
 
 ## What this does not measure
 
 - **Aggregation.** The reader returns raw rows. Bucketed aggregates belong to
   the v2 surface, and nothing here prices them.
-- **A concurrent roll and query.** The summed transient above is arithmetic.
+- **A concurrent roll and query.** The figure above is arithmetic.
 - **A tree with a real retention window in it.** Both aged trees are one day of
   data wearing thirty dates.
+- **A service across days rather than minutes.** The plateau above is forty
+  queries of one shape; what a week of mixed use settles at is
+  [#178](https://github.com/halos-org/halos/issues/178)'s to answer.
 - **A file deleted while a query reads it.** The file list is taken before the
   statement runs, so whatever ships expiry has to decide what a reader already
   holding a list should see.

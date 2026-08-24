@@ -35,8 +35,8 @@ implementing it.
 **The Signal K process does path filtering, rate capping and a socket write,
 and no storage work whatsoever.** Everything else runs in its own process: the
 writer owns the SQLite hot store, the roll is short-lived because DuckDB's
-allocator does not return memory in-process, and each query is a spawned
-DuckDB that exits.
+allocator does not return memory in-process, and queries are answered by a
+service process that holds the engine so the server never has to.
 
 So `src/index.ts` and everything it imports must never reach
 `@duckdb/node-api` — nor `node:sqlite`, which is a native module and would
@@ -98,10 +98,10 @@ a check on module evaluation alone.
   reachable from `src/index.ts` or from `src/writer/`, both of which run for as
   long as recording does.
 - `src/query/` — reading. `duck.ts` is the side that runs inside the Signal K
-  process: it spawns, caps concurrency and enforces the deadline, and it
-  imports no engine. `main.ts` is the spawned process, `reader.ts` the work it
-  does — file selection, the seam, and one statement. Like the roll, the
-  engine may be here because the process exits.
+  process: it starts the query service, queues requests, enforces the deadline
+  and restarts what dies, and it imports no engine. `main.ts` is the service —
+  one process, many requests — and `reader.ts` the work it does: file
+  selection, the seam, and one statement per request.
 - `src/durable-write.ts` — fsync, rename, fsync the directory. Shared so the
   order exists once.
 
@@ -113,9 +113,10 @@ a check on module evaluation alone.
   or the reader; the measurements behind each choice are in it, and so is what
   would reopen one.
 - `docs/query-layer.md` — what a query costs, measured through the shipped
-  reader: the ~345 ms floor a spawned process pays before reading a row, the
-  layout decision re-checked against it, and what may overlap with what. Read
-  it before changing anything about how a query is executed.
+  reader: the 336–375 ms an engine takes to start, what a warm query costs
+  against it, what the service holds while it waits, and the layout decision
+  re-checked against all three. Read it before changing anything about how a
+  query is executed.
 
 ## The writer
 
@@ -194,27 +195,46 @@ leaving something a `*.parquet` glob reads as finished.
 
 ## The query
 
-One process per request, spawned by the plugin, and it exits with the answer.
-**One request compiles to one statement**: the sibling provider issues a query
-per pathSpec, which is free against a running server and costs a whole process
-start here — measured at ~265 ms before a row is read, and ~345 ms when the
-hot store has to be attached.
+**One service, not one process per query.** The plugin starts `query/main.js`
+on the first history request and keeps it. Starting an engine costs 336–375 ms
+on the device — ~220 ms of it mapping the addon — which is more than an
+ordinary request costs to answer, so a process per query spent more on starting
+than on working.
 
-Two may run at once and eight may wait; past that a request is refused rather
-than queued behind requests that will not be served in time either. The
-deadline covers the wait as well as the work.
+What that costs is memory the service does not give back: 92 MB idle, ~165 MB
+after a dozen ordinary queries, and the high-water mark of the largest shape it
+has served (317 MB after an 82,000-row answer). It converges rather than
+leaking, and bounding it is
+[halos-org/halos#178](https://github.com/halos-org/halos/issues/178). Do not
+add a second concurrent engine without reading that issue.
+
+**One request compiles to one statement.** The sibling provider issues a query
+per pathSpec, which is free against a running server and is not free here.
+
+The service answers one request at a time; eight may queue and the rest are
+refused. A query that fails costs the request — the engine is worth more than
+one answer — and a query that overruns its deadline costs the service, because
+the engine cannot be interrupted from the plugin's side.
 
 A query subtracts the rows a completed roll has put in the tree and the writer
 has not yet deleted, rather than deduplicating the answer. It lists the tree's
 files first and the pending-roll record second, and excludes only the days
 whose file for that roll is on disk — the order is what keeps the race from
-turning a duplicate into a gap. `docs/query-layer.md` has the reasoning and
-the numbers.
+turning a duplicate into a gap.
 
-The engine is confined before the statement runs: `lockDownFileAccess` sets
+The hot store is attached per request (0.2–1.2 ms) rather than held. Holding it
+also works — a held attachment sees rows written after it, and the writer can
+still truncate its WAL underneath it, both measured across processes — but
+attaching per request also picks up a store that did not exist when the service
+started.
+
+The engine is confined before any statement runs: `lockDownFileAccess` sets
 `allowed_directories` to the data directory, turns external access off — which
 is what makes the allowlist mean anything, and was not obvious — and locks the
-configuration. Everything legitimate must be loaded and attached first.
+configuration. Everything else must be loaded first; attaching inside the
+allowed directory still works afterwards.
+
+`docs/query-layer.md` has the measurements behind every number here.
 
 ## Conventions
 
