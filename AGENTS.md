@@ -102,6 +102,11 @@ a check on module evaluation alone.
   and restarts what dies, and it imports no engine. `main.ts` is the service —
   one process, many requests — and `reader.ts` the work it does: file
   selection, the seam, and one statement per request.
+- `src/history-v2.ts` — the history v2 REST surface, registered by the plugin.
+  Mostly contract behaviour copied from
+  `signalk-questdb-history-provider/src/history-v2.ts` — the moving averages,
+  the context normalisation, the timestamp union and the column assembly —
+  with only the query construction rewritten. Fix contract bugs in both.
 - `src/durable-write.ts` — fsync, rename, fsync the directory. Shared so the
   order exists once.
 
@@ -235,6 +240,31 @@ configuration. Everything else must be loaded first; attaching inside the
 allowed directory still works afterwards.
 
 `docs/query-layer.md` has the measurements behind every number here.
+
+## The history surface
+
+The plugin registers the v2 provider on start and gives it back on stop, before
+the writer is asked to close the store — a query holds a read on it. A server
+with no registry gets recording and a debug line, because recording is the half
+with no alternative.
+
+**A request is buckets, and this side lays them out.** The sibling provider
+fabricates a row per bucket inside QuestDB with `FILL(NULL)`, because it issues
+one query per pathSpec and needs the timestamps to line up. Here one statement
+answers every series and the matrix is assembled here anyway, so the engine
+returns only buckets that hold something and the gaps are filled during
+assembly. Same response, without fabricated rows crossing a pipe. The timeline
+spans the data rather than the request, which is what `FILL(NULL)` does.
+
+A million buckets per request is the ceiling, counted as buckets × series
+before anything is queried. Resolutions clamp up to one second, as they do in
+the sibling — this storage could serve 0.5 s and deliberately does not, because
+two providers rendering the same chart is what the surface is judged on.
+
+`average` over a `units: rad` path is an arithmetic mean, so 359° and 1° average
+to 180°. That is wrong, it is wrong in the same way in the sibling provider, and
+fixing it needs server metadata the query service does not have. It belongs with
+the resolution ladder (#173), where that metadata has to arrive anyway.
 
 ## Conventions
 
