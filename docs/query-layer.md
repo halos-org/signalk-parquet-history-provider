@@ -86,10 +86,9 @@ against more data, and because two engines share the process while the pair is
 being measured. Read the columns against each other, not against another run.
 
 **The difference between the two columns is the pipe and the plugin's own
-handling**, and it is 80–85% of nothing: −4, +27, +67 and +209 ms against
-totals of 164 to 1,227. It does not reduce to a rate — 16.2, 5.2 and 2.6 µs per
-row for the three largest answers — so it has a small fixed part lost in noise
-and a per-row part that only becomes visible in the tens of thousands.
+handling.** It grows with the size of the answer and stays a small share of the
+whole: at most a sixth of what a request takes, and inside the noise for the
+smallest one.
 
 **A small answer is its statement; a large one is its rows.** `plan` never
 exceeds 5 ms. For a recent range the statement is dominated by the full scan of
@@ -114,10 +113,8 @@ numbers above should not be read as one:
   38.8 ms across four runs, moving with QuestDB's tuning. `~34 ms` is a point
   inside that spread rather than a measured constant.
 
-**The cost of an aggregated answer is unmeasured.** What the split above
-supports is only that 60 rows carry no shaping or transport cost worth
-counting, so such an answer would be close to its own statement — and no
-statement of that shape has been run here.
+**The cost of an aggregated answer is unmeasured.** No query of that shape has
+been run here, and nothing in the table above stands in for one.
 
 Nothing here changes the memory case the design was chosen for: QuestDB's
 standing cost is ~366 MB.
