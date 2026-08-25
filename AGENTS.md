@@ -102,6 +102,18 @@ a check on module evaluation alone.
   and restarts what dies, and it imports no engine. `main.ts` is the service —
   one process, many requests — and `reader.ts` the work it does: file
   selection, the seam, and one statement per request.
+- `src/history-v1.ts` — the history v1 WebSocket surface: `hasAnyData`,
+  `streamHistory` and `getHistory`, all three registered by the plugin. The
+  chunk/resume machine and the delta grouping are copied from
+  `signalk-questdb-history-provider/src/history-v1.ts`; the queries are not.
+  Fix contract bugs in both. It **differs** from the sibling by three: the own
+  vessel's context is resolved in `getHistory` as well as in `streamHistory`
+  ([#32](https://github.com/halos-org/signalk-questdb-history-provider/issues/32)),
+  a `playbackRate` that is not a number falls back to real time instead of
+  replaying every window with no delay
+  ([#33](https://github.com/halos-org/signalk-questdb-history-provider/issues/33)),
+  and a window that has not happened yet is not read
+  ([#34](https://github.com/halos-org/signalk-questdb-history-provider/issues/34)).
 - `src/history-v2.ts` — the history v2 REST surface, registered by the plugin.
   Mostly contract behaviour copied from
   `signalk-questdb-history-provider/src/history-v2.ts` — the moving averages,
@@ -243,6 +255,15 @@ allowed directory still works afterwards.
 
 ## The history surface
 
+Two of them, registered separately because the server's two registries arrived
+in different releases: a server carrying one and not the other serves the half
+it has. **The v1 registry is a single global slot** —
+`signalk-server/src/index.ts:316`, last registration wins — so two history
+plugins on one device silently pick a winner. Gating registration on the
+configured provider is
+[halos-org/halos#168](https://github.com/halos-org/halos/issues/168); running
+two of them together is unsupported either way.
+
 The plugin registers the v2 provider on start and does not unregister it: the
 server's plugin wrapper queues that when the provider is registered and runs it
 before `stop()` is entered, so the provider is gone before the plugin stops the
@@ -267,6 +288,44 @@ two providers rendering the same chart is what the surface is judged on.
 to 180°. That is wrong, it is wrong in the same way in the sibling provider, and
 fixing it needs server metadata the query service does not have. It belongs with
 the resolution ladder (#173), where that metadata has to arrive anyway.
+
+**The snapshot is the one question this storage has no index for.** "Every
+path's last value at T" is a backward scan whose depth is the retention window
+rather than the request, because a path that stopped reporting days before T
+still has a last value — QuestDB answers it from an index and the sibling
+provider still records that timing out past 30 seconds on a real install. Here
+the sidecar answers it instead: it holds one row per `(context, path)`, so any
+key whose newest rolled row is at or before T is resolved exactly, however long
+ago that row was written. **A snapshot of the present therefore reads the
+sidecar and the hot store and no tree file at all.** Only a key the sidecar has
+already moved past needs the tree, and that read is bounded to
+`SNAPSHOT_SCAN_DAYS` date directories ending at T's own — a path whose last row
+before T is older than that is absent from the snapshot rather than searched
+for. `query/reader.ts` states the rule; changing the bound changes what a
+historical snapshot holds.
+
+`getHistory` returns one row per `(context, path)` and not per source, and it
+labels the own vessel `vessels.<id>` rather than the `self` the store spells.
+That second part is not cosmetic: the snapshot route maps `self` in the URL to
+the vessel's id _before_ walking the tree it builds from these deltas, so a
+delta labelled `self` builds a tree the route cannot find. The sibling provider
+does not do this, which is
+[signalk-questdb-history-provider#32](https://github.com/halos-org/signalk-questdb-history-provider/issues/32).
+
+**Playback runs on the query service like everything else.** A session reads a
+60-second window per chunk and holds no engine between them, so the queue can
+only be as deep as there are clients — one outstanding request each, by
+construction. **A window that has not happened yet is not read at all.** An
+empty window advances the cursor, so without that rule a replay which catches
+up with real time reads one future window every 100 ms, for ever, against the
+service every other history request shares. The sibling provider does exactly
+that, which is
+[signalk-questdb-history-provider#34](https://github.com/halos-org/signalk-questdb-history-provider/issues/34). Nothing caps the number of sessions: past `MAX_QUEUED_QUERIES` a
+request is refused, which reaches a session as an error and becomes the same
+backoff as any other failure, and the v1 interface gives a provider no channel
+to refuse a session on. A cap enforced through `hasAnyData` would tell the
+client its vessel has no history, which is what that answer means to
+`interfaces/ws.ts`.
 
 ## Conventions
 

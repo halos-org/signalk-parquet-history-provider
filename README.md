@@ -14,11 +14,14 @@ anyone queries it.
 
 ## Status
 
-The plugin records and rolls: it filters, rate-caps and buffers, a separate
-writer process owns a SQLite hot store, and that writer rolls the store into a
-Parquet tree on a schedule and truncates it. The query layer and the two
-history API surfaces do not exist yet, so nothing reads this data back.
-Progress is tracked in
+The plugin records, rolls and answers. It filters, rate-caps and buffers; a
+separate writer process owns a SQLite hot store and rolls it into a Parquet tree
+on a schedule; and a query service holds one DuckDB engine that serves both
+history API surfaces — the v2 REST API, and v1 playback and snapshots — reading
+the tree and the hot store as one.
+
+Retention, the resolution ladder, packaging and on-device verification are still
+open. Progress is tracked in
 [halos-org/halos#152](https://github.com/halos-org/halos/issues/152).
 
 ## The tree

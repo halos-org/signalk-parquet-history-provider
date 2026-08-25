@@ -22,6 +22,7 @@ function stubApp(dataDirPath: string) {
     busValues: [] as ((value: BusValue) => void)[],
     unsubscribed: 0,
     registered: [] as unknown[],
+    registeredV1: [] as unknown[],
   };
   return {
     calls,
@@ -34,6 +35,8 @@ function stubApp(dataDirPath: string) {
       selfContext: "vessels.self",
       registerHistoryApiProvider: (provider: unknown) =>
         calls.registered.push(provider),
+      registerHistoryProvider: (provider: unknown) =>
+        calls.registeredV1.push(provider),
       streambundle: {
         getBus: () => ({
           onValue: (fn: (value: BusValue) => void) => {
@@ -137,25 +140,38 @@ describe("the plugin", () => {
     }
   });
 
-  it("registers the history surface", async () => {
+  it("registers both history surfaces", async () => {
     const work = mkdtempSync(join(tmpdir(), "sk-parquet-history-"));
     const { app, calls } = stubApp(work);
     const plugin = createPlugin(app);
     try {
       plugin.start({});
 
-      assert.equal(calls.registered.length, 1, "no provider was registered");
-      const provider = calls.registered[0] as Record<string, unknown>;
+      assert.equal(calls.registered.length, 1, "no v2 provider was registered");
+      const v2 = calls.registered[0] as Record<string, unknown>;
       for (const method of ["getValues", "getPaths", "getContexts"]) {
         assert.equal(
-          typeof provider[method],
+          typeof v2[method],
           "function",
-          `the registered provider has no ${method}`,
+          `the registered v2 provider has no ${method}`,
         );
       }
 
-      // Nothing unregisters here: the server queues that itself when the
-      // provider is registered, and runs it before `stop()` is entered.
+      assert.equal(calls.registeredV1.length, 1, "no v1 provider registered");
+      const v1 = calls.registeredV1[0] as Record<string, unknown>;
+      // All three, not just playback: the snapshot route calls `getHistory` and
+      // the WebSocket handler calls `hasAnyData` before it offers playback at
+      // all.
+      for (const method of ["hasAnyData", "streamHistory", "getHistory"]) {
+        assert.equal(
+          typeof v1[method],
+          "function",
+          `the registered v1 provider has no ${method}`,
+        );
+      }
+
+      // Nothing unregisters here: the server queues that itself when a provider
+      // is registered, and runs it before `stop()` is entered.
       await plugin.stop();
     } finally {
       rmSync(work, { recursive: true, force: true });
@@ -170,11 +186,32 @@ describe("the plugin", () => {
     const { app, calls } = stubApp(work);
     const older = { ...app } as Record<string, unknown>;
     delete older.registerHistoryApiProvider;
+    delete older.registerHistoryProvider;
     const plugin = createPlugin(older as typeof app);
     try {
       plugin.start({});
       assert.deepEqual(calls.errors, []);
       assert.equal(calls.busValues.length, 1, "the plugin did not subscribe");
+      await plugin.stop();
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it("registers the surface a server does have", async () => {
+    // The two registries arrived in different server releases, so they are
+    // asked for separately: half a history API is what such a server can serve,
+    // and it is better than none.
+    const work = mkdtempSync(join(tmpdir(), "sk-parquet-v2only-"));
+    const { app, calls } = stubApp(work);
+    const older = { ...app } as Record<string, unknown>;
+    delete older.registerHistoryProvider;
+    const plugin = createPlugin(older as typeof app);
+    try {
+      plugin.start({});
+      assert.deepEqual(calls.errors, []);
+      assert.equal(calls.registered.length, 1, "the v2 surface was lost too");
+      assert.equal(calls.registeredV1.length, 0);
       await plugin.stop();
     } finally {
       rmSync(work, { recursive: true, force: true });

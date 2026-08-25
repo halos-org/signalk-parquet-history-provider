@@ -183,6 +183,50 @@ why. The cumulative sidecar could answer "every path ever" from one 11 kB file,
 but not "every path with data in this range", which is what the history API
 asks. Nothing reads the sidecar.
 
+## The snapshot
+
+Every other query names a time range, and the tree's directories are cut on
+time — so a range is a directory selection and a `ts` filter, and the numbers
+above are what that costs. The v1 snapshot API asks a different question:
+**every path's last value at an instant**. Nothing in this layout answers that
+by pruning, because a path that stopped reporting a week before T still has a
+last value, so the honest form of the question is a backward scan whose depth is
+the retention window rather than the request.
+
+The sidecar is what makes it affordable. It holds one row per
+`(context, path)` — the newest that has ever been rolled — so a key whose
+sidecar row is at or before T is answered by that row exactly, however long ago
+it was written. Only a key the sidecar has already moved past needs anything
+else, and one statement over the sidecar tells the reader whether any such key
+exists before it opens a file:
+
+| snapshot of                         | reads                                 |
+| ----------------------------------- | ------------------------------------- |
+| the present                         | the sidecar and the hot store         |
+| an instant the tree has rolled past | those, plus `SNAPSHOT_SCAN_DAYS` days |
+
+The second row is the bounded case, and the bound is the rule the API answers
+under: date directories ending at T's own, newest data first, and a path whose
+last row before T is older than that window is **absent from the snapshot**
+rather than searched for. Two days is the shipped value — a day resolves every
+path still reporting at T, and the day before it resolves one that went quiet
+overnight. It is a constant in `query/reader.ts` rather than a setting, because
+changing it changes what a historical snapshot holds and not just what it costs.
+
+Both branches reduce with one `arg_max` over a struct, grouped by
+`(context, path)`: a hash aggregate over the key count — hundreds of groups,
+whatever the row count — where `DISTINCT ON` would sort the input. One row per
+key and not per source, which is what the sibling provider's
+`LATEST ON ts PARTITION BY path, context` returns and what the tree the server
+assembles from it can hold.
+
+**Neither branch is measured on the device.** The unbounded case is arithmetic
+from the figures above — a bounded snapshot reads whole days, and a day of this
+device's data is the 12,849-row shape's tree files without its `ts` filter —
+and nothing here stands in for a measurement. What the sibling provider records
+for the same request is a `LATEST ON` over an index that still timed out past
+30 seconds on a real install.
+
 ## The seam
 
 A roll writes its rows to Parquet, and the writer deletes them from the hot
@@ -214,6 +258,17 @@ A query that overruns it costs the service — the engine cannot be interrupted
 from the plugin's side — and the next request starts a new one. A query that
 _fails_ costs only the request; the engine is worth more than one answer.
 
+**A playback session is a client of the same queue, not a process of its own.**
+It reads a 60-second window per chunk and holds no engine between chunks, so it
+has at most one outstanding request at any moment and N clients make a queue of
+N. It also never reads a window that has not happened yet, which is what keeps
+a session that has caught up with real time from becoming ten queries a second
+against this service for as long as its client stays connected. Past the eight that may wait, a request is refused — which reaches a playback
+session as an error and becomes the same backoff as any other failure. Nothing
+caps the number of sessions: the v1 provider interface offers no way to decline
+one, and the only answer it does have (`hasAnyData` returning false) means "this
+vessel has no history" to the server.
+
 **Nothing coordinates a query with a roll.** The roll runs on the writer's
 schedule and a query arrives when a client asks, so the worst case is the sum
 of peaks measured apart: a service that has served a large query at ~320 MB and
@@ -228,6 +283,10 @@ ceiling on that process, not on this one.
 
 - **Aggregation.** The reader returns raw rows. Bucketed aggregates belong to
   the v2 surface, and nothing here prices them.
+- **A snapshot, in either of its branches.** See the section above.
+- **A playback session.** A chunk is an ordinary range query of the shapes
+  above, but what a session costs over minutes — and what two of them do to the
+  queue — is Unit 7's to measure.
 - **A concurrent roll and query.** The figure above is arithmetic.
 - **A tree with a real retention window in it.** Both aged trees are one day of
   data wearing thirty dates.
