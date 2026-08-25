@@ -9,7 +9,11 @@ import {
   lockDownFileAccess,
 } from "../duckdb/extension.js";
 import { sqlLiteral } from "../duckdb/sql.js";
-import { sidecarFile, treeRoot, utcDateSegment } from "../roll/tree-path.js";
+import {
+  dateDirectoryStart,
+  sidecarFile,
+  treeRoot,
+} from "../roll/tree-path.js";
 import { readPendingRoll, writerPaths } from "../writer/contract.js";
 import { DEFAULT_ROW_LIMIT, RANGE_COLUMNS, VALUE_COLUMNS } from "./duck.js";
 import type { QueryRequest, ValueAggregate } from "./duck.js";
@@ -527,7 +531,7 @@ export function treeFilesInRange(
 
   const found: TreeFile[] = [];
   for (const entry of dates.sort()) {
-    const day = dayStartOf(entry);
+    const day = dateDirectoryStart(entry);
     if (day === null) continue;
     if (day >= to || day + DAY_MS <= from) continue;
     const directory = join(root, entry);
@@ -543,18 +547,6 @@ export function treeFilesInRange(
     }
   }
   return found;
-}
-
-/** The UTC midnight a `date=YYYY-MM-DD` directory names, or null. */
-function dayStartOf(entry: string): number | null {
-  if (!entry.startsWith("date=")) return null;
-  const date = entry.slice("date=".length);
-  const parsed = Date.parse(`${date}T00:00:00.000Z`);
-  // Round-tripped rather than range-checked: `Date.parse` accepts
-  // `2026-08-32T00:00:00.000Z` in some engines and rolls it into September,
-  // which would name a directory a day that is not the one it holds.
-  if (!Number.isFinite(parsed) || utcDateSegment(parsed) !== date) return null;
-  return parsed;
 }
 
 /**

@@ -119,7 +119,10 @@ describe("delivery", () => {
     client.add(sample({ ts: 3 }));
 
     await eventually(() => store.rowCount() === 3, "the batch to land");
-    assert.strictEqual(client.stats.acked, 1);
+    // A second wait, because these two counters move on the acknowledgement
+    // and the rows land a round-trip before it arrives. Asserting them off the
+    // row count alone failed once in a full-suite run and never in isolation.
+    await eventually(() => client!.stats.acked === 1, "the acknowledgement");
     assert.strictEqual(client.stats.stored, 3);
   });
 

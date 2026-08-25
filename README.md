@@ -20,8 +20,8 @@ on a schedule; and a query service holds one DuckDB engine that serves both
 history API surfaces — the v2 REST API, and v1 playback and snapshots — reading
 the tree and the hot store as one.
 
-Retention, the resolution ladder, packaging and on-device verification are still
-open. Progress is tracked in
+The resolution ladder, packaging and on-device verification are still open.
+Progress is tracked in
 [halos-org/halos#152](https://github.com/halos-org/halos/issues/152).
 
 ## The tree
@@ -35,6 +35,29 @@ open. Progress is tracked in
 the date its own timestamp names — so a roll spanning midnight writes two
 files. Why it is shaped this way, with the measurements behind it, is
 `docs/layout-decision.md`.
+
+## Retention
+
+**Retention is a bound on what is stored. It is not a promise that everything
+older has been deleted.** A date directory is the finest thing this layout can
+drop, so a directory survives until its whole day is behind the window: with
+seven days configured, a sample recorded seven days and twenty hours ago can
+still be there. Anyone setting it for privacy rather than for disk has to read
+it that way.
+
+Expiry runs at the end of each roll, so a changed setting takes effect at the
+next one. The window is measured back from whichever is earlier, the clock or
+the newest day in the tree. Both caps matter on a device without a real-time
+clock: an RTC reading a year ahead would otherwise delete the whole tree at the
+first roll, and one delta stamped in the far future would take every real day
+with it. It also means a device that records nothing expires nothing — the tree
+is not growing then either.
+
+`latest/latest.parquet` is not expired. It holds one row per `(context, path)`
+and answers "the last value of everything", which is the one question this
+storage has no index for; pruning it to the boundary would make a path that
+went quiet inside the window disappear from a snapshot of the present. It is
+bounded by how many paths a vessel has, not by how long it has been recording.
 
 ## Installation
 
@@ -61,7 +84,7 @@ Every option is rendered in the Signal K Admin UI from the plugin's own schema
 | Flush batch size (samples)                          | `1000`                | Samples per write, whichever comes first with the interval. Each batch is one SQLite transaction.                                                                                                                                           |
 | Buffer ceiling while the writer is unreachable (MB) | `8`                   | Memory held for samples that could not be sent. When full the oldest are dropped and the count is reported in the plugin status.                                                                                                            |
 | Data directory                                      | plugin data directory | Where the hot store and the Parquet tree live. A relative value resolves against the plugin's own directory.                                                                                                                                |
-| Retention (days, 0 = keep forever)                  | `0`                   | How long data is kept.                                                                                                                                                                                                                      |
+| Retention (days, 0 = keep forever)                  | `0`                   | A bound on what is stored, not a promise that everything older is deleted. Whole UTC days are dropped once the window has passed them, so the oldest sample kept can be up to a day older than the boundary. Applied after each roll.       |
 | Roll interval (minutes)                             | `60`                  | How often the hot store becomes Parquet and is truncated. Shorter keeps the hot store small at the cost of more Parquet files. Must divide 1440 — the schedule runs every N minutes from UTC midnight — and anything else falls back to 60. |
 
 ## The bundled DuckDB extension

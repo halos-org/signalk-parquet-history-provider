@@ -86,6 +86,8 @@ export const ConfigSchema = Type.Object({
   retentionDays: Type.Number({
     default: 0,
     title: "Retention (days, 0 = keep forever)",
+    description:
+      "A bound on what is stored, not a promise that everything older is deleted. Whole UTC days are dropped once the window has passed them, so the oldest sample kept can be up to a day older than the boundary. Applied after each roll.",
   }),
 
   rollIntervalMinutes: Type.Number({
@@ -185,9 +187,11 @@ export function normalizeConfig(config: StoredConfig): Config {
       typeof config.dataDir === "string"
         ? config.dataDir
         : CONFIG_DEFAULTS.dataDir,
-    retentionDays: nonNegative(
-      config.retentionDays,
-      CONFIG_DEFAULTS.retentionDays,
+    // Floored, because expiry drops whole UTC days and half a day is not one
+    // of them. A number field in the Admin UI accepts 0.5 quite happily, and
+    // the rounding has to be visible in one place rather than inside the roll.
+    retentionDays: Math.floor(
+      nonNegative(config.retentionDays, CONFIG_DEFAULTS.retentionDays),
     ),
     rollIntervalMinutes: dayDivisor(
       config.rollIntervalMinutes,

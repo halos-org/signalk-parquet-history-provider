@@ -220,6 +220,19 @@ describe("normalizeConfig", () => {
     );
   });
 
+  it("rounds retention down to whole days", () => {
+    // Expiry drops whole UTC days, so half a day is not a boundary it has. The
+    // Admin UI's number field accepts 0.5 quite happily.
+    assert.equal(
+      normalizeConfig({ ...complete, retentionDays: 7.9 }).retentionDays,
+      7,
+    );
+    assert.equal(
+      normalizeConfig({ ...complete, retentionDays: 0.5 }).retentionDays,
+      0,
+    );
+  });
+
   it("rejects a non-finite number rather than propagating it", () => {
     const normalized = normalizeConfig({
       ...complete,

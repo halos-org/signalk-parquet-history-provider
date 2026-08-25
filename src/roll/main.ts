@@ -18,7 +18,8 @@ import { NameTakenError, roll } from "./roll.js";
  * back in-process, so a long-lived engine would turn a two-second transient
  * into a standing cost on a device chosen for not having one.
  *
- *   node dist/roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms> [--replace]
+ *   node dist/roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms>
+ *     [--retention-days <n>] [--replace]
  *
  * On success it prints one JSON line describing what it wrote — including
  * this process's own peak resident size, which is the figure the design is
@@ -110,7 +111,8 @@ async function main(): Promise<void> {
   const dataDir = argValue("--data-dir");
   if (dataDir === undefined || dataDir === "") {
     writeStderr(
-      "usage: roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms>\n",
+      "usage: roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms> " +
+        "[--retention-days <n>] [--replace]\n",
     );
     process.exit(1);
   }
@@ -129,6 +131,10 @@ async function main(): Promise<void> {
     maxRowid: requireNumber("--max-rowid"),
     rollId: requireNumber("--roll-id"),
     memoryLimit: argValue("--memory-limit"),
+    // Not validated here, unlike the two above. Anything this cannot read is
+    // "keep forever", which costs disk; refusing to roll would cost recording,
+    // because the hot store is only truncated after this process exits 0.
+    retentionDays: Number(argValue("--retention-days") ?? 0),
     // Only a retry of a roll that already wrote something may replace it.
     replace: process.argv.includes("--replace"),
   });

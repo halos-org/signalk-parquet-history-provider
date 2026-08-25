@@ -111,7 +111,7 @@ jobs:
             const plugin = plugins.find((p) => p.id === process.env.PLUGIN_ID);
             const properties = Object.keys(plugin.schema?.properties ?? {});
             console.log(properties.join(", "));
-            const required = ["pathFilter", "defaultSamplingRate", "dataDir", "rollIntervalMinutes"];
+            const required = ["pathFilter", "defaultSamplingRate", "dataDir", "rollIntervalMinutes", "retentionDays"];
             const missing = required.filter((name) => !properties.includes(name));
             if (missing.length > 0) {
               console.error(`::error::the config form is missing ${missing.join(", ")}`);
