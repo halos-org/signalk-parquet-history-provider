@@ -42,7 +42,13 @@ const QUERY_ENTRY = fileURLToPath(new URL("./main.js", import.meta.url));
  */
 export const DEFAULT_ROW_LIMIT = 100_000;
 
-/** The columns a `range` row carries, in the order the tree writes them. */
+/**
+ * The columns a `range` row carries, in the order the tree writes them.
+ *
+ * A `snapshot` row carries the same nine in the same order — it is one row per
+ * `(context, path)` rather than one per sample, and everything the caller does
+ * with it afterwards is identical, so it decodes through the same indices.
+ */
 export const RANGE_COLUMNS = [
   "ts",
   "context",
@@ -99,11 +105,44 @@ export type QueryRequest =
       kind: "range";
       from: number;
       to: number;
-      context: string;
+      /**
+       * Absent means every context. The v2 surface always names one; history
+       * playback never does, because it replays the whole vessel picture —
+       * every AIS target as well as the own vessel.
+       */
+      context?: string;
       /** Empty or absent means every path in the context. */
       paths?: string[];
       /** Rows to return before the answer is reported as truncated. */
       limit?: number;
+    }
+  | {
+      /**
+       * Whether the range holds anything at all, as one row of one count.
+       *
+       * Separate from `range` because it must not sort. History playback asks
+       * this before every session and answering `false` disables playback, so
+       * it is asked for a range that may be the whole tree — where a top-N over
+       * the union costs a full scan and this stops at the first row.
+       */
+      kind: "exists";
+      from: number;
+      to: number;
+    }
+  | {
+      /**
+       * The last value per `(context, path)` at an instant.
+       *
+       * What the v1 snapshot API asks for, and the one question this storage
+       * has no index for: "newest row before T" is a backward scan whose depth
+       * is the retention window rather than the request. `reader.ts` states the
+       * rule it answers under.
+       */
+      kind: "snapshot";
+      /** The instant the snapshot describes. Rows at or before it count. */
+      at: number;
+      /** Restrict to these paths. Empty or absent means every path. */
+      paths?: string[];
     }
   | {
       /** One statement for every series a history request asked for. */

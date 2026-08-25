@@ -275,6 +275,49 @@ describe("what a query reads", { skip: NO_BUNDLED_EXTENSION }, () => {
       { kind: "range", from: AUG_23, to: undefined, context: "self" },
       /to must be a timestamp/,
     );
+    await refuses({ kind: "snapshot", at: "x" }, /at must be a timestamp/);
+    await refuses(
+      { kind: "snapshot", at: AUG_23, paths: "a.b" },
+      /paths must be an array/,
+    );
+  });
+
+  it("opens no tree file for a snapshot the sidecar can answer", async () => {
+    // The claim the snapshot rests on: one row per key, written by every roll,
+    // so "the last value of everything now" needs the tree only when a key's
+    // newest row is newer than the instant asked for. Here none is, and the
+    // path's rows are not in the store any more either.
+    series(AUG_23 + 1000, 2, "a.b");
+    const maxRowid = await rollAll(1);
+    store.deleteThrough(maxRowid);
+
+    const result = await runner.run({
+      kind: "snapshot",
+      at: AUG_23 + DAY,
+    });
+
+    assert.equal(result.treeFiles, 0);
+    assert.deepEqual(
+      result.rows.map((row) => [row[2], row[5]]),
+      [["a.b", 1]],
+    );
+  });
+
+  it("reads the tree for a snapshot of an instant a later row has replaced", async () => {
+    series(AUG_23 + 1000, 2, "a.b");
+    const maxRowid = await rollAll(1);
+    store.deleteThrough(maxRowid);
+
+    const result = await runner.run({
+      kind: "snapshot",
+      at: AUG_23 + 1000,
+    });
+
+    assert.equal(result.treeFiles, 1);
+    assert.deepEqual(
+      result.rows.map((row) => [row[2], row[5]]),
+      [["a.b", 0]],
+    );
   });
 
   it("skips a partition a killed roll left half-written", async () => {

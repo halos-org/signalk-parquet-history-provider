@@ -9,7 +9,7 @@ import {
   lockDownFileAccess,
 } from "../duckdb/extension.js";
 import { sqlLiteral } from "../duckdb/sql.js";
-import { treeRoot, utcDateSegment } from "../roll/tree-path.js";
+import { sidecarFile, treeRoot, utcDateSegment } from "../roll/tree-path.js";
 import { readPendingRoll, writerPaths } from "../writer/contract.js";
 import { DEFAULT_ROW_LIMIT, RANGE_COLUMNS, VALUE_COLUMNS } from "./duck.js";
 import type { QueryRequest, ValueAggregate } from "./duck.js";
@@ -50,6 +50,30 @@ const MAX_SPECS = 200;
 
 /** Milliseconds in a UTC day. The tree's directories are cut on these. */
 const DAY_MS = 86_400_000;
+
+/**
+ * Date directories a snapshot may read when the sidecar cannot answer it.
+ *
+ * **The rule a snapshot answers under**, and it is a bound rather than a
+ * preference. "The last value of every path at T" has no index here: a path
+ * that stopped reporting a week before T still has a last value, so an exact
+ * answer is a backward scan whose depth is the retention window rather than
+ * the request. QuestDB answers it with `LATEST ON` over an index, and the
+ * sibling provider records that timing out past 30 seconds on a real install
+ * even so.
+ *
+ * So a snapshot resolves a path from the sidecar when it can — which is exact
+ * over all of history, and is the whole of a snapshot taken at or after the
+ * newest recorded row — and from this many date directories, ending at T's own,
+ * when it cannot. A path whose last row before T is older than that window is
+ * absent from the snapshot rather than searched for.
+ *
+ * Two rather than more because each directory is a day of rows to scan and
+ * nothing prunes on path: a day answers every path still reporting at T, and
+ * the day before it answers one that went quiet overnight. Raising this trades
+ * seconds per snapshot for paths that have not reported in days.
+ */
+const SNAPSHOT_SCAN_DAYS = 2;
 
 const COLUMNS = RANGE_COLUMNS.join(", ");
 
@@ -191,26 +215,20 @@ export async function openReader(options: ReaderOptions): Promise<Reader> {
 }
 
 /**
- * One query on an already-open engine.
+ * One request on an already-open engine.
  *
- * The hot store is attached per query and detached afterwards, for about a
- * millisecond. Holding it would work — measured across processes, a held
- * attachment still sees rows written after it and still lets the writer
- * truncate its WAL — but attaching here also picks up a store that did not
- * exist when the engine started, which on a fresh device is the first minute
- * of its life.
+ * A snapshot is the one kind that does not name a time range, and it is
+ * answered differently enough — a sidecar, a bounded window, and a statement
+ * that groups rather than orders — to be its own path from here down.
  */
 async function runOne(
   request: QueryRequest,
-  context: {
-    dataDir: string;
-    connection: DuckDBConnection;
-    scannerFailure: string | null;
-  },
+  context: ReadContext,
 ): Promise<ReadResult> {
   validate(request);
-  const { dataDir, connection } = context;
-  const plan = planSources(dataDir, request);
+  if (request.kind === "snapshot") return runSnapshot(request, context);
+
+  const plan = planSources(context.dataDir, request);
   const sql = compile(request, plan);
   if (sql === null) {
     // Neither a tree file nor a hot store: a device that has recorded nothing,
@@ -218,15 +236,39 @@ async function runOne(
     // an error — the history API's own answer for a range with no data.
     return { rows: [], truncated: false, treeFiles: 0 };
   }
-  if (plan.storeExists && context.scannerFailure !== null) {
-    throw new Error(
-      `this range needs the hot store and sqlite_scanner could not be loaded: ${context.scannerFailure}`,
-    );
-  }
+  requireScanner(plan.storeExists, context);
 
+  const answer = await execute(context, sql, {
+    attach: plan.storeExists,
+    limit: rowLimit(request),
+  });
+  return { ...answer, treeFiles: plan.files.length };
+}
+
+interface ReadContext {
+  dataDir: string;
+  connection: DuckDBConnection;
+  scannerFailure: string | null;
+}
+
+/**
+ * A statement, run against the hot store and the tree.
+ *
+ * The attachment is per statement and lasts about a millisecond. Holding it
+ * would work — measured across processes, a held attachment still sees rows
+ * written after it and still lets the writer truncate its WAL — but attaching
+ * here also picks up a store that did not exist when the engine started, which
+ * on a fresh device is the first minute of its life.
+ */
+async function execute(
+  context: ReadContext,
+  sql: Compiled,
+  options: { attach: boolean; limit: number },
+): Promise<{ rows: unknown[][]; truncated: boolean }> {
+  const { connection, dataDir } = context;
   let attached = false;
   try {
-    if (plan.storeExists) {
+    if (options.attach) {
       // READ_ONLY: the writer owns this file and keeps ingesting throughout.
       // SQLite in WAL mode takes concurrent readers, which is why the hot
       // store is SQLite at all.
@@ -236,7 +278,6 @@ async function runOne(
       attached = true;
     }
 
-    const limit = rowLimit(request);
     const result = await connection.runAndReadAll(sql.text, sql.params);
     const rows = result.getRowsJS();
     // In place. These arrays are freshly built and nothing else holds them,
@@ -253,15 +294,188 @@ async function runOne(
     return {
       // One row over the limit is asked for, so a full answer and a truncated
       // one can be told apart. It is dropped here.
-      truncated: rows.length > limit,
-      rows: rows.length > limit ? rows.slice(0, limit) : rows,
-      treeFiles: plan.files.length,
+      truncated: rows.length > options.limit,
+      rows: rows.length > options.limit ? rows.slice(0, options.limit) : rows,
     };
   } finally {
     // A left-over attachment would make the next query's `ATTACH` fail on the
     // name, so every one of them would fail after the first that threw.
     if (attached) await connection.run("DETACH hot").catch(() => {});
   }
+}
+
+/** The store cannot be read without the extension, and says so once. */
+function requireScanner(storeExists: boolean, context: ReadContext): void {
+  if (storeExists && context.scannerFailure !== null) {
+    throw new Error(
+      `this range needs the hot store and sqlite_scanner could not be loaded: ${context.scannerFailure}`,
+    );
+  }
+}
+
+/**
+ * The last value per `(context, path)` at an instant.
+ *
+ * Two statements, and the first is what keeps the second cheap. The sidecar
+ * holds one row per key — the newest that has ever been rolled — so a key whose
+ * sidecar row is at or before T is already answered by it, exactly, however
+ * long ago that row was written. Only a key whose sidecar row is *newer* than T
+ * needs the tree, because its value at T is an older row the sidecar has
+ * replaced.
+ *
+ * So the first statement asks whether any such key exists, and the tree is read
+ * only when one does. A snapshot of the present therefore reads the sidecar and
+ * the hot store and nothing else; a snapshot of an instant the tree has rolled
+ * past reads `SNAPSHOT_SCAN_DAYS` date directories under the rule that constant
+ * states.
+ *
+ * A missing sidecar is treated as "every key needs the tree": it is written by
+ * every roll, so its absence means either nothing has rolled — in which case
+ * there is no tree to read either — or somebody removed it, and answering from
+ * the hot store alone would silently drop every path that stopped reporting
+ * before the last roll.
+ */
+async function runSnapshot(
+  request: Extract<QueryRequest, { kind: "snapshot" }>,
+  context: ReadContext,
+): Promise<ReadResult> {
+  const { dataDir } = context;
+  const sidecar = sidecarFile(dataDir);
+  const hasSidecar = existsSync(sidecar);
+  const storeExists = existsSync(writerPaths(dataDir).store);
+  requireScanner(storeExists, context);
+
+  const at = Math.trunc(request.at);
+  const needsTree =
+    !hasSidecar || (await sidecarHasRowsAfter(context, sidecar, request));
+  const files = needsTree
+    ? treeFilesInRange(
+        dataDir,
+        dayStart(at) - (SNAPSHOT_SCAN_DAYS - 1) * DAY_MS,
+        at + 1,
+      )
+    : [];
+
+  const params: Record<string, DuckDBValue> = { at: BigInt(at) };
+  const where = ["ts <= $at", ...pathFilter(request.paths, params)].join(
+    " AND ",
+  );
+
+  // No seam predicate, unlike a range. A row the tree and the store both hold
+  // is the same row twice, and the newest of two identical rows is that row —
+  // so the duplicate a range has to subtract cannot change this answer.
+  const branches: string[] = [];
+  if (hasSidecar) {
+    branches.push(
+      `SELECT ${COLUMNS} FROM read_parquet('${sqlLiteral(sidecar)}', union_by_name = true) WHERE ${where}`,
+    );
+  }
+  if (files.length > 0) {
+    const list = files.map((file) => `'${sqlLiteral(file.path)}'`).join(", ");
+    branches.push(
+      `SELECT ${COLUMNS} FROM read_parquet([${list}], union_by_name = true) WHERE ${where}`,
+    );
+  }
+  if (storeExists) {
+    branches.push(`SELECT ${COLUMNS} FROM hot.sample WHERE ${where}`);
+  }
+  if (branches.length === 0) {
+    return { rows: [], truncated: false, treeFiles: 0 };
+  }
+
+  const limit = DEFAULT_ROW_LIMIT;
+  const answer = await execute(
+    context,
+    { text: snapshotSQL(branches.join(" UNION ALL "), limit + 1), params },
+    { attach: storeExists, limit },
+  );
+  return { ...answer, treeFiles: files.length };
+}
+
+/**
+ * Whether any key's newest rolled row is newer than the instant asked for.
+ *
+ * One row is enough to answer it, and the sidecar is a single file of one row
+ * per key — 11 kB on the device that has been recording longest.
+ *
+ * A sidecar that cannot be read counts as "yes". It is the same answer a
+ * missing one gets, for the same reason: the alternative is a snapshot that
+ * quietly omits every path which stopped reporting before the last roll.
+ */
+async function sidecarHasRowsAfter(
+  context: ReadContext,
+  sidecar: string,
+  request: Extract<QueryRequest, { kind: "snapshot" }>,
+): Promise<boolean> {
+  const params: Record<string, DuckDBValue> = {
+    at: BigInt(Math.trunc(request.at)),
+  };
+  const filters = ["ts > $at", ...pathFilter(request.paths, params)];
+  try {
+    const result = await context.connection.runAndReadAll(
+      `SELECT count(*) FROM (SELECT 1 FROM ` +
+        `read_parquet('${sqlLiteral(sidecar)}', union_by_name = true) ` +
+        `WHERE ${filters.join(" AND ")} LIMIT 1)`,
+      params,
+    );
+    return Number(result.getRowsJS()[0][0]) > 0;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * One row per `(context, path)`, carrying the newest sample at or before T.
+ *
+ * `arg_max` over one struct rather than one per column: two of them tie-break
+ * independently when two sources record in the same millisecond, and would
+ * return a value and a source that never occurred together. It is also a hash
+ * aggregate over the key count — hundreds of groups, whatever the row count —
+ * where `DISTINCT ON` sorts the input.
+ *
+ * One row per key and not per source, which is what the sibling provider's
+ * `LATEST ON ts PARTITION BY path, context` returns and what the snapshot the
+ * server assembles from it can hold.
+ */
+function snapshotSQL(union: string, limit: number): string {
+  const packed = [
+    "ts := ts",
+    "source := source",
+    "value_kind := value_kind",
+    "value_num := value_num",
+    "value_str := value_str",
+    "value_lat := value_lat",
+    "value_lon := value_lon",
+  ].join(", ");
+  const newest =
+    `SELECT context, path, arg_max(struct_pack(${packed}), ts) AS newest ` +
+    `FROM (${union}) GROUP BY context, path`;
+  // Projected back into RANGE_COLUMNS order, which is what the caller decodes.
+  const columns = RANGE_COLUMNS.map((name) =>
+    name === "context" || name === "path" ? name : `newest.${name} AS ${name}`,
+  ).join(", ");
+  return `SELECT ${columns} FROM (${newest}) ORDER BY context, path LIMIT ${limit}`;
+}
+
+/** The UTC midnight the instant falls in. */
+function dayStart(at: number): number {
+  return Math.floor(at / DAY_MS) * DAY_MS;
+}
+
+/**
+ * Bind the requested paths, if any.
+ *
+ * A list rather than composed text: these come from an HTTP request, and they
+ * are the only strings in here that do.
+ */
+function pathFilter(
+  paths: string[] | undefined,
+  params: Record<string, DuckDBValue>,
+): string[] {
+  const wanted = [...new Set(paths ?? [])];
+  if (wanted.length === 0) return [];
+  params.paths = listValue(wanted);
+  return ["list_contains($paths, path)"];
 }
 
 /**
@@ -276,7 +490,7 @@ async function runOne(
  * race is harmless: a record cleared after the listing means the store's rows
  * are already gone.
  */
-function planSources(dataDir: string, request: QueryRequest): Plan {
+function planSources(dataDir: string, request: WindowedRequest): Plan {
   const files = treeFilesInRange(dataDir, request.from, request.to);
   return {
     files,
@@ -370,23 +584,20 @@ interface Compiled {
   params: Record<string, DuckDBValue>;
 }
 
-function compile(request: QueryRequest, plan: Plan): Compiled | null {
+type WindowedRequest = Exclude<QueryRequest, { kind: "snapshot" }>;
+
+function compile(request: WindowedRequest, plan: Plan): Compiled | null {
   const params: Record<string, DuckDBValue> = {
     fromMs: BigInt(Math.trunc(request.from)),
     toMs: BigInt(Math.trunc(request.to)),
   };
   const filters = ["ts >= $fromMs", "ts < $toMs"];
-  if (request.kind !== "contexts" && request.context !== undefined) {
-    params.context = request.context;
+  const context = requestedContext(request);
+  if (context !== undefined) {
+    params.context = context;
     filters.push("context = $context");
   }
-  // Bound as a list rather than composed into the statement: these come from
-  // an HTTP request, and they are the only strings in here that do.
-  const wanted = requestedPaths(request);
-  if (wanted.length > 0) {
-    params.paths = listValue(wanted);
-    filters.push("list_contains($paths, path)");
-  }
+  filters.push(...pathFilter(requestedPaths(request), params));
   const where = filters.join(" AND ");
 
   const branches: string[] = [];
@@ -419,6 +630,15 @@ function compile(request: QueryRequest, plan: Plan): Compiled | null {
   if (request.kind === "values") {
     return compileValues(request, union, params);
   }
+  if (request.kind === "exists") {
+    // Deliberately unordered, and the `LIMIT 1` is the whole point: the caller
+    // asks this for a range that may be the entire tree, and the engine stops
+    // at the first row rather than scanning it to sort or to count.
+    return {
+      text: `SELECT count(*) FROM (SELECT 1 FROM (${union}) LIMIT 1)`,
+      params,
+    };
+  }
   const column = request.kind === "paths" ? "path" : "context";
   return {
     text: `SELECT DISTINCT ${column} FROM (${union}) ORDER BY ${column}`,
@@ -426,8 +646,15 @@ function compile(request: QueryRequest, plan: Plan): Compiled | null {
   };
 }
 
+/** The one context a request restricts itself to, if it names one. */
+function requestedContext(request: WindowedRequest): string | undefined {
+  if (request.kind === "contexts" || request.kind === "exists")
+    return undefined;
+  return request.context;
+}
+
 /** Every path a request needs, so the scan is pruned to those and no more. */
-function requestedPaths(request: QueryRequest): string[] {
+function requestedPaths(request: WindowedRequest): string[] {
   if (request.kind === "range") return request.paths ?? [];
   if (request.kind === "values") {
     return [...new Set(request.specs.map((spec) => spec.path))];
@@ -549,7 +776,7 @@ function seam(
 }
 
 /** The cap on what one answer returns, whatever it is made of. */
-function rowLimit(request: QueryRequest): number {
+function rowLimit(request: WindowedRequest): number {
   if (request.kind !== "range") return DEFAULT_ROW_LIMIT;
   return clampLimit(request.limit);
 }
@@ -573,7 +800,14 @@ function clampLimit(asked: number | undefined): number {
 }
 
 /** The kinds a request may name. Anything else is not a query. */
-const KINDS = ["range", "values", "paths", "contexts"] as const;
+const KINDS = [
+  "range",
+  "values",
+  "paths",
+  "contexts",
+  "exists",
+  "snapshot",
+] as const;
 
 /** The bucket reductions a spec may name. */
 const AGGREGATES: readonly ValueAggregate[] = [
@@ -602,19 +836,24 @@ function validate(request: QueryRequest): void {
       `${JSON.stringify(request.kind)} is not a query kind; expected one of ${KINDS.join(", ")}`,
     );
   }
-  const time = (name: "from" | "to", value: unknown) => {
+  const time = (name: "from" | "to" | "at", value: unknown) => {
     if (typeof value !== "number" || !Number.isFinite(value)) {
       throw new Error(`${name} must be a timestamp in milliseconds`);
     }
   };
+  if (request.kind === "snapshot") {
+    time("at", request.at);
+    validatePaths(request.paths);
+    return;
+  }
   time("from", request.from);
   time("to", request.to);
-  if (request.kind === "range" || request.kind === "values") {
+  if (request.kind === "values") {
     if (typeof request.context !== "string") {
       throw new Error("context must be a string");
     }
   } else if (
-    request.kind === "paths" &&
+    (request.kind === "range" || request.kind === "paths") &&
     request.context !== undefined &&
     typeof request.context !== "string"
   ) {
@@ -660,12 +899,12 @@ function validate(request: QueryRequest): void {
     return;
   }
   if (request.kind !== "range") return;
-  if (request.paths !== undefined) {
-    if (
-      !Array.isArray(request.paths) ||
-      request.paths.some((path) => typeof path !== "string")
-    ) {
-      throw new Error("paths must be an array of strings");
-    }
+  validatePaths(request.paths);
+}
+
+function validatePaths(paths: string[] | undefined): void {
+  if (paths === undefined) return;
+  if (!Array.isArray(paths) || paths.some((path) => typeof path !== "string")) {
+    throw new Error("paths must be an array of strings");
   }
 }
