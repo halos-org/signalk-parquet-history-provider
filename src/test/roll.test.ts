@@ -209,6 +209,49 @@ describe("a roll", { skip: NO_BUNDLED_EXTENSION }, () => {
     );
   });
 
+  it("expires a day it wrote in this same roll, when the backlog is older than the window", async () => {
+    // A device that was off for a fortnight comes back and rolls all of it at
+    // once. Every date it writes is real, and most of them are already past
+    // the window — so expiry runs after the write and takes them, rather than
+    // leaving a fortnight in a tree configured to hold three days.
+    for (let day = 0; day <= 14; day += 1) {
+      record(sample({ ts: AUG_23 + day * DAY + 1000, path: "a.b" }));
+    }
+    const result = await roll({
+      dataDir: dir,
+      maxRowid: store.rollBound()!.maxRowid,
+      rollId: 1,
+      retentionDays: 3,
+      // The clock is on the newest day, which is where a device catching up
+      // would have it.
+      now: () => AUG_23 + 14 * DAY + 2000,
+    });
+
+    assert.equal(result.files.length, 15, "every date was written first");
+    assert.deepEqual(readdirSync(join(dir, DATA_LAYOUT.tree)).sort(), [
+      "date=2026-09-03",
+      "date=2026-09-04",
+      "date=2026-09-05",
+      "date=2026-09-06",
+    ]);
+    assert.equal(result.expired.length, 11);
+    assert.deepEqual(result.expiryFailures, []);
+  });
+
+  it("keeps every date when retention is off", async () => {
+    for (let day = 0; day <= 5; day += 1) {
+      record(sample({ ts: AUG_23 + day * DAY + 1000, path: "a.b" }));
+    }
+    const result = await roll({
+      dataDir: dir,
+      maxRowid: store.rollBound()!.maxRowid,
+      rollId: 1,
+    });
+
+    assert.equal(readdirSync(join(dir, DATA_LAYOUT.tree)).length, 6);
+    assert.deepEqual(result.expired, []);
+  });
+
   it("refuses a bound that is not a rowid", async () => {
     record(sample({ ts: AUG_23 }));
     await assert.rejects(

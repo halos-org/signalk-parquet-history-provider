@@ -144,6 +144,36 @@ describe("a delta reaching the writer's store", () => {
     }
   });
 
+  it("hands the writer the roll interval and the retention it was configured with", async () => {
+    // Both cross a process boundary as command-line flags, so a name the two
+    // sides spell differently would mean rolling on the default and keeping
+    // everything for ever, with nothing failing anywhere.
+    const base = mkdtempSync(join(tmpdir(), "sk-parquet-e2e-"));
+    const paths = writerPaths(base);
+    const { app, calls } = stubApp(base);
+    const plugin = createPlugin(app);
+    try {
+      plugin.start({ rollIntervalMinutes: 30, retentionDays: 14 });
+
+      await eventually(
+        () => calls.debug.some((line) => line.includes("writer ready")),
+        `the writer to report itself (errors: ${JSON.stringify(calls.errors)})`,
+      );
+      assert.match(
+        calls.debug.join("\n"),
+        /rolling every 30 minutes, keeping 14 days/,
+      );
+    } finally {
+      await plugin.stop();
+      await eventually(
+        () => !existsSync(paths.pidFile),
+        "the writer to clean up after itself",
+        10_000,
+      ).catch(() => {});
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it("survives a writer that cannot be spawned at all", async () => {
     // A ChildProcess with no `error` listener rethrows the event, and the throw
     // lands a tick after start() returned, so start()'s catch cannot see it.

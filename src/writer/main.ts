@@ -22,6 +22,7 @@ import { EXIT_LOCKED, writerPaths } from "./contract.js";
  * what makes that true of memory as well as CPU.
  *
  *   node dist/writer/main.js --data-dir <path> --roll-interval-minutes <n>
+ *     [--retention-days <n>]
  *
  * Exit codes are read by the plugin, which turns them into a status an
  * operator can see:
@@ -68,6 +69,24 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Not checked like the interval above, and deliberately: a retention this
+  // cannot read means the tree keeps everything, which costs disk, while
+  // exiting here would stop recording. The plugin normalizes the value before
+  // it gets here, so an unreadable one is a bug in this package rather than
+  // something an operator typed.
+  const retentionRaw = argValue("--retention-days");
+  const retentionDays = Number(retentionRaw ?? 0);
+  const retentionUsable =
+    Number.isFinite(retentionDays) && retentionDays >= 0
+      ? Math.floor(retentionDays)
+      : 0;
+  if (retentionRaw !== undefined && retentionUsable !== retentionDays) {
+    writeStderr(
+      `--retention-days ${retentionRaw} is not a whole number of days; ` +
+        `keeping ${retentionUsable === 0 ? "everything" : `${retentionUsable} days`}\n`,
+    );
+  }
+
   const paths = writerPaths(dataDir);
   const hot = join(dataDir, DATA_LAYOUT.hotStore);
   mkdirSync(hot, { recursive: true, mode: DATA_DIR_MODE });
@@ -95,7 +114,13 @@ async function main(): Promise<void> {
   }
   // Informational only. Nothing decides anything from it -- see writerPaths.
   writeFileSync(paths.pidFile, `${process.pid}\n`, { mode: 0o600 });
-  process.stdout.write(`writer ready on ${paths.socket}\n`);
+  // The settings this process was actually given, not the ones the Admin UI
+  // shows. They arrive as arguments, and a flag the plugin and this side spell
+  // differently would otherwise mean silently keeping everything for ever.
+  process.stdout.write(
+    `writer ready on ${paths.socket}, rolling every ${rollIntervalMinutes} minutes, ` +
+      `keeping ${retentionUsable === 0 ? "everything" : `${retentionUsable} days`}\n`,
+  );
 
   // The roll runs here rather than in the plugin because only this process may
   // write to the store: the roll reads it read-only, and the delete that
@@ -104,6 +129,7 @@ async function main(): Promise<void> {
     store,
     dataDir,
     intervalMinutes: rollIntervalMinutes,
+    retentionDays: retentionUsable,
     log: (line) => process.stdout.write(`${line}\n`),
     // stderr, because the plugin routes it to app.error while stdout goes to
     // app.debug. A roll failure nobody sees is the shape this whole design

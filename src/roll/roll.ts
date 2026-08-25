@@ -14,6 +14,8 @@ import { DATA_DIR_MODE, DATA_LAYOUT } from "../data-dir.js";
 import { commitFile } from "../durable-write.js";
 import { BASE_DUCKDB_CONFIG, loadSqliteScanner } from "../duckdb/extension.js";
 import { sqlLiteral } from "../duckdb/sql.js";
+import { expire } from "../retention/expire.js";
+import type { ExpiryFailure } from "../retention/expire.js";
 import { writerPaths } from "../writer/contract.js";
 import {
   dateDirectory,
@@ -95,6 +97,18 @@ export interface RollOptions {
   rollId: number;
   memoryLimit?: string;
   /**
+   * Whole days of tree to keep. Zero keeps everything.
+   *
+   * Expiry runs here because the roll already holds the claim on the data
+   * directory, so the one thing that could delete a directory another process
+   * is writing into cannot be running. It costs the roll a readdir and an
+   * unlink; nothing about it needs the engine.
+   */
+  retentionDays?: number;
+  /** Injected in tests, for the retention boundary. Production reads the
+   * clock. */
+  now?: () => number;
+  /**
    * Whether this roll may replace a file that already carries its name.
    *
    * Only a retry may. A fresh roll that finds its name taken has been handed
@@ -118,6 +132,10 @@ export interface RollResult {
   /** One per UTC date the covered rows fell in. */
   files: RolledFile[];
   sidecarRows: number;
+  /** Date directories retention removed after this roll wrote. */
+  expired: string[];
+  /** Directories retention should have removed and could not. */
+  expiryFailures: ExpiryFailure[];
 }
 
 export async function roll(options: RollOptions): Promise<RollResult> {
@@ -151,6 +169,7 @@ export async function roll(options: RollOptions): Promise<RollResult> {
     temp_directory: scratch,
   });
   const connection = await instance.connect();
+  let written: { files: RolledFile[]; sidecarRows: number };
   try {
     await loadSqliteScanner(connection, {
       cacheDir: join(dataDir, DATA_LAYOUT.extensionCache),
@@ -175,14 +194,9 @@ export async function roll(options: RollOptions): Promise<RollResult> {
         }),
       );
     }
-    const sidecarRows = await writeSidecar({ connection, dataDir, maxRowid });
-
-    return {
-      rollId,
-      maxRowid,
-      rows: files.reduce((total, file) => total + file.rows, 0),
+    written = {
       files,
-      sidecarRows,
+      sidecarRows: await writeSidecar({ connection, dataDir, maxRowid }),
     };
   } finally {
     connection.closeSync();
@@ -192,6 +206,25 @@ export async function roll(options: RollOptions): Promise<RollResult> {
     // top is what eventually collects those.
     rmSync(scratch, { recursive: true, force: true });
   }
+
+  // After the engine is closed, and after this roll's own files are in the
+  // tree: the boundary is measured from the newest date directory, and the day
+  // this roll just wrote is the one that has to set it.
+  const expired = expire({
+    dataDir,
+    retentionDays: options.retentionDays ?? 0,
+    now: options.now,
+  });
+
+  return {
+    rollId,
+    maxRowid,
+    rows: written.files.reduce((total, file) => total + file.rows, 0),
+    files: written.files,
+    sidecarRows: written.sidecarRows,
+    expired: expired.removed,
+    expiryFailures: expired.failures,
+  };
 }
 
 /**

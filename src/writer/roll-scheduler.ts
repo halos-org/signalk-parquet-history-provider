@@ -49,6 +49,15 @@ export interface RollSchedulerOptions {
   store: HotStore;
   dataDir: string;
   intervalMinutes: number;
+  /**
+   * Whole days of tree to keep, passed through to the roll. Zero keeps
+   * everything.
+   *
+   * Expiry is a step of the roll rather than a timer of its own, so a changed
+   * setting takes effect at the next roll and a device that records nothing
+   * expires nothing. Neither matters: the tree only grows when a roll writes.
+   */
+  retentionDays?: number;
   /** Ordinary progress. The plugin routes the writer's stdout to `app.debug`. */
   log: (line: string) => void;
   /** Anything an operator has to see. The plugin routes stderr to `app.error`;
@@ -287,6 +296,18 @@ export class RollScheduler {
     this.options.log(
       `roll ${rollId} wrote ${outcome.summary}; ${removed} rows truncated`,
     );
+    // On the error sink rather than in the line above: a tree that keeps
+    // growing past its configured bound is the failure an operator has to see,
+    // and it repeats every roll until the directory can be unlinked.
+    const failures = outcome.result.expiryFailures ?? [];
+    if (failures.length > 0) {
+      this.reportFailure(
+        `retention could not remove ${failures.length} date ` +
+          `${failures.length === 1 ? "directory" : "directories"} ` +
+          `(${failures[0].date}: ${failures[0].why}); the tree is over its ` +
+          `configured retention until they go`,
+      );
+    }
   }
 
   /** Roll failures go to the error sink, which the plugin routes to
@@ -313,6 +334,8 @@ export class RollScheduler {
       String(maxRowid),
       "--roll-id",
       String(rollId),
+      "--retention-days",
+      String(this.options.retentionDays ?? 0),
       // Only a retry is allowed to replace a file. Otherwise a roll that
       // arrives at a name already taken fails loudly instead of overwriting
       // history with a fraction of it.
@@ -473,6 +496,9 @@ interface RollSummary {
   files: { date: string }[];
   sidecarRows: number;
   peakRssBytes: number | null;
+  /** Optional, because a roll built before retention existed omits both. */
+  expired?: string[];
+  expiryFailures?: { date: string; why: string }[];
 }
 
 function parseSummary(stdout: string): RollSummary | null {
@@ -532,5 +558,9 @@ function describe(result: RollSummary): string {
     typeof result.peakRssBytes === "number"
       ? `, peaking at ${Math.round(result.peakRssBytes / 1048576)} MB`
       : "";
-  return `${result.rows} rows to ${dates} and ${result.sidecarRows} sidecar rows${peak}`;
+  const expired =
+    result.expired !== undefined && result.expired.length > 0
+      ? `, expiring ${result.expired.join(", ")}`
+      : "";
+  return `${result.rows} rows to ${dates} and ${result.sidecarRows} sidecar rows${peak}${expired}`;
 }

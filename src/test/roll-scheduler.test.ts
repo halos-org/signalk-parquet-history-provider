@@ -88,6 +88,24 @@ function succeeds(rows?: number): (args: string[]) => ChildProcess {
   };
 }
 
+/** A stand-in roll whose summary carries extra fields the scheduler reads. */
+function summarising(
+  args: string[],
+  extra: Record<string, unknown>,
+): ChildProcess {
+  const count = store.rollBound()?.rows ?? 0;
+  const summary = {
+    rollId: Number(argOf(args, "--roll-id")),
+    maxRowid: Number(argOf(args, "--max-rowid")),
+    rows: count,
+    files: [{ date: "2026-08-23", path: "x", rows: count }],
+    sidecarRows: 2,
+    peakRssBytes: null,
+    ...extra,
+  };
+  return child(`console.log(${JSON.stringify(JSON.stringify(summary))})`);
+}
+
 const FAILS = (): ChildProcess =>
   child(
     `console.error("boom: the roll could not finish\\n    at some.frame"); process.exit(3)`,
@@ -537,10 +555,110 @@ describe("stopping", () => {
   });
 });
 
+describe("retention", () => {
+  it("hands the roll the configured days", async () => {
+    record(sample({ ts: AUG_23 }));
+    let seen = "";
+    await scheduler({
+      retentionDays: 30,
+      spawnRoll: (args) => {
+        seen = argOf(args, "--retention-days");
+        return succeeds(1)(args);
+      },
+    }).rollOnce(SLOT);
+
+    assert.equal(seen, "30");
+  });
+
+  it("hands the roll a zero when nothing is configured", async () => {
+    record(sample({ ts: AUG_23 }));
+    let seen = "";
+    await scheduler({
+      spawnRoll: (args) => {
+        seen = argOf(args, "--retention-days");
+        return succeeds(1)(args);
+      },
+    }).rollOnce(SLOT);
+
+    assert.equal(seen, "0");
+  });
+
+  it("names the directories the roll expired", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({
+      spawnRoll: (args) => summarising(args, { expired: ["2026-07-01"] }),
+    }).rollOnce(SLOT);
+
+    assert.match(logged.join("\n"), /expiring 2026-07-01/);
+  });
+
+  it("reports a directory it could not expire on the error sink", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({
+      spawnRoll: (args) =>
+        summarising(args, {
+          expiryFailures: [{ date: "2026-07-01", why: "EACCES" }],
+        }),
+    }).rollOnce(SLOT);
+
+    // Rows still truncated: a tree over its bound is a disk problem, and
+    // refusing to truncate would turn it into a recording problem too.
+    assert.equal(store.rowCount(), 0);
+    assert.match(errors.join("\n"), /retention could not remove 1 date/);
+    assert.match(errors.join("\n"), /2026-07-01: EACCES/);
+  });
+});
+
 describe(
   "the real roll process, driven by the scheduler",
   { skip: NO_BUNDLED_EXTENSION },
   () => {
+    it("expires a date directory the window has passed", async () => {
+      // A directory from a device that has been recording for a while, and one
+      // row today. The roll writes today's file and then drops the old day.
+      const stale = dateDirectory(dir, AUG_23 - 40 * 86_400_000);
+      mkdirSync(stale, { recursive: true });
+      writeFileSync(join(stale, "1.parquet"), "not read, only removed");
+      record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+
+      const rolls = new RollScheduler({
+        store,
+        dataDir: dir,
+        intervalMinutes: 60,
+        retentionDays: 7,
+        log: (line) => logged.push(line),
+        onError: (line) => errors.push(line),
+        now: () => NOW,
+      });
+      await rolls.rollOnce(SLOT);
+
+      assert.deepEqual(errors, []);
+      assert.equal(existsSync(stale), false);
+      assert.deepEqual(readdirSync(dateDirectory(dir, AUG_23)), [
+        `${SLOT}.parquet`,
+      ]);
+      assert.match(logged.join("\n"), /expiring 2026-07-14/);
+    });
+
+    it("expires nothing when retention is off", async () => {
+      const stale = dateDirectory(dir, AUG_23 - 400 * 86_400_000);
+      mkdirSync(stale, { recursive: true });
+      writeFileSync(join(stale, "1.parquet"), "kept");
+      record(sample({ ts: AUG_23 + 1000, path: "a.b" }));
+
+      await new RollScheduler({
+        store,
+        dataDir: dir,
+        intervalMinutes: 60,
+        log: (line) => logged.push(line),
+        onError: (line) => errors.push(line),
+        now: () => NOW,
+      }).rollOnce(SLOT);
+
+      assert.deepEqual(errors, []);
+      assert.ok(existsSync(stale));
+    });
+
     it("writes the tree and truncates the store", async () => {
       record(
         sample({ ts: AUG_23 + 1000, path: "a.b" }),
