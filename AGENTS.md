@@ -97,6 +97,11 @@ a check on module evaluation alone.
   not "one directory owns the engine"; it is that the engine may never be
   reachable from `src/index.ts` or from `src/writer/`, both of which run for as
   long as recording does.
+- `src/retention/expire.ts` — dropping whole date directories the retention
+  window has passed. It imports no engine and is called at the end of a roll,
+  after the roll's own files are in the tree. Read "Retention" below before
+  changing the boundary: what it deletes is a bound on storage rather than a
+  deletion guarantee, and that distinction is documented to operators.
 - `src/query/` — reading. `duck.ts` is the side that runs inside the Signal K
   process: it starts the query service, queues requests, enforces the deadline
   and restarts what dies, and it imports no engine. `main.ts` is the service —
@@ -209,6 +214,50 @@ this package's path cardinality, while a sort costs three times the memory of
 the whole rest of the roll. Each file is fsynced under a `.tmp` name and
 renamed; the suffix is the whole mechanism that keeps a killed roll from
 leaving something a `*.parquet` glob reads as finished.
+
+## Retention
+
+**A storage bound, not a deletion guarantee, and the difference is what an
+operator has to be told.** A date directory is the finest thing this layout can
+drop: a roll file is named for the roll that wrote it and holds whatever rows of
+that day the roll covered, so no path names a narrower boundary. A directory
+therefore survives until its whole day is behind the window, and the oldest
+sample kept can be up to a day older than the instant "now minus retentionDays"
+names. Somebody setting retention for privacy is setting it for the wrong thing;
+the config description, the README and `expire.ts` all say so, and any change to
+the boundary has to keep saying it.
+
+The window is measured back from `min(clock, the end of the newest date
+directory)`. That is QuestDB's own TTL formula with the directory standing in
+for its table's latest timestamp, and both caps earn their place in opposite
+directions: a device whose RTC reads a year ahead before NTP corrects it would
+otherwise lose its whole tree to the first roll, and one delta stamped in the far
+future would otherwise take every real day with it. The consequence to keep in
+mind is that expiry follows the data rather than the calendar — a device that
+stops recording stops expiring, which is harmless because the tree stops growing
+with it.
+
+Expiry runs inside the roll process, after the files and the sidecar are
+committed and after the engine is closed. Three reasons, in order: the roll
+already holds the claim on the data directory, so nothing else can be writing a
+directory this deletes; the boundary is measured from the newest directory, which
+this roll may have just created; and an unlink on a failing card should not be
+holding 160 MB of engine. It never throws — a directory it cannot remove is
+reported, and the roll still exits 0, because a roll that fails is a roll whose
+rows are never truncated from the hot store. Costing recording to save disk is
+the wrong trade.
+
+A query that has already listed a file expiry then unlinks fails, and nothing
+retries it. The window is between `treeFilesInRange`'s readdir and DuckDB
+opening the file, it needs a request whose range reaches the oldest day in the
+tree, and it can happen at most once per roll. Costing one request an hour in
+the worst case is cheaper than a retry that would also swallow real IO errors.
+
+**The sidecar is not expired.** Its rows are copies of rows the tree may no
+longer hold, and that is deliberate: it answers "the last value of everything",
+and pruning it to the boundary would drop every path that went quiet inside the
+window — the one question this storage has no index for. It is bounded by key
+count rather than by time, so retention is not what keeps it small.
 
 ## The query
 

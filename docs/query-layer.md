@@ -213,6 +213,12 @@ path still reporting at T, and the day before it resolves one that went quiet
 overnight. It is a constant in `query/reader.ts` rather than a setting, because
 changing it changes what a historical snapshot holds and not just what it costs.
 
+Retention does not prune the sidecar, so the first row keeps answering for a
+path whose tree files have expired: a snapshot of the present still carries its
+last value. The second row degrades instead — an instant inside an expired
+range finds no date directory to scan, and the answer for a key the sidecar has
+moved past is empty rather than wrong.
+
 Both branches reduce with one `arg_max` over a struct, grouped by
 `(context, path)`: a hash aggregate over the key count — hundreds of groups,
 whatever the row count — where `DISTINCT ON` would sort the input. One row per
