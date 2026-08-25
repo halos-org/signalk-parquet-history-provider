@@ -71,9 +71,13 @@ jobs:
         run: |
           cd /tmp/sk-test
           mkdir -p plugin-config-data
-          # The plugin id is declared in the plugin's own code, not derived from
-          # the package name, so it is read back rather than assumed.
-          PLUGIN_ID=$(node -p "require('/tmp/sk-test/node_modules/signalk-parquet-history-provider/dist/plugin-id.js').PLUGIN_ID")
+          # Two names, and they are deliberately different: the package is
+          # scoped and the plugin id is not, because the id becomes a config
+          # filename and a scoped name would put a slash in it. So both are
+          # read rather than assumed -- resolving by package name also means a
+          # rename cannot leave a stale node_modules path here.
+          PKG_NAME=$(node -p "require('$GITHUB_WORKSPACE/package.json').name")
+          PLUGIN_ID=$(node -p "require('$PKG_NAME/dist/plugin-id.js').PLUGIN_ID")
           echo "PLUGIN_ID=$PLUGIN_ID" >> "$GITHUB_ENV"
           cat > "plugin-config-data/${PLUGIN_ID}.json" <<JSON
           { "enabled": true, "configuration": {} }

@@ -1,4 +1,4 @@
-# signalk-parquet-history-provider
+# @halos-org/signalk-parquet-history-provider
 
 A Signal K history provider that stores data in Parquet files instead of a
 database server. Deltas go to a SQLite hot store owned by a separate writer
@@ -61,9 +61,38 @@ bounded by how many paths a vessel has, not by how long it has been recording.
 
 ## Installation
 
-Not published yet. Once it is, it installs from the Signal K app store or with
-`npm install signalk-parquet-history-provider` into the server's plugin
-directory.
+From the Signal K app store, or with
+`npm install @halos-org/signalk-parquet-history-provider` into the server's
+plugin directory. On HaLOS Marine it is baked into the image and needs no
+installation.
+
+**The plugin id is `signalk-parquet-history-provider`, without the scope.** It
+is what names the config file and what `historyApi.defaultProvider` holds; the
+scoped name is the package only.
+
+## Choosing this provider
+
+A Signal K server exposes two history APIs, and they behave differently when
+more than one provider is installed.
+
+The **v2 REST API** has a real registry keyed by plugin id. It serves the
+provider named by `historyApi.defaultProvider`, and falls back to the first one
+registered when that names nothing or names a provider that is not running.
+This plugin always registers there.
+
+The **v1 WebSocket API** — playback and snapshots — has no registry. The server
+keeps one provider in a single global field and the last plugin to register
+takes it, so this plugin claims it only when `historyApi.defaultProvider` names
+this plugin or names nothing at all. If it names another provider, this one
+stands aside and says so in the log. Choose the provider under **Apps & Plugins
+→ Configuration**, then restart the server: the v1 slot is taken at plugin
+start, so a change made while the server is running reaches v2 immediately and
+v1 only after a restart.
+
+**Running two history providers on one device is unsupported.** They record the
+same deltas twice, and which one answers v1 depends on plugin load order. The
+plugin reports the state when it can see it — it cannot see a provider that
+registers after it does — but it does not try to resolve it. Disable one.
 
 ## Configuration
 
