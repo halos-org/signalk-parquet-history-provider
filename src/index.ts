@@ -12,6 +12,12 @@ import {
 } from "./config/schema.js";
 import type { Config } from "./config/schema.js";
 import { createHistoryProviderV1 } from "./history-v1.js";
+import {
+  decideHistoryV1Slot,
+  describeDeclinedV1Slot,
+  describeOccupiedV1Slot,
+} from "./history-v1-slot.js";
+import type { HistoryApiSettings } from "./history-v1-slot.js";
 import { createHistoryV2 } from "./history-v2.js";
 import { QueryRunner } from "./query/duck.js";
 import { DATA_DIR_MODE, DATA_LAYOUT, resolveDataDir } from "./data-dir.js";
@@ -66,11 +72,29 @@ interface App {
    *
    * **The server keeps one v1 provider, globally.** `src/index.ts:316` is a
    * single slot and the last registration wins, so two history plugins on one
-   * device silently pick a winner. Gating this on the configured provider is
-   * [halos-org/halos#168](https://github.com/halos-org/halos/issues/168);
-   * running two providers together is unsupported either way.
+   * device silently pick a winner. `history-v1-slot.ts` decides whether this
+   * plugin may take it; running two providers together is unsupported either
+   * way.
    */
   registerHistoryProvider?: (provider: HistoryProviderV1) => void;
+  /**
+   * The server's own settings, reachable because the plugin wrapper's app copy
+   * is shallow — `config` is the same object the server reads, so
+   * `historyApi.defaultProvider` is current rather than a snapshot.
+   *
+   * Optional and loosely typed on purpose: it is not part of the documented
+   * plugin API, and a server that stops exposing it must cost this plugin its
+   * gate rather than its start.
+   */
+  config?: { settings?: { historyApi?: HistoryApiSettings } };
+  /**
+   * Whoever holds the v1 slot, if anyone did before this plugin started.
+   *
+   * The app copy is taken when the plugin loads, so this sees a provider that
+   * registered earlier and never one that registers later. That asymmetry is
+   * why co-residency is reported rather than resolved.
+   */
+  historyProvider?: unknown;
   streambundle: {
     getBus: (path?: string) => {
       onValue: (fn: (value: BusValue) => void) => () => void;
@@ -319,14 +343,33 @@ export default (app: App) => {
         }
         // Registered separately, because the two registries are separate: a
         // server old enough to have one and not the other serves the half it
-        // has rather than neither.
+        // has rather than neither. And gated, because v1 is not a registry at
+        // all — see history-v1-slot.ts for what that costs and who may take it.
         if (app.registerHistoryProvider) {
-          app.registerHistoryProvider(
-            createHistoryProviderV1(queries, app.selfContext, (line) =>
-              app.debug(line),
-            ),
+          const decision = decideHistoryV1Slot(
+            app.config?.settings?.historyApi,
           );
-          app.debug("registered the history v1 provider");
+          // Both notices go to app.error rather than app.debug. Each one means
+          // history is served by something other than what an operator would
+          // assume from seeing this plugin enabled, and a debug line nobody
+          // has switched on says nothing at all.
+          const occupied = describeOccupiedV1Slot(
+            decision,
+            app.historyProvider !== undefined,
+          );
+          if (occupied !== null) app.error(occupied);
+          if (decision.claim) {
+            app.registerHistoryProvider(
+              createHistoryProviderV1(queries, app.selfContext, (line) =>
+                app.debug(line),
+              ),
+            );
+            app.debug(
+              `registered the history v1 provider (${decision.because})`,
+            );
+          } else {
+            app.error(describeDeclinedV1Slot(decision));
+          }
         } else {
           app.debug("this server has no v1 history registry; no playback");
         }
