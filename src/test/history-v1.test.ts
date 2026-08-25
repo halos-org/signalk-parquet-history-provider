@@ -121,6 +121,33 @@ function replayed(writes: Written[]): [string, unknown][] {
   );
 }
 
+/**
+ * The runner with every request counted, for the assertions about queries that
+ * should not happen.
+ *
+ * Those cannot be made against the debug log: starting the engine takes the
+ * better part of a second, so a request that is going to fail has not failed
+ * yet at the moment the log is read, and a test that only reads the log passes
+ * whether or not the code under it is right.
+ */
+function countingRunner(): { runner: QueryRunner; runs: () => number } {
+  let runs = 0;
+  const target = runner;
+  const proxy = new Proxy(target, {
+    get(owner, property, receiver) {
+      if (property === "run") {
+        return (request: never) => {
+          runs += 1;
+          return owner.run(request);
+        };
+      }
+      const value = Reflect.get(owner, property, receiver) as unknown;
+      return typeof value === "function" ? value.bind(owner) : value;
+    },
+  });
+  return { runner: proxy, runs: () => runs };
+}
+
 /** Playback at a rate that makes the 60-second chunk delay a millisecond. */
 const FAST = 60_000;
 
@@ -604,32 +631,20 @@ describe("streamHistory", { skip: NO_BUNDLED_EXTENSION }, () => {
     const started = now - CHUNK_SECONDS * 1000 - 5000;
     record(sample({ ts: started + 1000, path: "a", value: 1 }));
 
-    let runs = 0;
-    const counted = new Proxy(runner, {
-      get(target, property, receiver) {
-        if (property === "run") {
-          return (request: never) => {
-            runs += 1;
-            return target.run(request);
-          };
-        }
-        const value = Reflect.get(target, property, receiver) as unknown;
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-    const counting = createHistoryProviderV1(counted, SELF, (line) =>
+    const counted = countingRunner();
+    const provider = createHistoryProviderV1(counted.runner, SELF, (line) =>
       debugLines.push(line),
     );
 
     const client = fakeSpark();
-    const stop = counting.streamHistory(client.spark, ask(started), () => {});
+    const stop = provider.streamHistory(client.spark, ask(started), () => {});
     try {
       // The first window is over, so it is read and replayed. The second ends
       // about 55 seconds from now, so it is not read at all.
       await eventually(() => client.writes.length >= 1, "the complete window");
-      const after = runs;
+      const after = counted.runs();
       await new Promise((resolve) => setTimeout(resolve, 300));
-      assert.equal(runs, after, "the future window was read anyway");
+      assert.equal(counted.runs(), after, "the future window was read anyway");
       assert.equal(client.writes.length, 1);
     } finally {
       stop();
@@ -639,23 +654,27 @@ describe("streamHistory", { skip: NO_BUNDLED_EXTENSION }, () => {
   it("does not replay from a start time that is not a time", async () => {
     record(sample({ ts: AUG_23, path: "a", value: 1 }));
 
+    const counted = countingRunner();
+    const provider = createHistoryProviderV1(counted.runner, SELF, (line) =>
+      debugLines.push(line),
+    );
+
     const client = fakeSpark();
-    const stop = history.streamHistory(
+    const stop = provider.streamHistory(
       client.spark,
       { startTime: new Date("not a date"), playbackRate: 1 },
       () => {},
     );
     try {
       await new Promise((resolve) => setTimeout(resolve, 100));
+      // The queries, not the log: starting the engine takes the better part of
+      // a second, so a request that is going to be refused has not been refused
+      // yet at the moment a log assertion would run — and the test would pass
+      // whether or not the guard exists. Without it every read is refused and
+      // every refusal reschedules, which is a query a second for as long as the
+      // client stays connected.
+      assert.equal(counted.runs(), 0, "a replay was started anyway");
       assert.equal(client.writes.length, 0);
-      // Every read would be refused by the query layer and every refusal
-      // reschedules, so without the guard this is a query a second for as long
-      // as the client stays connected.
-      assert.equal(
-        debugLines.filter((line) => line.startsWith("streamHistory error"))
-          .length,
-        0,
-      );
     } finally {
       stop();
     }
