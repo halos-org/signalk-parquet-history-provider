@@ -172,14 +172,35 @@ describe("expire", () => {
     assert.deepEqual(new Set(counts.slice(6)), new Set([6]));
   });
 
-  it("does nothing when there is no tree", () => {
+  it("does nothing, and says nothing, when there is no tree", () => {
     const result = expire({
       dataDir: dir,
       retentionDays: 1,
       now: middayOf(5),
     });
 
-    assert.deepEqual(result, { removed: [], failures: [] });
+    assert.deepEqual(result, { removed: [], failures: [], treeError: null });
+  });
+
+  it("reports a tree it cannot list, rather than reading as a clean run", (t) => {
+    if (process.getuid?.() === 0) {
+      t.skip("root ignores directory permissions");
+      return;
+    }
+    tree(0, 5);
+    // 0100: the directory can be traversed but not listed. An empty result
+    // here is indistinguishable from a device that has never rolled, and the
+    // scheduler would report a clean roll while the tree grows without bound.
+    chmodSync(treeRoot(dir), 0o100);
+
+    const result = expire({
+      dataDir: dir,
+      retentionDays: 1,
+      now: middayOf(5),
+    });
+
+    assert.equal(result.treeError, "EACCES");
+    assert.deepEqual(result.removed, []);
   });
 
   it("reports a directory it could not remove and expires the rest", (t) => {
@@ -202,7 +223,10 @@ describe("expire", () => {
       result.failures.map((failure) => failure.date),
       [segment(0), segment(1)],
     );
-    assert.ok(result.failures[0].why.length > 0);
+    // A code, not a message. A filesystem error's message carries the whole
+    // path it failed on, and these lines ship in support bundles.
+    assert.equal(result.failures[0].why, "EACCES");
+    assert.ok(!result.failures[0].why.includes(dir));
     chmodSync(treeRoot(dir), 0o700);
     assert.deepEqual(remaining(), [0, 1, 5]);
   });

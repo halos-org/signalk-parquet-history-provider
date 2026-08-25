@@ -607,6 +607,17 @@ describe("retention", () => {
     assert.match(errors.join("\n"), /retention could not remove 1 date/);
     assert.match(errors.join("\n"), /2026-07-01: EACCES/);
   });
+
+  it("reports a tree it could not list apart from a directory it could not remove", async () => {
+    record(sample({ ts: AUG_23 }));
+    await scheduler({
+      spawnRoll: (args) => summarising(args, { expiryTreeError: "EIO" }),
+    }).rollOnce(SLOT);
+
+    assert.equal(store.rowCount(), 0);
+    assert.match(errors.join("\n"), /could not list the Parquet tree \(EIO\)/);
+    assert.doesNotMatch(errors.join("\n"), /could not remove/);
+  });
 });
 
 describe(

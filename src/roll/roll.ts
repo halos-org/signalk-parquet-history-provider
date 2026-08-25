@@ -136,6 +136,8 @@ export interface RollResult {
   expired: string[];
   /** Directories retention should have removed and could not. */
   expiryFailures: ExpiryFailure[];
+  /** Why retention could not list the tree at all, if it could not. */
+  expiryTreeError: string | null;
 }
 
 export async function roll(options: RollOptions): Promise<RollResult> {
@@ -224,6 +226,7 @@ export async function roll(options: RollOptions): Promise<RollResult> {
     sidecarRows: written.sidecarRows,
     expired: expired.removed,
     expiryFailures: expired.failures,
+    expiryTreeError: expired.treeError,
   };
 }
 

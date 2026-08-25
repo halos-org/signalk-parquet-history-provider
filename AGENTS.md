@@ -247,6 +247,15 @@ reported, and the roll still exits 0, because a roll that fails is a roll whose
 rows are never truncated from the hot store. Costing recording to save disk is
 the wrong trade.
 
+Its two failures are reported apart, because they are different states with
+different remedies: a tree that could not be listed means nothing was even
+considered, and a directory that could not be unlinked means the rest of the
+expiry ran. A _missing_ tree is neither — that is every device's first hour, and
+the only case that stays silent. What is reported is an error **code**, never a
+message: a filesystem error's message carries the whole path it failed on, these
+lines reach the Signal K log and ship in support bundles, and the date already
+names the directory an operator would act on.
+
 A query that has already listed a file expiry then unlinks fails, and nothing
 retries it. The window is between `treeFilesInRange`'s readdir and DuckDB
 opening the file, it needs a request whose range reaches the oldest day in the

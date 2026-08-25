@@ -52,7 +52,8 @@ async function main(): Promise<void> {
   const dataDir = argValue("--data-dir");
   if (dataDir === undefined || dataDir === "") {
     writeStderr(
-      "usage: writer/main.js --data-dir <path> --roll-interval-minutes <n>\n",
+      "usage: writer/main.js --data-dir <path> --roll-interval-minutes <n> " +
+        "[--retention-days <n>]\n",
     );
     process.exit(1);
   }

@@ -44,6 +44,7 @@ export interface ExpireOptions {
 
 export interface ExpiryFailure {
   date: string;
+  /** An error code, never a message: a message carries the configured path. */
   why: string;
 }
 
@@ -52,6 +53,15 @@ export interface ExpiryResult {
   removed: string[];
   /** Directories the window had passed and that could not be removed. */
   failures: ExpiryFailure[];
+  /**
+   * Why the tree could not be listed at all, if it could not.
+   *
+   * Apart from the failures above, because it is a different state and a
+   * different remedy: not "these three are stuck" but "nothing was even
+   * considered". A missing tree is not one of these — that is every device's
+   * first hour.
+   */
+  treeError: string | null;
 }
 
 /**
@@ -63,7 +73,7 @@ export interface ExpiryResult {
  * not be allowed to stop recording.
  */
 export function expire(options: ExpireOptions): ExpiryResult {
-  const result: ExpiryResult = { removed: [], failures: [] };
+  const result: ExpiryResult = { removed: [], failures: [], treeError: null };
   const days = Math.floor(options.retentionDays);
   if (!Number.isFinite(days) || days < 1) return result;
 
@@ -71,8 +81,13 @@ export function expire(options: ExpireOptions): ExpiryResult {
   let entries: string[];
   try {
     entries = readdirSync(root);
-  } catch {
-    // No tree yet, which is every device's first hour.
+  } catch (err) {
+    // A missing tree is every device's first hour and says nothing. Anything
+    // else — EACCES, EIO, a card that has gone read-only — means retention did
+    // not run, and returning the same empty answer for both would let the
+    // scheduler report a clean roll while the tree grows without bound.
+    const code = errorCode(err);
+    if (code !== "ENOENT") result.treeError = code;
     return result;
   }
 
@@ -94,13 +109,25 @@ export function expire(options: ExpireOptions): ExpiryResult {
       });
       result.removed.push(date);
     } catch (err) {
-      result.failures.push({
-        date,
-        why: err instanceof Error ? err.message : String(err),
-      });
+      result.failures.push({ date, why: errorCode(err) });
     }
   }
   return result;
+}
+
+/**
+ * An error reduced to something safe to log.
+ *
+ * The code, or failing that the class — never the message. A filesystem error's
+ * message carries the whole path it failed on, and these lines reach the Signal
+ * K log and ship in support bundles from a public plugin. The date already
+ * names which directory is stuck, which is the part an operator can act on;
+ * `EACCES` against `ENOTEMPTY` against `EROFS` is the rest of it.
+ */
+function errorCode(err: unknown): string {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  if (typeof code === "string" && code !== "") return code;
+  return err instanceof Error ? err.name : "unknown";
 }
 
 /**

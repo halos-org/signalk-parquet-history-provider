@@ -352,15 +352,15 @@ task assignments.
 - **Selection is by date directory and timestamp, not by partition pruning.** A
   reader narrows to files with a directory glob and a `ts` filter; nothing in
   the tree prunes on `path`.
-- **Expiry drops whole date directories.** Settled by Unit 5a, and one step
-  coarser than this document expected: a roll file is named for the roll that
-  wrote it, not for the rows inside it, so the file name bounds nothing and the
-  date directory is the finest boundary in the tree. That makes retention a
-  **storage bound rather than a deletion guarantee** — a directory survives
-  until its whole day is behind the window, so the oldest surviving sample can
-  be up to a day older than the boundary. The window is measured back from
-  `min(clock, the end of the newest date directory)`, which is QuestDB's TTL
-  formula with the directory in place of its latest timestamp.
+- **Expiry drops whole date directories, and nothing finer.** A roll file is
+  named for the roll that wrote it, not for the rows inside it, so the file name
+  bounds nothing and the date directory is the finest boundary the tree has.
+  That makes retention a **storage bound rather than a deletion guarantee** — a
+  directory survives until its whole day is behind the window, so the oldest
+  surviving sample can be up to a day older than the boundary. The window is
+  measured back from `min(clock, the end of the newest date directory)`, which
+  is QuestDB's TTL formula with the directory in place of its latest timestamp.
+  Settled by Unit 5a.
 - **The sidecar is read as well as written.** Each roll folds the previous one
   in, so it is an input to the roll that produces it. It lives at
   `latest/latest.parquet`, a sibling of the tree rather than a file inside it,

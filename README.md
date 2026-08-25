@@ -20,9 +20,8 @@ on a schedule; and a query service holds one DuckDB engine that serves both
 history API surfaces — the v2 REST API, and v1 playback and snapshots — reading
 the tree and the hot store as one.
 
-Retention drops whole UTC days once the window has passed them. The resolution
-ladder, packaging and on-device verification are still open. Progress is tracked
-in
+The resolution ladder, packaging and on-device verification are still open.
+Progress is tracked in
 [halos-org/halos#152](https://github.com/halos-org/halos/issues/152).
 
 ## The tree

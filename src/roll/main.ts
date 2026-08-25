@@ -111,7 +111,8 @@ async function main(): Promise<void> {
   const dataDir = argValue("--data-dir");
   if (dataDir === undefined || dataDir === "") {
     writeStderr(
-      "usage: roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms>\n",
+      "usage: roll/main.js --data-dir <path> --max-rowid <n> --roll-id <ms> " +
+        "[--retention-days <n>] [--replace]\n",
     );
     process.exit(1);
   }

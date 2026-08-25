@@ -296,18 +296,33 @@ export class RollScheduler {
     this.options.log(
       `roll ${rollId} wrote ${outcome.summary}; ${removed} rows truncated`,
     );
-    // On the error sink rather than in the line above: a tree that keeps
-    // growing past its configured bound is the failure an operator has to see,
-    // and it repeats every roll until the directory can be unlinked.
-    const failures = outcome.result.expiryFailures ?? [];
-    if (failures.length > 0) {
+    this.reportExpiry(outcome.result);
+  }
+
+  /**
+   * What retention could not do, on the error sink.
+   *
+   * Not in the success line above, because a tree growing past its configured
+   * bound is a failure an operator has to see, and it repeats every roll until
+   * the cause goes. The two states are reported apart: a tree that could not be
+   * listed means nothing was even considered, and a directory that could not be
+   * unlinked means the rest of the expiry ran.
+   */
+  private reportExpiry(result: RollSummary): void {
+    if (typeof result.expiryTreeError === "string") {
       this.reportFailure(
-        `retention could not remove ${failures.length} date ` +
-          `${failures.length === 1 ? "directory" : "directories"} ` +
-          `(${failures[0].date}: ${failures[0].why}); the tree is over its ` +
-          `configured retention until they go`,
+        `retention could not list the Parquet tree (${result.expiryTreeError}); ` +
+          `nothing is being expired and the tree grows without bound`,
       );
     }
+    const failures = result.expiryFailures ?? [];
+    if (failures.length === 0) return;
+    this.reportFailure(
+      `retention could not remove ${failures.length} date ` +
+        `${failures.length === 1 ? "directory" : "directories"} ` +
+        `(${failures[0].date}: ${failures[0].why}); the tree is over its ` +
+        `configured retention until they go`,
+    );
   }
 
   /** Roll failures go to the error sink, which the plugin routes to
@@ -496,9 +511,10 @@ interface RollSummary {
   files: { date: string }[];
   sidecarRows: number;
   peakRssBytes: number | null;
-  /** Optional, because a roll built before retention existed omits both. */
+  /** Optional, because a roll built before retention existed omits all three. */
   expired?: string[];
   expiryFailures?: { date: string; why: string }[];
+  expiryTreeError?: string | null;
 }
 
 function parseSummary(stdout: string): RollSummary | null {
