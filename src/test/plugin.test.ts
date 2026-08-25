@@ -224,3 +224,74 @@ describe("the plugin", () => {
     assert.doesNotThrow(() => plugin.stop());
   });
 });
+
+describe("the history v1 slot", () => {
+  /** Starts the plugin against a server whose settings and slot are given. */
+  async function startWith(over: Record<string, unknown>) {
+    const work = mkdtempSync(join(tmpdir(), "sk-parquet-v1slot-"));
+    const { app, calls } = stubApp(work);
+    const plugin = createPlugin({ ...app, ...over } as typeof app);
+    try {
+      plugin.start({});
+      await plugin.stop();
+      return { calls, said: calls.logged.map(String).join("\n") };
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  }
+
+  it("takes it when no default provider is configured", async () => {
+    // The common case: nothing writes that setting except the Admin UI, so a
+    // device where nobody picked has no key at all. Declining here would mean
+    // no playback and no snapshots on a device this plugin is alone on.
+    const { calls, said } = await startWith({});
+    assert.equal(calls.registeredV1.length, 1);
+    assert.equal(said, "");
+  });
+
+  it("takes it when it is the configured default", async () => {
+    const { calls } = await startWith({
+      config: { settings: { historyApi: { defaultProvider: PLUGIN_ID } } },
+    });
+    assert.equal(calls.registeredV1.length, 1);
+  });
+
+  it("stands aside for another configured provider, and says so", async () => {
+    const { calls, said } = await startWith({
+      config: {
+        settings: {
+          historyApi: { defaultProvider: "signalk-questdb-history-provider" },
+        },
+      },
+    });
+    assert.equal(calls.registeredV1.length, 0, "the slot was taken anyway");
+    assert.match(said, /not registering the history v1 provider/);
+    assert.match(said, /signalk-questdb-history-provider/);
+    // v2 is unaffected: its registry keys by plugin id and two providers
+    // coexist there without either one silently winning.
+    assert.equal(calls.registered.length, 1, "the v2 surface was lost too");
+  });
+
+  it("reports a slot another provider already held", async () => {
+    const { calls, said } = await startWith({
+      historyProvider: { streamHistory: () => {} },
+    });
+    assert.equal(calls.registeredV1.length, 1, "it still takes the slot");
+    assert.match(said, /already holds the v1 slot/);
+    assert.match(said, /unsupported/);
+  });
+
+  it("does not report a takeover it is not performing", async () => {
+    const { calls, said } = await startWith({
+      historyProvider: { streamHistory: () => {} },
+      config: {
+        settings: {
+          historyApi: { defaultProvider: "signalk-questdb-history-provider" },
+        },
+      },
+    });
+    assert.equal(calls.registeredV1.length, 0);
+    assert.doesNotMatch(said, /already holds the v1 slot/);
+    assert.match(said, /not registering the history v1 provider/);
+  });
+});

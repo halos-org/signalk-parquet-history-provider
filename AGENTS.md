@@ -119,6 +119,10 @@ a check on module evaluation alone.
   ([#33](https://github.com/halos-org/signalk-questdb-history-provider/issues/33)),
   and a window that has not happened yet is not read
   ([#34](https://github.com/halos-org/signalk-questdb-history-provider/issues/34)).
+- `src/history-v1-slot.ts` — who may take the v1 slot, and what the operator is
+  told when this plugin stands aside or takes it from somebody. Pure and
+  engine-free; the plugin supplies the settings and the observed slot. See "The
+  history surface" for why declining on an absent setting would be wrong.
 - `src/history-v2.ts` — the history v2 REST surface, registered by the plugin.
   Mostly contract behaviour copied from
   `signalk-questdb-history-provider/src/history-v2.ts` — the moving averages,
@@ -311,16 +315,49 @@ allowed directory still works afterwards.
 
 `docs/query-layer.md` has the measurements behind every number here.
 
+## Names
+
+**The package is `@halos-org/signalk-parquet-history-provider`; the plugin id
+is `signalk-parquet-history-provider`.** They differ on purpose and must not be
+made to match. The id becomes a filename — `plugin-config-data/<id>.json` — so
+a scope would put a slash in it, and it is also what
+`historyApi.defaultProvider` holds, because the server keys its registry on
+`plugin.id` and carries the package name separately as `plugin.packageName`
+(`signalk-server/src/interfaces/plugins.ts:1222`).
+`@halos-org/skip-freeboard-panel` is the same shape.
+`src/test/package-e2e.test.ts` pins the relation that is left: the id is the
+package name with the scope stripped, so neither can be renamed alone.
+
+The scope is why `publishConfig.access` is `public` — a scoped package
+publishes restricted by default, and that failure would land at install time on
+a boat rather than in CI. Workflows read the name from `package.json` rather
+than spelling it, with one exception: `main.yml`'s `package-name` is a _Debian_
+name, which takes neither `@` nor `/`.
+
 ## The history surface
 
 Two of them, registered separately because the server's two registries arrived
 in different releases: a server carrying one and not the other serves the half
 it has. **The v1 registry is a single global slot** —
 `signalk-server/src/index.ts:316`, last registration wins — so two history
-plugins on one device silently pick a winner. Gating registration on the
-configured provider is
-[halos-org/halos#168](https://github.com/halos-org/halos/issues/168); running
-two of them together is unsupported either way.
+plugins on one device silently pick a winner.
+
+`src/history-v1-slot.ts` decides whether this plugin may take that slot: yes
+when it is the configured `historyApi.defaultProvider`, yes when nothing is
+configured, no when the key names somebody else. **The second condition is not
+a convenience and must not be removed.** Nothing writes that setting except the
+Admin UI — `registerHistoryApiProvider` sets none, and `saveConfiguredProvider`
+is reached only from the `PUT` route — so on a device where nobody ever picked,
+the key is absent for ever, and gating on it alone would leave playback and
+snapshots dead even for the only history provider installed. v2 needs no gate:
+its registry keys by plugin id and its default falls back to the first
+registered provider.
+
+Co-residency is reported rather than resolved, and the report is one-sided: the
+app object a plugin receives is a shallow copy taken when it loads, so a
+provider registering _earlier_ is visible and one registering _later_ is not. A
+precedence rule invented here would still lose to that second case. Running two
+history providers on one device is unsupported.
 
 The plugin registers the v2 provider on start and does not unregister it: the
 server's plugin wrapper queues that when the provider is registered and runs it
