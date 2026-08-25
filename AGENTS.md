@@ -106,12 +106,14 @@ a check on module evaluation alone.
   `streamHistory` and `getHistory`, all three registered by the plugin. The
   chunk/resume machine and the delta grouping are copied from
   `signalk-questdb-history-provider/src/history-v1.ts`; the queries are not.
-  Fix contract bugs in both. It **differs** from the sibling by two: the own
+  Fix contract bugs in both. It **differs** from the sibling by three: the own
   vessel's context is resolved in `getHistory` as well as in `streamHistory`
   ([#32](https://github.com/halos-org/signalk-questdb-history-provider/issues/32)),
-  and a `playbackRate` that is not a number falls back to real time instead of
+  a `playbackRate` that is not a number falls back to real time instead of
   replaying every window with no delay
-  ([#33](https://github.com/halos-org/signalk-questdb-history-provider/issues/33)).
+  ([#33](https://github.com/halos-org/signalk-questdb-history-provider/issues/33)),
+  and a window that has not happened yet is not read
+  ([#34](https://github.com/halos-org/signalk-questdb-history-provider/issues/34)).
 - `src/history-v2.ts` — the history v2 REST surface, registered by the plugin.
   Mostly contract behaviour copied from
   `signalk-questdb-history-provider/src/history-v2.ts` — the moving averages,
@@ -313,7 +315,12 @@ does not do this, which is
 **Playback runs on the query service like everything else.** A session reads a
 60-second window per chunk and holds no engine between them, so the queue can
 only be as deep as there are clients — one outstanding request each, by
-construction. Nothing caps the number of sessions: past `MAX_QUEUED_QUERIES` a
+construction. **A window that has not happened yet is not read at all.** An
+empty window advances the cursor, so without that rule a replay which catches
+up with real time reads one future window every 100 ms, for ever, against the
+service every other history request shares. The sibling provider does exactly
+that, which is
+[signalk-questdb-history-provider#34](https://github.com/halos-org/signalk-questdb-history-provider/issues/34). Nothing caps the number of sessions: past `MAX_QUEUED_QUERIES` a
 request is refused, which reaches a session as an error and becomes the same
 backoff as any other failure, and the v1 interface gives a provider no channel
 to refuse a session on. A cap enforced through `hasAnyData` would tell the

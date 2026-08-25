@@ -31,13 +31,22 @@ import { QueryRunner, RANGE_COLUMNS } from "./query/duck.js";
  */
 
 /** How much wall time one read covers, at playback rate 1. */
-const CHUNK_SECONDS = 60;
+export const CHUNK_SECONDS = 60;
 
 /**
  * Rows one read returns. A window holding more is drained across several reads
  * rather than truncated — see the resume rule below.
  */
 const CHUNK_ROW_LIMIT = 10000;
+
+/**
+ * How long a completed but empty window pauses before the next one is read.
+ *
+ * Short, because there is nothing to pace: a gap in the recording should not
+ * replay as a gap in wall time. It is only ever paid on windows that are over,
+ * so it cannot become a poll of the present.
+ */
+const EMPTY_WINDOW_MS = 100;
 
 /**
  * The upper bound of the "is there anything to play back" range.
@@ -290,6 +299,14 @@ export function createHistoryProviderV1(
     };
 
     const startTime = options.startTime.getTime();
+    // The same guard `hasAnyData` applies, because the failure without it is
+    // not a bad answer: every read would be refused by the query layer, and
+    // every refusal reschedules, so a start time that is not a time becomes a
+    // query a second for as long as the client stays connected.
+    if (!Number.isFinite(startTime)) {
+      debug(`streamHistory: ${String(options.startTime)} is not a start time`);
+      return () => {};
+    }
     // `spark.query.playbackRate || 1` is what the server passes, and a query
     // string is text: `?playbackRate=fast` arrives here as a string that
     // `Math.max` alone turns into NaN, and `setTimeout(fn, NaN)` fires
@@ -306,6 +323,20 @@ export function createHistoryProviderV1(
       if (stopped) return;
       const chunkEnd = currentTime + CHUNK_SECONDS * 1000;
 
+      // A window that has not happened yet is not read at all. Reading it is
+      // what turns a replay that has caught up with real time into a permanent
+      // poll: it comes back empty because it is in the future, the cursor
+      // advances past it anyway, and the next one is further into the future
+      // still — a query every 100 ms per connected client, for ever, against
+      // the one service every other history request shares. Waiting for the
+      // window costs the client the same 60 seconds the replay's own cadence
+      // costs it, and the window is read once, complete.
+      const untilComplete = chunkEnd - Date.now();
+      if (untilComplete > 0) {
+        scheduleChunk(untilComplete);
+        return;
+      }
+
       try {
         const answer = await runner.run({
           kind: "range",
@@ -318,8 +349,11 @@ export function createHistoryProviderV1(
         if (stopped) return;
 
         if (answer.rows.length === 0) {
+          // A window that is over and holds nothing — the vessel was off, or
+          // the replay started before recording did. Skipped quickly rather
+          // than in wall time, because there is nothing to pace.
           currentTime = chunkEnd;
-          scheduleChunk(100);
+          scheduleChunk(EMPTY_WINDOW_MS);
           return;
         }
 

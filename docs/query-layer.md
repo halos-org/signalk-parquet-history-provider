@@ -261,7 +261,9 @@ _fails_ costs only the request; the engine is worth more than one answer.
 **A playback session is a client of the same queue, not a process of its own.**
 It reads a 60-second window per chunk and holds no engine between chunks, so it
 has at most one outstanding request at any moment and N clients make a queue of
-N. Past the eight that may wait, a request is refused — which reaches a playback
+N. It also never reads a window that has not happened yet, which is what keeps
+a session that has caught up with real time from becoming ten queries a second
+against this service for as long as its client stays connected. Past the eight that may wait, a request is refused — which reaches a playback
 session as an error and becomes the same backoff as any other failure. Nothing
 caps the number of sessions: the v1 provider interface offers no way to decline
 one, and the only answer it does have (`hasAnyData` returning false) means "this

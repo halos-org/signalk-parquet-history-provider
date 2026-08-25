@@ -1,11 +1,11 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_LAYOUT } from "../data-dir.js";
-import { createHistoryProviderV1 } from "../history-v1.js";
+import { CHUNK_SECONDS, createHistoryProviderV1 } from "../history-v1.js";
 import { QueryRunner } from "../query/duck.js";
 import { roll } from "../roll/roll.js";
 import { writerPaths } from "../writer/contract.js";
@@ -568,12 +568,12 @@ describe("streamHistory", { skip: NO_BUNDLED_EXTENSION }, () => {
 
   it("retries the window it could not read rather than skipping it", async () => {
     record(sample({ ts: AUG_23, path: "a", value: 1 }));
+    // A store the engine cannot open. The window must be read again once it
+    // can, because skipping it hands the client a gap it has no way to notice.
+    const storePath = writerPaths(dir).store;
     store.close();
-    // A store the engine cannot open: the query fails, and the window must be
-    // read again once it can, because skipping it would hand the client a gap
-    // it has no way to notice.
-    rmSync(writerPaths(dir).store, { force: true });
-    mkdirSync(writerPaths(dir).store, { recursive: true });
+    renameSync(storePath, `${storePath}.away`);
+    mkdirSync(storePath);
 
     const client = fakeSpark();
     const stop = history.streamHistory(client.spark, ask(AUG_23), () => {});
@@ -583,6 +583,79 @@ describe("streamHistory", { skip: NO_BUNDLED_EXTENSION }, () => {
         "the failure to be reported",
       );
       assert.equal(client.writes.length, 0);
+
+      rmSync(storePath, { recursive: true });
+      renameSync(`${storePath}.away`, storePath);
+
+      // The same window, read again and delivered — not the next one.
+      await eventually(() => client.writes.length >= 1, "the retried window");
+      assert.deepEqual(replayed(client.writes), [["a", 1]]);
+    } finally {
+      stop();
+    }
+  });
+
+  it("waits for a window that has not happened yet", async () => {
+    // Otherwise a replay that catches up with real time never stops: the
+    // window ahead of now is empty because it is in the future, the cursor
+    // advances past it, and the next one is further ahead still — a query
+    // every 100 ms per client, for ever, against the one shared service.
+    const now = Date.now();
+    const started = now - CHUNK_SECONDS * 1000 - 5000;
+    record(sample({ ts: started + 1000, path: "a", value: 1 }));
+
+    let runs = 0;
+    const counted = new Proxy(runner, {
+      get(target, property, receiver) {
+        if (property === "run") {
+          return (request: never) => {
+            runs += 1;
+            return target.run(request);
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const counting = createHistoryProviderV1(counted, SELF, (line) =>
+      debugLines.push(line),
+    );
+
+    const client = fakeSpark();
+    const stop = counting.streamHistory(client.spark, ask(started), () => {});
+    try {
+      // The first window is over, so it is read and replayed. The second ends
+      // about 55 seconds from now, so it is not read at all.
+      await eventually(() => client.writes.length >= 1, "the complete window");
+      const after = runs;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(runs, after, "the future window was read anyway");
+      assert.equal(client.writes.length, 1);
+    } finally {
+      stop();
+    }
+  });
+
+  it("does not replay from a start time that is not a time", async () => {
+    record(sample({ ts: AUG_23, path: "a", value: 1 }));
+
+    const client = fakeSpark();
+    const stop = history.streamHistory(
+      client.spark,
+      { startTime: new Date("not a date"), playbackRate: 1 },
+      () => {},
+    );
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(client.writes.length, 0);
+      // Every read would be refused by the query layer and every refusal
+      // reschedules, so without the guard this is a query a second for as long
+      // as the client stays connected.
+      assert.equal(
+        debugLines.filter((line) => line.startsWith("streamHistory error"))
+          .length,
+        0,
+      );
     } finally {
       stop();
     }
