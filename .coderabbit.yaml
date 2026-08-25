@@ -18,6 +18,20 @@ reviews:
       - "dependabot[bot]"
       - "github-actions[bot]"
 
+  pre_merge_checks:
+    # Off, because the 80% default measures a convention this repository
+    # deliberately does not follow. CLAUDE.md asks for rare, short comments that
+    # explain *why* at the point of the decision, so the explanation for
+    # `writePendingRoll`, `defaultSpawn` or `rollIdSegment` sits inside the body
+    # and `roll()`'s sits in the module block above it. Coverage counts none of
+    # those and reads the file as undocumented. Left on, every PR here carries a
+    # warning nobody can clear without padding the code, which is how a warning
+    # stops meaning anything.
+    #
+    # Quoted: bare `off` is a YAML 1.1 boolean, and this field takes a string.
+    docstrings:
+      mode: "off"
+
   path_filters:
     - "!**/package-lock.json"
     - "!**/dist/**"
