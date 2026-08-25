@@ -11,6 +11,7 @@ import {
   normalizeConfig,
 } from "./config/schema.js";
 import type { Config } from "./config/schema.js";
+import { createHistoryProviderV1 } from "./history-v1.js";
 import { createHistoryV2 } from "./history-v2.js";
 import { QueryRunner } from "./query/duck.js";
 import { DATA_DIR_MODE, DATA_LAYOUT, resolveDataDir } from "./data-dir.js";
@@ -56,6 +57,20 @@ interface App {
    * already gone by the time anything below happens.
    */
   registerHistoryApiProvider?: (provider: HistoryProvider) => void;
+  /**
+   * The v1 registry: WebSocket playback and the snapshot REST route.
+   *
+   * Optional for the same reason as the v2 one, and unregistered the same way —
+   * the plugin wrapper queues `unregisterHistoryProvider` as an onStop handler
+   * when the provider is registered through it.
+   *
+   * **The server keeps one v1 provider, globally.** `src/index.ts:316` is a
+   * single slot and the last registration wins, so two history plugins on one
+   * device silently pick a winner. Gating this on the configured provider is
+   * [halos-org/halos#168](https://github.com/halos-org/halos/issues/168);
+   * running two providers together is unsupported either way.
+   */
+  registerHistoryProvider?: (provider: HistoryProviderV1) => void;
   streambundle: {
     getBus: (path?: string) => {
       onValue: (fn: (value: BusValue) => void) => () => void;
@@ -63,6 +78,9 @@ interface App {
   };
   [key: string]: unknown;
 }
+
+/** What `createHistoryProviderV1` returns; the server exports no type for it. */
+type HistoryProviderV1 = ReturnType<typeof createHistoryProviderV1>;
 
 const WRITER_ENTRY = fileURLToPath(
   new URL("./writer/main.js", import.meta.url),
@@ -291,6 +309,19 @@ export default (app: App) => {
           app.debug(
             "this server has no history provider registry; recording only",
           );
+        }
+        // Registered separately, because the two registries are separate: a
+        // server old enough to have one and not the other serves the half it
+        // has rather than neither.
+        if (app.registerHistoryProvider) {
+          app.registerHistoryProvider(
+            createHistoryProviderV1(queries, app.selfContext, (line) =>
+              app.debug(line),
+            ),
+          );
+          app.debug("registered the history v1 provider");
+        } else {
+          app.debug("this server has no v1 history registry; no playback");
         }
 
         statusTimer = setInterval(status, STATUS_INTERVAL_MS);
