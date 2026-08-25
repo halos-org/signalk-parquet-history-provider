@@ -44,6 +44,27 @@ export function treeRoot(dataDir: string): string {
   return join(resolve(dataDir), DATA_LAYOUT.tree);
 }
 
+/**
+ * The UTC midnight a `date=YYYY-MM-DD` directory names, or null for an entry
+ * that is not one.
+ *
+ * Shared by the reader, which selects files with it, and by expiry, which
+ * deletes directories with it. Two copies of this rule would be two answers to
+ * "is this entry ours", and the one that says yes too readily removes a
+ * directory the tree does not own.
+ *
+ * Round-tripped rather than range-checked: `Date.parse` accepts
+ * `2026-08-32T00:00:00.000Z` in some engines and rolls it into September, which
+ * would name a directory a day that is not the one it holds.
+ */
+export function dateDirectoryStart(entry: string): number | null {
+  if (!entry.startsWith("date=")) return null;
+  const date = entry.slice("date=".length);
+  const parsed = Date.parse(`${date}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed) || utcDateSegment(parsed) !== date) return null;
+  return parsed;
+}
+
 /** The directory for one date. The roll creates it before writing into it. */
 export function dateDirectory(dataDir: string, ts: number): string {
   return join(treeRoot(dataDir), `date=${utcDateSegment(ts)}`);
