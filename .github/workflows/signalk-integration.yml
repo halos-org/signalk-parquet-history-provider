@@ -3,11 +3,12 @@
 # modules in isolation, and package-e2e asserts the tarball's shape -- not
 # that signalk-server finds the package, reads its schema and starts it.
 #
-# It asserts the v2 history surface answers, because that is the only place
-# the whole chain is exercised at once: sample NMEA into the recorder, through
-# the socket to the writer, into SQLite, out through the query service's
-# DuckDB and back as JSON. The v1 surface is issue 172 under
-# https://github.com/halos-org/halos/issues/172.
+# It asserts the history surfaces answer, because that is the only place the
+# whole chain is exercised at once: sample NMEA into the recorder, through the
+# socket to the writer, into SQLite, out through the query service's DuckDB and
+# back as JSON. Both API versions are checked -- the v2 REST endpoints, and the
+# v1 snapshot, which additionally goes through the server's own tree builder.
+# v1 playback is a WebSocket and is covered by the unit suite instead.
 
 name: Signal K Integration
 
@@ -214,6 +215,31 @@ jobs:
               process.exit(1);
             }
             console.log(`  values: ${answer.data.length} rows for ${series.path} as ${series.method}`);
+          ' || { cat /tmp/sk.log; exit 1; }
+
+          # The v1 snapshot route, which is the half of that surface a shell can
+          # reach -- playback is a WebSocket and is covered by the unit suite.
+          # It is worth its own check because it is the one request that goes
+          # through the server's own tree builder: the route maps `self` in the
+          # URL to the vessel's id before walking what it built, so a provider
+          # returning the context the store spells answers 200 here with
+          # nothing, or throws inside the builder.
+          echo "--- history v1 snapshot ---"
+          AT=$(node -e 'console.log(new Date().toISOString())')
+          SNAPSHOT="http://localhost:3000/signalk/v1/snapshot"
+          LEAF=$(echo "$ASKED" | tr '.' '/')
+          CODE=$(curl -s -o /tmp/snapshot.json -w '%{http_code}' \
+            "$SNAPSHOT/vessels/self/$LEAF?time=$AT")
+          [ "$CODE" = "200" ] || {
+            echo "::error::the v1 snapshot answered $CODE: $(cat /tmp/snapshot.json)"
+            cat /tmp/sk.log; exit 1; }
+          node -e '
+            const leaf = JSON.parse(require("fs").readFileSync("/tmp/snapshot.json", "utf8"));
+            if (typeof leaf?.value !== "number") {
+              console.error(`::error::the v1 snapshot returned ${JSON.stringify(leaf)}`);
+              process.exit(1);
+            }
+            console.log(`  snapshot: ${leaf.value} at ${leaf.timestamp}`);
           ' || { cat /tmp/sk.log; exit 1; }
 
           # The premise of the design: the server pays for no storage engine.
