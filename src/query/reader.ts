@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { DuckDBInstance, listValue } from "@duckdb/node-api";
 import type { DuckDBConnection, DuckDBValue } from "@duckdb/node-api";
@@ -128,7 +129,59 @@ interface Overlap {
 interface Plan {
   files: TreeFile[];
   overlap: Overlap | null;
-  storeExists: boolean;
+  /** Whether this window is read from the hot store at all. See `needsHotStore`. */
+  readStore: boolean;
+}
+
+/**
+ * Whether a window can hold a row the hot store still has.
+ *
+ * `sqlite_scanner` does not push a predicate into SQLite: the plan puts a
+ * FILTER above a SQLITE_SCAN that emits every row, so a branch matching
+ * nothing still costs a scan of the whole store. Attaching it for a window it
+ * cannot answer therefore charges each query for however much the current roll
+ * interval has accumulated -- measured on a device at 0.708 ms per 1000 rows,
+ * which took one unchanged historical query from 25 ms just after a roll to
+ * 157 ms just before the next. An index does not help, because nothing reaches
+ * it.
+ *
+ * The decision rests on the oldest row and never on the newest. The oldest
+ * only moves forward -- the roll truncates from the front, the writer appends
+ * to the back -- so a window ending before it will still end before it when
+ * the query runs. The newest moves the other way, and a window opening after
+ * it can be filled by the writer between this read and the scan, so a store
+ * with nothing in it yet is read rather than skipped.
+ */
+export function needsHotStore(oldestTs: number | null, to: number): boolean {
+  if (oldestTs === null) return true;
+  return to > oldestTs;
+}
+
+/**
+ * The timestamp of the oldest row the hot store still holds, `null` when it is
+ * empty, and `undefined` when there is no store to read.
+ *
+ * By rowid rather than `min(ts)`, for the reason `HotStore.oldestTimestamp`
+ * gives: rowid order is insertion order, so this is one row rather than a scan
+ * of the table this exists to avoid scanning.
+ */
+function hotStoreOldest(dataDir: string): number | null | undefined {
+  const path = writerPaths(dataDir).store;
+  if (!existsSync(path)) return undefined;
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(path, { readOnly: true });
+    const row = db
+      .prepare("SELECT ts FROM sample ORDER BY rowid LIMIT 1")
+      .get() as { ts: number } | undefined;
+    return row === undefined ? null : Number(row.ts);
+  } catch {
+    // A store being created, or one this build cannot open. Read it through
+    // DuckDB as before rather than dropping rows the window may need.
+    return null;
+  } finally {
+    db?.close();
+  }
 }
 
 /** An engine held open, and the queries it answers. */
@@ -240,10 +293,10 @@ async function runOne(
     // an error — the history API's own answer for a range with no data.
     return { rows: [], truncated: false, treeFiles: 0 };
   }
-  requireScanner(plan.storeExists, context);
+  requireScanner(plan.readStore, context);
 
   const answer = await execute(context, sql, {
-    attach: plan.storeExists,
+    attach: plan.readStore,
     limit: rowLimit(request),
   });
   return { ...answer, treeFiles: plan.files.length };
@@ -496,10 +549,11 @@ function pathFilter(
  */
 function planSources(dataDir: string, request: WindowedRequest): Plan {
   const files = treeFilesInRange(dataDir, request.from, request.to);
+  const oldest = hotStoreOldest(dataDir);
   return {
     files,
     overlap: rolledOverlap(dataDir, files),
-    storeExists: existsSync(writerPaths(dataDir).store),
+    readStore: oldest !== undefined && needsHotStore(oldest, request.to),
   };
 }
 
@@ -603,7 +657,7 @@ function compile(request: WindowedRequest, plan: Plan): Compiled | null {
       `SELECT ${COLUMNS} FROM read_parquet([${list}], union_by_name = true) WHERE ${where}`,
     );
   }
-  if (plan.storeExists) {
+  if (plan.readStore) {
     branches.push(
       `SELECT ${COLUMNS} FROM hot.sample WHERE ${where}${seam(plan.overlap, params)}`,
     );
