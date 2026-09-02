@@ -47,14 +47,6 @@ CREATE TABLE IF NOT EXISTS sample (
   value_lon  REAL
 );
 
--- Read by the query service through node:sqlite, where SQLite turns
--- SELECT MIN(ts) into a seek instead of a scan. That boundary decides whether
--- a query reads the store at all, so it is asked on every request and has to
--- be cheap. It buys the DuckDB side nothing -- sqlite_scanner pushes no
--- predicate down and reaches no index -- and costs one right-edge append per
--- row, because ts is a clock reading and arrives in near order.
-CREATE INDEX IF NOT EXISTS sample_ts ON sample (ts);
-
 CREATE TABLE IF NOT EXISTS writer_state (
   id       INTEGER PRIMARY KEY CHECK (id = 0),
   session  TEXT    NOT NULL,

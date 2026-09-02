@@ -48,18 +48,18 @@ describe("the store is configured for cheap, durable-enough writes", () => {
     assert.strictEqual(store.pragma("synchronous"), 1);
   });
 
-  it("indexes ts, and nothing else", () => {
-    // This asserted *no* index until the query service began reading the
-    // hot store's lower bound. The old reasoning -- every index is paid on
-    // each insert and nothing reads this table by key -- was sound while that
-    // was true: the roll scans a time range and truncates, and DuckDB's
-    // sqlite_scanner scans regardless of what is indexed.
+  it("carries no index on the sample table", () => {
+    // Still deliberate, and re-checked when the query service began reading
+    // this table's lower bound. Every index is paid on each insert, and the
+    // ingest path is what this design is judged on: a ts index measured
+    // +29.6% bytes at a 5-minute interval and +30.8% at an hour, which would
+    // take the writer's 17.53 KB/s to about 22.8.
     //
-    // `query/reader.ts` now asks SELECT MIN(ts) on every history request to
-    // decide whether the store is worth attaching at all, and it has to be
-    // MIN rather than the first rowid because insertBatch enforces no
-    // timestamp order. Unindexed that is a scan of an interval's whole
-    // ingest, on every query. So exactly one index, on exactly that column.
+    // What reads by key is `query/reader.ts`, which asks SELECT MIN(ts) per
+    // history request to decide whether the store is worth attaching. Scanned
+    // rather than sought, that is 0.84 ms over a 5-minute interval's 16k rows
+    // and 13.99 ms over an hour's 197k -- against the ~11 ms and ~139 ms of
+    // DuckDB scan the answer saves. The scan is the cheaper side of the trade.
     store.beginSession("s1");
     const db = new DatabaseSync(join(dir, "hot.sqlite"), { readOnly: true });
     try {
@@ -67,11 +67,8 @@ describe("the store is configured for cheap, durable-enough writes", () => {
         .prepare(
           "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'sample'",
         )
-        .all() as { name: string }[];
-      assert.deepStrictEqual(
-        indexes.map((row) => row.name),
-        ["sample_ts"],
-      );
+        .all();
+      assert.deepStrictEqual(indexes, []);
     } finally {
       db.close();
     }
@@ -434,28 +431,3 @@ describe("the bound a roll is truncated against", () => {
  * rather than left to the schema string because nothing else fails when it is
  * missing -- queries stay correct and quietly get slower.
  */
-
-/**
- * The plan, not just the presence of the index.
- *
- * An index SQLite declines to use costs the writes and saves nothing, and the
- * read it exists for happens on every history request.
- */
-describe("MIN(ts) is a seek", () => {
-  it("plans through the index rather than scanning", () => {
-    store.beginSession("s1");
-    for (let i = 0; i < 200; i += 1) {
-      store.insertBatch(i + 1, [sample({ ts: 1_000 + i })]);
-    }
-    const db = new DatabaseSync(join(dir, "hot.sqlite"), { readOnly: true });
-    try {
-      const plan = db
-        .prepare("EXPLAIN QUERY PLAN SELECT MIN(ts) FROM sample")
-        .all() as { detail: string }[];
-      const detail = plan.map((row) => row.detail).join(" ");
-      assert.match(detail, /sample_ts/);
-    } finally {
-      db.close();
-    }
-  });
-});

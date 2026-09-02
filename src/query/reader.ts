@@ -172,9 +172,13 @@ export function needsHotStore(oldestTs: number | null, to: number): boolean {
  * would skip a store holding rows inside the window. That is a query missing
  * rows silently, which is worse than the scan this exists to avoid.
  *
- * The index on `ts` is what keeps it cheap: through `node:sqlite` this is a
- * covering-index seek rather than a scan. It does nothing for the DuckDB side,
- * which reaches no index at all -- see `needsHotStore`.
+ * Scanned, not sought, and deliberately so. An index on `ts` would make this
+ * a seek, and it would cost the ingest path ~30% more bytes -- measured on a
+ * device at both interval sizes -- which is the axis this provider wins on.
+ * The scan is 0.84 ms over a 5-minute interval's 16k rows and 13.99 ms over an
+ * hour's 197k, against the ~11 ms and ~139 ms of DuckDB scan the answer saves.
+ * It buys the DuckDB side nothing either way: `sqlite_scanner` pushes no
+ * predicate down and reaches no index -- see `needsHotStore`.
  */
 function hotStoreOldest(dataDir: string): number | null | undefined {
   const path = writerPaths(dataDir).store;
