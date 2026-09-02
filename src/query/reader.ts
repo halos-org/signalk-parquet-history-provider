@@ -161,9 +161,20 @@ export function needsHotStore(oldestTs: number | null, to: number): boolean {
  * The timestamp of the oldest row the hot store still holds, `null` when it is
  * empty, and `undefined` when there is no store to read.
  *
- * By rowid rather than `min(ts)`, for the reason `HotStore.oldestTimestamp`
- * gives: rowid order is insertion order, so this is one row rather than a scan
- * of the table this exists to avoid scanning.
+ * **`MIN(ts)`, and not the first row by rowid.** `HotStore.oldestTimestamp`
+ * reads by rowid and says why -- insertion order, one row instead of a scan --
+ * and that is sound for its own caller, which only asks whether a roll is
+ * overdue. It is not sound here. `insertBatch` enforces no timestamp order and
+ * `ts` is the recorder's clock reading at arrival, so a device correcting its
+ * clock at boot -- the case `path-matcher.ts` already treats as a discontinuity
+ * -- stores a smaller `ts` at a higher rowid. A boundary taken from the first
+ * row would then place the store later than it reaches, and `needsHotStore`
+ * would skip a store holding rows inside the window. That is a query missing
+ * rows silently, which is worse than the scan this exists to avoid.
+ *
+ * The index on `ts` is what keeps it cheap: through `node:sqlite` this is a
+ * covering-index seek rather than a scan. It does nothing for the DuckDB side,
+ * which reaches no index at all -- see `needsHotStore`.
  */
 function hotStoreOldest(dataDir: string): number | null | undefined {
   const path = writerPaths(dataDir).store;
@@ -171,10 +182,10 @@ function hotStoreOldest(dataDir: string): number | null | undefined {
   let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(path, { readOnly: true });
-    const row = db
-      .prepare("SELECT ts FROM sample ORDER BY rowid LIMIT 1")
-      .get() as { ts: number } | undefined;
-    return row === undefined ? null : Number(row.ts);
+    const row = db.prepare("SELECT MIN(ts) AS ts FROM sample").get() as
+      { ts: number | null } | undefined;
+    // `MIN` over an empty table is one row holding NULL, not no row.
+    return row?.ts === undefined || row.ts === null ? null : Number(row.ts);
   } catch {
     // A store being created, or one this build cannot open. Read it through
     // DuckDB as before rather than dropping rows the window may need.

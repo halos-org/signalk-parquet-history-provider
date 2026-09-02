@@ -778,3 +778,35 @@ describe("needsHotStore", () => {
     assert.equal(needsHotStore(null, 1), true);
   });
 });
+
+/**
+ * A sample whose timestamp precedes rows already stored.
+ *
+ * `insertBatch` enforces no timestamp order, and `ts` is the recorder's clock
+ * reading at arrival -- which steps backwards when a device corrects its clock
+ * at boot, the case `path-matcher.ts` already treats as a discontinuity. So the
+ * lowest rowid does not carry the lowest `ts`, and a boundary read from the
+ * first row would place the store later than it reaches. The query would then
+ * skip it and answer without a row the store holds, silently.
+ */
+describe("an out-of-order sample still bounds the hot store", () => {
+  it("reads a window the earliest row falls in, whatever its rowid", async () => {
+    const late = AUG_23 + 60_000;
+    const early = AUG_23 + 1_000;
+    // Stored newest-first, so rowid order and timestamp order disagree.
+    record(sample({ ts: late, path: "a.b", value: 1 }));
+    record(sample({ ts: early, path: "a.b", value: 2 }));
+
+    const rows = await runner.run({
+      kind: "range",
+      from: early,
+      to: early + 1_000,
+      context: "self",
+    });
+    assert.equal(
+      rows.rows.length,
+      1,
+      "the window holds the out-of-order sample and must not be skipped",
+    );
+  });
+});
