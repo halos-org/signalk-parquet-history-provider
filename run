@@ -2,7 +2,7 @@
 #
 # usage: ./run command [argument ...]
 #
-# Commands for signalk-parquet-history-provider development.
+# Commands for signalk-duckdb-history-provider development.
 #
 
 set -o nounset
@@ -446,7 +446,7 @@ function bumpversion {
 function help {
   #@ Show this help message
   #@ Category: Core
-  echo "signalk-parquet-history-provider - Development Commands"
+  echo "signalk-duckdb-history-provider - Development Commands"
   echo "======================================================"
   echo ""
   echo "Available commands:"

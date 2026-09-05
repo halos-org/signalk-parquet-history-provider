@@ -8,7 +8,7 @@
  * runtime, not at build time, so every site reads it from here.
  *
  * **It is deliberately not the package name.** The package is
- * `@halos-org/signalk-parquet-history-provider`, and this is not, because the
+ * `@halos-org/signalk-duckdb-history-provider`, and this is not, because the
  * id becomes a filename — `plugin-config-data/<id>.json` — and a scope would
  * put a slash in it. `historyApi.defaultProvider` holds this value too, since
  * the server's registry keys on `plugin.id` rather than on the package
@@ -17,4 +17,4 @@
  * `@halos-org/skip-freeboard-panel` is the same shape: a scoped package
  * declaring the unscoped id `skip-plotter-panel`.
  */
-export const PLUGIN_ID = "signalk-parquet-history-provider";
+export const PLUGIN_ID = "signalk-duckdb-history-provider";

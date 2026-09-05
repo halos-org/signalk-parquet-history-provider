@@ -266,7 +266,7 @@ export default (app: App) => {
 
   const plugin = {
     id: PLUGIN_ID,
-    name: "Parquet History",
+    name: "DuckDB History",
 
     schema: ConfigSchema,
 

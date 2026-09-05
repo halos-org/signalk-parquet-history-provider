@@ -317,8 +317,8 @@ allowed directory still works afterwards.
 
 ## Names
 
-**The package is `@halos-org/signalk-parquet-history-provider`; the plugin id
-is `signalk-parquet-history-provider`.** They differ on purpose and must not be
+**The package is `@halos-org/signalk-duckdb-history-provider`; the plugin id
+is `signalk-duckdb-history-provider`.** They differ on purpose and must not be
 made to match. The id becomes a filename — `plugin-config-data/<id>.json` — so
 a scope would put a slash in it, and it is also what
 `historyApi.defaultProvider` holds, because the server keys its registry on
