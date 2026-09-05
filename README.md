@@ -1,4 +1,4 @@
-# @halos-org/signalk-parquet-history-provider
+# @halos-org/signalk-duckdb-history-provider
 
 A Signal K history provider that stores data in Parquet files instead of a
 database server. Deltas go to a SQLite hot store owned by a separate writer
@@ -62,11 +62,11 @@ bounded by how many paths a vessel has, not by how long it has been recording.
 ## Installation
 
 From the Signal K app store, or with
-`npm install @halos-org/signalk-parquet-history-provider` into the server's
+`npm install @halos-org/signalk-duckdb-history-provider` into the server's
 plugin directory. On HaLOS Marine it is baked into the image and needs no
 installation.
 
-**The plugin id is `signalk-parquet-history-provider`, without the scope.** It
+**The plugin id is `signalk-duckdb-history-provider`, without the scope.** It
 is what names the config file and what `historyApi.defaultProvider` holds; the
 scoped name is the package only.
 
