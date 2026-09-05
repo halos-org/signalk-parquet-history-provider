@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { DATA_LAYOUT } from "../data-dir.js";
 import { QueryRunner } from "../query/duck.js";
 import type { QueryRequest, QueryResult } from "../query/duck.js";
-import { treeFilesInRange } from "../query/reader.js";
+import { needsHotStore, treeFilesInRange } from "../query/reader.js";
 import { roll } from "../roll/roll.js";
 import { dateDirectory, rollFile } from "../roll/tree-path.js";
 import { writerPaths } from "../writer/contract.js";
@@ -742,5 +742,71 @@ describe("the tree's file selection", () => {
 
   it("returns nothing rather than failing when there is no tree", () => {
     assert.deepEqual(treeFilesInRange(dir, 0, Date.UTC(2100, 0, 1)), []);
+  });
+});
+
+/**
+ * The hot store is read whenever a window could hold one of its rows, and not
+ * otherwise.
+ *
+ * `sqlite_scanner` does not push a predicate into SQLite -- the plan puts a
+ * FILTER above a SQLITE_SCAN that emits the whole table -- so a branch that
+ * matches nothing still costs a scan of every row the current roll interval
+ * has accumulated. Measured on a device: an unchanged query over a window
+ * entirely inside the tree ran 25 ms with 2k rows in the store and 157 ms with
+ * 197k, tracking the store's size at 0.708 ms per 1000 rows and resetting at
+ * each roll. Indexing does not help, because nothing reaches the index.
+ */
+describe("needsHotStore", () => {
+  it("skips a window that ends at or before the oldest row", () => {
+    assert.equal(needsHotStore(1000, 1000), false);
+    assert.equal(needsHotStore(1000, 999), false);
+  });
+
+  it("reads a window that reaches past the oldest row", () => {
+    assert.equal(needsHotStore(1000, 1001), true);
+  });
+
+  /**
+   * Only the oldest row is safe to decide on. It only ever moves forward -- a
+   * roll truncates from the front and the writer appends to the back -- so a
+   * window that ends before it stays that way. The newest row moves the other
+   * way, and a window opening after it can be filled by the writer between the
+   * planning read and the query.
+   */
+  it("reads an empty store, which the writer may fill mid-query", () => {
+    assert.equal(needsHotStore(null, 1), true);
+  });
+});
+
+/**
+ * A sample whose timestamp precedes rows already stored.
+ *
+ * `insertBatch` enforces no timestamp order, and `ts` is the recorder's clock
+ * reading at arrival -- which steps backwards when a device corrects its clock
+ * at boot, the case `path-matcher.ts` already treats as a discontinuity. So the
+ * lowest rowid does not carry the lowest `ts`, and a boundary read from the
+ * first row would place the store later than it reaches. The query would then
+ * skip it and answer without a row the store holds, silently.
+ */
+describe("an out-of-order sample still bounds the hot store", () => {
+  it("reads a window the earliest row falls in, whatever its rowid", async () => {
+    const late = AUG_23 + 60_000;
+    const early = AUG_23 + 1_000;
+    // Stored newest-first, so rowid order and timestamp order disagree.
+    record(sample({ ts: late, path: "a.b", value: 1 }));
+    record(sample({ ts: early, path: "a.b", value: 2 }));
+
+    const rows = await runner.run({
+      kind: "range",
+      from: early,
+      to: early + 1_000,
+      context: "self",
+    });
+    assert.equal(
+      rows.rows.length,
+      1,
+      "the window holds the out-of-order sample and must not be skipped",
+    );
   });
 });
